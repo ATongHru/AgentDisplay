@@ -9,12 +9,15 @@ import time
 from typing import Callable
 
 from asr import transcribe_pcm, warmup as asr_warmup
+from chat_context import chat_context
 from llm import llm_chat, llm_configured
-from settings_store import get_volume_percent, scale_pcm16
+from settings_store import get_volume_percent
 from voice_session import SessionPhase, VoiceSession, session_store
 
 TTS_VOICE = os.getenv("TTS_VOICE", "zh-CN-XiaoxiaoNeural")
 VOICE_TTS = os.getenv("VOICE_TTS", "1").strip() not in {"0", "false", "False", ""}
+# Same edge-tts engine; faster speech shortens synthesis + transfer.
+TTS_RATE = os.getenv("TTS_RATE", "+20%").strip() or "+20%"
 
 TranscriptFn = Callable[..., None]
 PushFn = Callable[[str, str, str], None]
@@ -53,7 +56,7 @@ class _DeltaCoalescer:
 
 
 def warmup() -> None:
-    print(f"[voice] TTS={'on' if VOICE_TTS else 'off'} voice={TTS_VOICE}")
+    print(f"[voice] TTS={'on' if VOICE_TTS else 'off'} voice={TTS_VOICE} rate={TTS_RATE}")
     asr_warmup()
 
 
@@ -67,13 +70,48 @@ def transcribe_session_pcm(session: VoiceSession) -> str:
     )
 
 
+def _split_tts_parts(text: str) -> list[str]:
+    """Split reply into short clauses so first audio can start early."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    hard = set("。！？!?;；\n")
+    soft = set("，、,;； ")
+    parts: list[str] = []
+    buf = ""
+    for ch in text:
+        buf += ch
+        strip = buf.strip()
+        if not strip:
+            buf = ""
+            continue
+        if ch in hard and len(strip) >= 2:
+            parts.append(strip)
+            buf = ""
+        elif len(strip) >= 28 and ch in soft:
+            parts.append(strip)
+            buf = ""
+        elif len(strip) >= 48:
+            parts.append(strip)
+            buf = ""
+    if buf.strip():
+        parts.append(buf.strip())
+    merged: list[str] = []
+    for part in parts:
+        if merged and len(part) < 4:
+            merged[-1] = merged[-1] + part
+        else:
+            merged.append(part)
+    return merged or [text]
+
+
 async def tts_to_pcm(text: str) -> bytes:
     import edge_tts
 
     if not text.strip():
         return b""
 
-    communicate = edge_tts.Communicate(text, TTS_VOICE)
+    communicate = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE)
     mp3 = bytearray()
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
@@ -81,10 +119,34 @@ async def tts_to_pcm(text: str) -> bytes:
     if not mp3:
         raise RuntimeError("TTS 无音频")
     pcm = await asyncio.to_thread(_mp3_to_pcm16k_mono, bytes(mp3))
+    # Volume is applied on-device only (avoid double attenuation with firmware gain).
     volume = get_volume_percent()
-    pcm = scale_pcm16(pcm, volume)
-    print(f"[tts] mp3={len(mp3)} pcm={len(pcm)} volume={volume}%")
+    print(f"[tts] chars={len(text)} mp3={len(mp3)} pcm={len(pcm)} rate={TTS_RATE} device_volume={volume}%")
     return pcm
+
+
+async def synthesize_to_session(session: VoiceSession, text: str) -> int:
+    """Stream sentence-level TTS into the session so WS pump can start early."""
+    parts = _split_tts_parts(text)
+    total = 0
+    if not parts:
+        session.finish_tts()
+        return 0
+    session.phase = SessionPhase.TTS
+    for idx, part in enumerate(parts):
+        t0 = time.monotonic()
+        pcm = await tts_to_pcm(part)
+        dt = time.monotonic() - t0
+        if not pcm:
+            continue
+        session.append_tts_pcm(pcm)
+        total += len(pcm)
+        print(
+            f"[tts] part {idx + 1}/{len(parts)} chars={len(part)} "
+            f"pcm={len(pcm)} in {dt:.2f}s queued={total}"
+        )
+    session.finish_tts()
+    return total
 
 
 def _mp3_to_pcm16k_mono(mp3: bytes) -> bytes:
@@ -103,19 +165,10 @@ def _mp3_to_pcm16k_mono(mp3: bytes) -> bytes:
             "h",
             (max(-32767, min(32767, int(x * 32767))) for x in samples),
         )
-        raw = pcm.tobytes()
-    elif hasattr(samples, "tobytes"):
-        raw = samples.tobytes()
-    else:
-        raw = bytes(samples)
-    peak = 0
-    view = memoryview(raw).cast("h")
-    for sample in view:
-        abs_s = -sample if sample < 0 else sample
-        if abs_s > peak:
-            peak = abs_s
-    print(f"[tts] pcm={len(raw)} peak={peak} fmt={getattr(samples, 'typecode', type(samples).__name__)}")
-    return raw
+        return pcm.tobytes()
+    if hasattr(samples, "tobytes"):
+        return samples.tobytes()
+    return bytes(samples)
 
 
 def run_pipeline(
@@ -135,12 +188,17 @@ def run_pipeline(
                 f"sr={session.sample_rate} ch={session.channels}"
             )
             push_event("THINKING", "正在识别", "VOICE")
-            asr_text = await asyncio.to_thread(transcribe_session_pcm, session)
+            if session.asr_ready and session.asr_text:
+                asr_text = session.asr_text.strip()
+                print(f"[voice] asr prefilled session={session_id} text={asr_text!r}")
+            else:
+                asr_text = await asyncio.to_thread(transcribe_session_pcm, session)
             if not asr_text:
-                session.set_error("未识别到语音")
-                push_event("ERROR", "未识别到语音", "VOICE")
+                session.mark_done()
+                push_event("IDLE", "没听清，请再说一次", "VOICE")
                 if on_transcript:
                     on_transcript(session_id, "")
+                print(f"[voice] asr empty {session_id}, ask retry")
                 return
             session.set_asr(asr_text)
             if on_transcript:
@@ -175,12 +233,14 @@ def run_pipeline(
                         push_append("", "VOICE", True)
                 coalescer.add(delta)
 
-            reply = await llm_chat(asr_text, on_partial)
+            history = chat_context.history_for_llm()
+            reply = await llm_chat(asr_text, on_partial, history=history)
             coalescer.flush()
             if not reply:
                 session.set_error("LLM 无回复")
                 push_event("ERROR", "LLM 无回复", "VOICE")
                 return
+            chat_context.add_turn(asr_text, reply)
             session.append_llm(reply)
             if on_transcript:
                 on_transcript(session_id, reply, "assistant")
@@ -189,10 +249,8 @@ def run_pipeline(
                 push_event("IDLE", reply, "VOICE")
                 print(f"[voice] llm {session_id}: {reply}")
                 return
-            session.phase = SessionPhase.TTS
-            pcm = await tts_to_pcm(reply)
-            session.set_tts_pcm(pcm)
-            print(f"[voice] session {session_id} ready audio={len(pcm)} bytes")
+            total = await synthesize_to_session(session, reply)
+            print(f"[voice] session {session_id} ready audio={total} bytes (streamed)")
         except Exception as exc:
             import traceback
 

@@ -36,6 +36,7 @@ class VoiceSession:
     created_at: float = field(default_factory=time.time)
     phase: SessionPhase = SessionPhase.RECEIVED
     asr_text: str = ""
+    asr_ready: bool = False
     llm_text: str = ""
     error: str = ""
     audio_pcm: bytes = b""
@@ -56,23 +57,68 @@ class VoiceSession:
             self.error = message
             self.audio_end = True
 
+    def append_pcm(self, data: bytes) -> None:
+        if not data:
+            return
+        with self.lock:
+            self.pcm_data += data
+
     def set_asr(self, text: str) -> None:
         with self.lock:
             self.asr_text = text
+            self.asr_ready = True
             self.phase = SessionPhase.LLM
+
+    def mark_stream_asr(self, text: str) -> None:
+        """ASR finished during upload stream; pipeline can skip offline decode."""
+        with self.lock:
+            self.asr_text = (text or "").strip()
+            self.asr_ready = True
+            self.phase = SessionPhase.ASR
 
     def append_llm(self, text: str) -> None:
         with self.lock:
             self.llm_text = text
 
-    def set_tts_pcm(self, pcm: bytes) -> None:
-        with self.lock:
-            self.audio_pcm = pcm
-            self.audio_chunks.clear()
-            for i in range(0, len(pcm), CHUNK_SIZE):
-                self.audio_chunks.append(pcm[i : i + CHUNK_SIZE])
+    def _enqueue_pcm_locked(self, pcm: bytes) -> None:
+        if not pcm:
+            return
+        self.audio_pcm += pcm
+        for i in range(0, len(pcm), CHUNK_SIZE):
+            self.audio_chunks.append(pcm[i : i + CHUNK_SIZE])
+        if self.phase in (SessionPhase.TTS, SessionPhase.RECEIVED, SessionPhase.LLM, SessionPhase.ASR):
             self.phase = SessionPhase.READY
-            self.audio_end = len(self.audio_chunks) == 0
+
+    def set_tts_pcm(self, pcm: bytes) -> None:
+        """Queue a complete TTS payload and mark end-of-stream."""
+        with self.lock:
+            self.audio_pcm = b""
+            self.audio_chunks.clear()
+            self.audio_end = False
+            self.phase = SessionPhase.TTS
+            self._enqueue_pcm_locked(pcm)
+            self.audio_end = True
+            if not self.audio_chunks:
+                self.phase = SessionPhase.DONE
+
+    def append_tts_pcm(self, pcm: bytes) -> None:
+        """Append streaming TTS audio; end flag stays false until finish_tts()."""
+        with self.lock:
+            if self.audio_end:
+                self.audio_end = False
+            if self.phase == SessionPhase.DONE:
+                self.phase = SessionPhase.TTS
+            self._enqueue_pcm_locked(pcm)
+
+    def finish_tts(self) -> None:
+        with self.lock:
+            self.audio_end = True
+            if not self.audio_chunks:
+                self.phase = SessionPhase.DONE
+
+    def audio_still_active(self) -> bool:
+        with self.lock:
+            return bool(self.audio_chunks) or not self.audio_end
 
     def mark_playing(self) -> None:
         with self.lock:
@@ -89,14 +135,11 @@ class VoiceSession:
         with self.lock:
             if self.audio_chunks:
                 chunk = self.audio_chunks.popleft()
-                is_end = not self.audio_chunks
+                is_end = (not self.audio_chunks) and self.audio_end
+                if self.phase == SessionPhase.READY:
+                    self.phase = SessionPhase.PLAYING
                 if is_end:
-                    self.audio_end = True
                     self.phase = SessionPhase.DONE
-                else:
-                    # The session lock is already held here; reacquiring it would deadlock.
-                    if self.phase == SessionPhase.READY:
-                        self.phase = SessionPhase.PLAYING
                 return chunk, is_end
             if self.audio_end:
                 return None, True

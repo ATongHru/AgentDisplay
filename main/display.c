@@ -81,13 +81,14 @@ esp_err_t display_init(void)
     lv_init();
 
     const size_t partial_bytes = LCD_W * PARTIAL_BUF_LINES * sizeof(lv_color_t);
-    lv_color_t *buf1 = heap_caps_malloc(partial_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    lv_color_t *buf2 = heap_caps_malloc(partial_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    /* Prefer SPIRAM: BT controller needs contiguous internal DRAM. */
+    lv_color_t *buf1 = heap_caps_malloc(partial_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    lv_color_t *buf2 = heap_caps_malloc(partial_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
     if (!buf1) {
-        buf1 = heap_caps_malloc(partial_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+        buf1 = heap_caps_malloc(partial_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     }
     if (!buf2) {
-        buf2 = heap_caps_malloc(partial_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+        buf2 = heap_caps_malloc(partial_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     }
     if (!buf1 || !buf2) {
         ESP_LOGE(TAG, "LVGL buffer alloc failed");

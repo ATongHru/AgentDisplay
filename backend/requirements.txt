@@ -6,3 +6,4 @@ vosk
 python-dotenv
 edge-tts
 miniaudio
+bleak>=0.22.0

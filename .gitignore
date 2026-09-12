@@ -14,3 +14,8 @@ backend/.env
 
 backend/backend.pid
 backend/*.log
+
+# ad-hoc serial capture / one-off patches
+_esp_*.txt
+_patch_*.py
+backend.pid

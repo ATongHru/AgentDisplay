@@ -1,4 +1,4 @@
-"""Speech-to-text adapters (Vosk / SpeechRecognition / faster-whisper)."""
+"""Speech-to-text adapters (Vosk streaming / SpeechRecognition / faster-whisper)."""
 
 from __future__ import annotations
 
@@ -11,15 +11,21 @@ from pathlib import Path
 
 ASR_ENGINE = os.getenv("ASR_ENGINE", "vosk").strip().lower()
 
+# Vosk recommended feed size: 4096 bytes ≈ 128ms @ 16kHz s16le mono
+VOSK_CHUNK_BYTES = 4096
+
 
 def _default_vosk_path() -> str:
-    here = Path(__file__).resolve().parent / "models" / "vosk-model-small-cn-0.22"
-    if here.exists():
-        return str(here)
+    root = Path(__file__).resolve().parent / "models"
+    for name in ("vosk-model-small-cn-0.22", "vosk-model-cn-0.22"):
+        here = root / name
+        if here.exists():
+            return str(here)
     for cand in Path("D:/0-C").glob("ESP32*N16R8/backend/models/vosk-model-small-cn-0.22"):
         if cand.exists():
             return str(cand)
-    return str(here)
+    return str(root / "vosk-model-small-cn-0.22")
+
 
 VOSK_MODEL_PATH = os.getenv("VOSK_MODEL_PATH", _default_vosk_path())
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
@@ -90,19 +96,67 @@ def _pcm_to_mono_s16(pcm: bytes, channels: int, bit_depth: int) -> bytes:
     return mono.tobytes()
 
 
-def _transcribe_vosk_pcm(pcm: bytes, sample_rate: int, channels: int, bit_depth: int) -> str:
-    from vosk import KaldiRecognizer, SetLogLevel
+class VoskStreamRecognizer:
+    """Feed PCM as it arrives; call finish() on audio_end."""
 
-    SetLogLevel(-1)
-    model = _get_vosk_model()
-    mono = _pcm_to_mono_s16(pcm, channels, bit_depth)
-    rec = KaldiRecognizer(model, sample_rate)
-    rec.SetWords(False)
-    step = 4000 * 2
-    for offset in range(0, len(mono), step):
-        rec.AcceptWaveform(mono[offset:offset + step])
-    data = json.loads(rec.FinalResult())
-    return str(data.get("text", "")).strip()
+    def __init__(self, sample_rate: int = 16000, channels: int = 1, bit_depth: int = 16):
+        from vosk import KaldiRecognizer, SetLogLevel
+
+        SetLogLevel(-1)
+        model = _get_vosk_model()
+        self._channels = channels
+        self._bit_depth = bit_depth
+        self._rec = KaldiRecognizer(model, sample_rate)
+        self._rec.SetWords(False)
+        self._parts: list[str] = []
+        self._partial = ""
+        self._buf = bytearray()
+        self._finished = False
+        self._bytes = 0
+
+    def accept(self, pcm: bytes) -> str:
+        """Feed a PCM chunk. Returns latest partial text (may be empty)."""
+        if self._finished or not pcm:
+            return self._partial
+        mono = _pcm_to_mono_s16(pcm, self._channels, self._bit_depth)
+        self._buf.extend(mono)
+        self._bytes += len(mono)
+        while len(self._buf) >= VOSK_CHUNK_BYTES:
+            chunk = bytes(self._buf[:VOSK_CHUNK_BYTES])
+            del self._buf[:VOSK_CHUNK_BYTES]
+            if self._rec.AcceptWaveform(chunk):
+                data = json.loads(self._rec.Result())
+                text = str(data.get("text", "")).strip()
+                if text:
+                    self._parts.append(text)
+                self._partial = ""
+            else:
+                data = json.loads(self._rec.PartialResult())
+                self._partial = str(data.get("partial", "")).strip()
+        return self._partial
+
+    def finish(self) -> str:
+        if self._finished:
+            return " ".join(self._parts).strip()
+        self._finished = True
+        if self._buf:
+            self._rec.AcceptWaveform(bytes(self._buf))
+            self._buf.clear()
+        data = json.loads(self._rec.FinalResult())
+        text = str(data.get("text", "")).strip()
+        if text:
+            self._parts.append(text)
+        result = " ".join(self._parts).strip()
+        print(f"[asr] vosk stream done bytes={self._bytes} text={result!r}")
+        return result
+
+
+def _transcribe_vosk_pcm(pcm: bytes, sample_rate: int, channels: int, bit_depth: int) -> str:
+    stream = VoskStreamRecognizer(sample_rate, channels, bit_depth)
+    # Feed in recommended chunk size even for one-shot uploads.
+    for offset in range(0, len(pcm), VOSK_CHUNK_BYTES):
+        stream.accept(pcm[offset : offset + VOSK_CHUNK_BYTES])
+    return stream.finish()
 
 
 def _transcribe_vosk(wav_path: str) -> str:

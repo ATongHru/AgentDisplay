@@ -12,14 +12,16 @@ from dataclasses import dataclass, field
 AUDIO_CHUNK_BYTES = 4096
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_BYTES_PER_SAMPLE = 2
-AUDIO_SEND_INTERVAL_SEC = AUDIO_CHUNK_BYTES / (AUDIO_SAMPLE_RATE * AUDIO_BYTES_PER_SAMPLE)
-AUDIO_BURST_BYTES = 16384
-VOICE_BUSY_TIMEOUT_SEC = 45.0
+AUDIO_SEND_INTERVAL_SEC = 0.02
+AUDIO_BURST_BYTES = 65536
+VOICE_BUSY_TIMEOUT_SEC = 50.0
 from typing import Any, Callable
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from voice_pipeline import start_pipeline, tts_to_pcm
+from asr import VoskStreamRecognizer
+from settings_store import get_volume_percent
+from voice_pipeline import start_pipeline, synthesize_to_session, tts_to_pcm
 from voice_session import session_store
 
 
@@ -27,6 +29,8 @@ from voice_session import session_store
 class DeviceState:
     websocket: WebSocket | None = None
     waiting_audio: dict[str, Any] | None = None
+    stream_session_id: str | None = None
+    stream_asr: Any = None
     connected_at: float = 0.0
     last_seen: float = 0.0
     rssi: int | None = None
@@ -103,6 +107,7 @@ class WsHub:
                     "server_time": int(time.time()),
                 },
             )
+            await self.push_volume_config()
             if self._on_device_connect:
                 await self._on_device_connect(self)
             return
@@ -114,6 +119,8 @@ class WsHub:
             if self._device.websocket is websocket:
                 self._device.websocket = None
                 self._device.waiting_audio = None
+                self._device.stream_session_id = None
+                self._device.stream_asr = None
                 self._speak_sessions.clear()
                 self._clear_busy("device disconnect")
             self._dashboards.discard(websocket)
@@ -144,8 +151,19 @@ class WsHub:
         if msg_type == "audio_upload":
             if websocket is not self._device.websocket:
                 return
-            self._device.waiting_audio = msg
             self._device.last_seen = time.time()
+            streaming = bool(msg.get("stream")) or int(msg.get("audio_len", -1) or 0) == 0
+            if streaming:
+                await self._begin_audio_stream(websocket, msg)
+            else:
+                self._device.waiting_audio = msg
+            return
+
+        if msg_type == "audio_end":
+            if websocket is not self._device.websocket:
+                return
+            self._device.last_seen = time.time()
+            await self._finish_audio_stream(websocket, msg)
             return
 
         if msg_type == "status":
@@ -156,6 +174,24 @@ class WsHub:
         if websocket is not self._device.websocket:
             return
         self._device.last_seen = time.time()
+
+        if self._device.stream_session_id and self._device.stream_asr is not None:
+            session = session_store.get(self._device.stream_session_id)
+            if session is None:
+                self._device.stream_session_id = None
+                self._device.stream_asr = None
+                await self._send_ws_json(websocket, {"type": "error", "detail": "stream session missing"})
+                return
+            session.append_pcm(data)
+            try:
+                partial = self._device.stream_asr.accept(data)
+            except Exception as exc:
+                print(f"[asr] stream feed failed: {exc}")
+                partial = ""
+            if partial:
+                print(f"[asr] partial={partial!r}")
+            return
+
         meta = self._device.waiting_audio
         self._device.waiting_audio = None
         if not meta:
@@ -178,15 +214,33 @@ class WsHub:
             await self._send_ws_json(websocket, {"type": "error", "detail": "voice pipeline busy"})
             return
 
+        sample_rate = int(meta.get("sample_rate", 16000))
+        channels = int(meta.get("channels", 1))
+        bit_depth = int(meta.get("bit_depth", 16))
         session = session_store.create(
             data,
-            sample_rate=int(meta.get("sample_rate", 16000)),
-            channels=int(meta.get("channels", 1)),
-            bit_depth=int(meta.get("bit_depth", 16)),
+            sample_rate=sample_rate,
+            channels=channels,
+            bit_depth=bit_depth,
         )
         self._session_device[session.session_id] = "device"
         self._mark_busy()
-        await self._send_ws_json(websocket, {"type": "session", "session_id": session.session_id})
+        await self._send_ws_json(
+            websocket,
+            {
+                "type": "session",
+                "session_id": session.session_id,
+                "volume_percent": get_volume_percent(),
+            },
+        )
+        try:
+            stream = VoskStreamRecognizer(sample_rate, channels, bit_depth)
+            stream.accept(data)
+            text = stream.finish()
+            if text:
+                session.mark_stream_asr(text)
+        except Exception as exc:
+            print(f"[asr] oneshot stream failed, fallback offline: {exc}")
         self._push_status_threadsafe("THINKING", "正在处理…", "VOICE")
         start_pipeline(
             session.session_id,
@@ -196,7 +250,85 @@ class WsHub:
             self._push_append_threadsafe,
         )
 
+    async def _begin_audio_stream(self, websocket: WebSocket, meta: dict[str, Any]) -> None:
+        if self._voice_busy or self._device.stream_session_id:
+            print("[voice] drop stream start, busy")
+            await self._send_ws_json(websocket, {"type": "error", "detail": "voice pipeline busy"})
+            return
+        sample_rate = int(meta.get("sample_rate", 16000))
+        channels = int(meta.get("channels", 1))
+        bit_depth = int(meta.get("bit_depth", 16))
+        session = session_store.create(
+            b"",
+            sample_rate=sample_rate,
+            channels=channels,
+            bit_depth=bit_depth,
+        )
+        try:
+            asr = VoskStreamRecognizer(sample_rate, channels, bit_depth)
+        except Exception as exc:
+            session_store.delete(session.session_id)
+            await self._send_ws_json(websocket, {"type": "error", "detail": f"asr init failed: {exc}"})
+            return
+        self._session_device[session.session_id] = "device"
+        self._device.stream_session_id = session.session_id
+        self._device.stream_asr = asr
+        self._mark_busy()
+        await self._send_ws_json(
+            websocket,
+            {
+                "type": "session",
+                "session_id": session.session_id,
+                "volume_percent": get_volume_percent(),
+            },
+        )
+        print(f"[voice] stream start session={session.session_id}")
+
+    async def _finish_audio_stream(self, websocket: WebSocket, msg: dict[str, Any]) -> None:
+        session_id = self._device.stream_session_id or str(msg.get("session_id") or "")
+        asr = self._device.stream_asr
+        self._device.stream_session_id = None
+        self._device.stream_asr = None
+        if not session_id or asr is None:
+            await self._send_ws_json(websocket, {"type": "error", "detail": "no active audio stream"})
+            self._clear_busy("stream end without session")
+            return
+        session = session_store.get(session_id)
+        if session is None:
+            await self._send_ws_json(websocket, {"type": "error", "detail": "stream session missing"})
+            self._clear_busy("stream session missing")
+            return
+        try:
+            text = asr.finish()
+        except Exception as exc:
+            print(f"[asr] stream finish failed: {exc}")
+            text = ""
+        pcm_len = len(session.pcm_data)
+        print(f"[voice] stream end session={session_id} pcm={pcm_len} text={text!r}")
+        if pcm_len < 6400 or not text:
+            session.mark_done()
+            self._clear_busy("stream too short/empty")
+            detail = "没听清，请再说一次" if pcm_len >= 6400 else ""
+            self._push_status_threadsafe("IDLE", detail, "VOICE")
+            return
+        session.mark_stream_asr(text)
+        self._push_status_threadsafe("THINKING", text or "正在处理…", "VOICE")
+        start_pipeline(
+            session.session_id,
+            self._push_status_threadsafe,
+            self._transcript_threadsafe,
+            self._on_pipeline_done,
+            self._push_append_threadsafe,
+        )
+
+    async def push_volume_config(self, percent: int | None = None) -> None:
+        """Sync dashboard volume to device playback gain."""
+        value = get_volume_percent() if percent is None else int(percent)
+        await self._send_device({"type": "config", "volume_percent": value})
+        print(f"[volume] pushed to device {value}%")
+
     def _mark_busy(self) -> None:
+
         self._voice_busy = True
         self._busy_since = time.time()
 
@@ -226,7 +358,7 @@ class WsHub:
             return
         for session_id in list(self._session_device):
             session = session_store.get(session_id)
-            if session is not None and session.audio_chunks:
+            if session is not None and session.audio_still_active():
                 print("[voice] pipeline finished, audio still queued")
                 return
         self._clear_busy("pipeline done")
@@ -279,19 +411,21 @@ class WsHub:
             return {"ok": False, "detail": "voice busy"}
         self._mark_busy()
         try:
-            pcm = await tts_to_pcm(clean)
-            if not pcm:
-                self._clear_busy("tts empty")
-                return {"ok": False, "detail": "tts empty"}
+            await self.push_volume_config()
             session = session_store.create(b"", sample_rate=16000, channels=1, bit_depth=16)
-            session.set_tts_pcm(pcm)
             self._session_device[session.session_id] = "device"
             self._speak_sessions.add(session.session_id)
+            total = await synthesize_to_session(session, clean)
+            if not total:
+                self._session_device.pop(session.session_id, None)
+                self._speak_sessions.discard(session.session_id)
+                self._clear_busy("tts empty")
+                return {"ok": False, "detail": "tts empty"}
             print(
-                f"[tts] speak session={session.session_id} bytes={len(pcm)} "
-                f"chunks={len(session.audio_chunks)}"
+                f"[tts] speak session={session.session_id} bytes={total} "
+                f"chunks={len(session.audio_chunks)} (streamed)"
             )
-            return {"ok": True, "session_id": session.session_id, "bytes": len(pcm)}
+            return {"ok": True, "session_id": session.session_id, "bytes": total}
         except Exception as exc:
             self._clear_busy(f"tts failed: {exc}")
             print(f"[tts] speak failed: {exc}")

@@ -1,9 +1,11 @@
 #include "voice.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "audio.h"
+#include "ble_prov.h"
 #include "board_pins.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -21,16 +23,28 @@ enum {
     VOICE_ERROR,
 };
 
-#define VAD_PEAK_START 1400
-#define VAD_RMS_START 280
-#define VAD_PEAK_HOLD 480
-#define VAD_RMS_HOLD 90
+/* 能量按放大后归一化（与旧 int16 VAD 同一量纲）。
+ * 旧起始约 peak>=1400、rms>=280 → 归一化 0.043 / 0.0085；阈值抬高，减少环境音误触发。 */
+#define VAD_RMS_START_FLOOR 0.008f
+#define VAD_PEAK_START_FLOOR 0.045f
+#define VAD_NOISE_MULT 3.0f
+#define VAD_RMS_HOLD_FLOOR 0.003f
+#define VAD_PEAK_HOLD_FLOOR 0.020f
+#define VAD_NOISE_ALPHA 0.05f
+#define VAD_NOISE_INIT_FRAMES 10
 #define VAD_MIN_MS 500
-#define VAD_SILENCE_MS 900
-#define VAD_MAX_MS 6000
-#define VAD_COOLDOWN_MS 1500
-#define WAIT_REPLY_MS 25000
-#define MIN_CLIP_BYTES (VOICE_SAMPLE_RATE * 2 * 2 / 5)
+#define VAD_SILENCE_MS 1100
+#define VAD_MAX_MS 10000
+#define VAD_COOLDOWN_MS 800
+#define WAIT_REPLY_MS 40000
+#define MIN_CLIP_BYTES 6400
+
+typedef struct {
+    float noise_rms;
+    float noise_peak;
+    int noise_init_frames;
+    bool in_speech;
+} vad_state_t;
 
 static int s_phase = VOICE_LISTEN;
 static char s_session_id[16];
@@ -45,9 +59,12 @@ static bool s_listening;
 static volatile bool s_upload_pending;
 static volatile bool s_upload_done;
 static volatile bool s_upload_ok;
+static size_t s_stream_sent;
+static bool s_stream_active;
+static bool s_stream_failed;
 static char s_last_show[24];
-static size_t s_noise_peak = 180;
-static size_t s_noise_rms = 40;
+static vad_state_t s_vad = {.noise_rms = 0.001f, .noise_peak = 0.005f};
+static uint32_t s_last_vad_seq;
 
 static int64_t now_us(void) { return esp_timer_get_time(); }
 
@@ -80,39 +97,48 @@ static void set_listening(bool on)
     post_voice_icons();
 }
 
-static void update_noise(size_t peak, size_t rms)
+static float start_rms_th(void)
 {
-    s_noise_peak = (s_noise_peak * 31 + peak) / 32;
-    s_noise_rms = (s_noise_rms * 31 + rms) / 32;
+    return fmaxf(VAD_RMS_START_FLOOR, s_vad.noise_rms * VAD_NOISE_MULT);
 }
 
-static size_t start_peak_th(void)
+static float start_peak_th(void)
 {
-    size_t adaptive = s_noise_peak * 5 + 350;
-    return adaptive > VAD_PEAK_START ? adaptive : VAD_PEAK_START;
+    return fmaxf(VAD_PEAK_START_FLOOR, s_vad.noise_peak * VAD_NOISE_MULT);
 }
 
-static size_t start_rms_th(void)
+static float hold_rms_th(void)
 {
-    size_t adaptive = s_noise_rms * 4 + 80;
-    return adaptive > VAD_RMS_START ? adaptive : VAD_RMS_START;
+    return fmaxf(VAD_RMS_HOLD_FLOOR, start_rms_th() * 0.5f);
 }
 
-static size_t hold_peak_th(void)
+static float hold_peak_th(void)
 {
-    size_t adaptive = s_noise_peak * 2 + 120;
-    return adaptive > VAD_PEAK_HOLD ? adaptive : VAD_PEAK_HOLD;
+    return fmaxf(VAD_PEAK_HOLD_FLOOR, start_peak_th() * 0.5f);
 }
 
-static size_t hold_rms_th(void)
+static void update_noise_baseline(float rms, float peak)
 {
-    size_t adaptive = s_noise_rms * 2 + 30;
-    return adaptive > VAD_RMS_HOLD ? adaptive : VAD_RMS_HOLD;
+    if (s_vad.in_speech) {
+        return;
+    }
+    s_vad.noise_rms = (1.0f - VAD_NOISE_ALPHA) * s_vad.noise_rms + VAD_NOISE_ALPHA * rms;
+    s_vad.noise_peak = (1.0f - VAD_NOISE_ALPHA) * s_vad.noise_peak + VAD_NOISE_ALPHA * peak;
+}
+
+static void reset_vad_baseline(void)
+{
+    s_vad.noise_init_frames = 0;
+    s_vad.in_speech = false;
+    s_vad.noise_rms = 0.001f;
+    s_vad.noise_peak = 0.005f;
+    audio_capture_reset_hp();
 }
 
 static void resume_listen(void)
 {
 #if VOICE_HARDWARE_ENABLED
+    reset_vad_baseline();
     s_cooldown_until_us = now_us() + (int64_t)VAD_COOLDOWN_MS * 1000;
     if (audio_capture_listen_start()) {
         audio_capture_clear();
@@ -146,11 +172,24 @@ void voice_init(void)
     s_phase = VOICE_LISTEN;
     s_upload_pending = false;
     s_upload_done = false;
-    ESP_LOGI(TAG, "always-listen VAD, PDM DATA=GPIO%d CLK=GPIO%d", PIN_PDM_DATA, PIN_PDM_CLK);
+    reset_vad_baseline();
+    ESP_LOGI(TAG, "always-listen VAD adaptive, PDM DATA=GPIO%d CLK=GPIO%d", PIN_PDM_DATA,
+             PIN_PDM_CLK);
 }
 
-void voice_on_audio_chunk(const uint8_t *data, size_t len, bool end)
+void voice_on_audio_chunk(const char *session_id, const uint8_t *data, size_t len, bool end)
 {
+    if (session_id && session_id[0] && s_session_id[0] &&
+        (s_phase == VOICE_WAIT_REPLY || s_phase == VOICE_PLAYING) &&
+        strcmp(session_id, s_session_id) != 0) {
+        ESP_LOGW(TAG, "drop mismatched audio_chunk sid=%s expect=%s", session_id, s_session_id);
+        return;
+    }
+    if (session_id && session_id[0] && s_phase != VOICE_WAIT_REPLY && s_phase != VOICE_PLAYING) {
+        strncpy(s_session_id, session_id, sizeof(s_session_id) - 1);
+        s_session_id[sizeof(s_session_id) - 1] = '\0';
+    }
+
     if (data && len > 0) {
         if (s_phase != VOICE_PLAYING) {
 #if VOICE_HARDWARE_ENABLED
@@ -161,7 +200,8 @@ void voice_on_audio_chunk(const uint8_t *data, size_t len, bool end)
                 audio_playback_start();
             }
             post_voice_icons();
-            ESP_LOGI(TAG, "play start");
+            show("THINKING", "正在回复（不采集）");
+            ESP_LOGI(TAG, "play start sid=%s", s_session_id);
         }
         s_phase = VOICE_PLAYING;
         audio_playback_write(data, len);
@@ -191,8 +231,12 @@ void voice_loop(void)
 #if !VOICE_HARDWARE_ENABLED
     return;
 #endif
+    if (ble_prov_active()) {
+        return;
+    }
     if (s_phase == VOICE_PLAYING) {
-        if (s_audio_end && audio_playback_should_stop()) {
+        /* 服务端发完 + 本地缓冲播完 */
+        if (s_audio_end && audio_playback_pending() == 0 && audio_playback_should_stop()) {
             finish_turn(false);
         }
         return;
@@ -212,7 +256,6 @@ void voice_loop(void)
     }
 
     if (s_phase == VOICE_UPLOADING) {
-        (void)audio_capture_poll();
         if (s_upload_done) {
             s_upload_done = false;
             if (!s_upload_ok) {
@@ -237,25 +280,40 @@ void voice_loop(void)
         return;
     }
 
-    size_t peak = audio_capture_poll();
-    size_t rms = audio_capture_rms();
+    uint32_t seq = audio_capture_frame_seq();
+    if (seq == s_last_vad_seq) {
+        return;
+    }
+    s_last_vad_seq = seq;
+
+    float peak = audio_capture_peak();
+    float rms = audio_capture_rms();
+
+    if (s_vad.noise_init_frames < VAD_NOISE_INIT_FRAMES) {
+        int n = s_vad.noise_init_frames;
+        s_vad.noise_rms = (s_vad.noise_rms * (float)n + rms) / (float)(n + 1);
+        s_vad.noise_peak = (s_vad.noise_peak * (float)n + peak) / (float)(n + 1);
+        s_vad.noise_init_frames++;
+        return;
+    }
+
     if (now_us() - s_last_diag_us > 2000000) {
         s_last_diag_us = now_us();
         ESP_LOGI(TAG,
-                 "phase=%d listen=%d peak=%u rms=%u noise=%u/%u th=%u/%u pcm=%u ws=%d",
-                 s_phase, (int)s_listening, (unsigned)peak, (unsigned)rms,
-                 (unsigned)s_noise_peak, (unsigned)s_noise_rms,
-                 (unsigned)start_peak_th(), (unsigned)start_rms_th(),
-                 (unsigned)audio_capture_size(), (int)net_ws_ready());
+                 "phase=%d listen=%d rms=%.4f peak=%.4f noise=%.4f/%.4f th=%.4f/%.4f pcm=%u ws=%d",
+                 s_phase, (int)s_listening, rms, peak, s_vad.noise_rms, s_vad.noise_peak,
+                 start_rms_th(), start_peak_th(), (unsigned)audio_capture_size(),
+                 (int)net_ws_ready());
     }
+
     if (s_phase == VOICE_LISTEN) {
         if (now_us() < s_cooldown_until_us) {
-            update_noise(peak, rms);
+            update_noise_baseline(rms, peak);
             return;
         }
-        bool speech = peak >= start_peak_th() && rms >= start_rms_th();
-        if (!speech) {
-            update_noise(peak, rms);
+        bool start = (rms > start_rms_th()) && (peak > start_peak_th());
+        if (!start) {
+            update_noise_baseline(rms, peak);
             return;
         }
         if (!net_ws_ready()) {
@@ -264,15 +322,21 @@ void voice_loop(void)
         audio_capture_begin_store();
         s_record_start_us = now_us();
         s_last_voice_us = now_us();
+        s_vad.in_speech = true;
+        s_stream_sent = 0;
+        s_stream_active = false;
+        s_stream_failed = false;
+        s_session_id[0] = '\0';
         s_phase = VOICE_RECORDING;
-        ESP_LOGI(TAG, "VAD start peak=%u rms=%u th=%u/%u", (unsigned)peak, (unsigned)rms,
-                 (unsigned)start_peak_th(), (unsigned)start_rms_th());
+        ESP_LOGI(TAG, "VAD start rms=%.4f peak=%.4f th=%.4f/%.4f", rms, peak, start_rms_th(),
+                 start_peak_th());
         show("THINKING", "正在聆听");
         return;
     }
 
     if (s_phase == VOICE_RECORDING) {
-        if (peak >= hold_peak_th() || rms >= hold_rms_th()) {
+        bool hold = (rms > hold_rms_th()) || (peak > hold_peak_th());
+        if (hold) {
             s_last_voice_us = now_us();
         }
         int64_t dur_us = now_us() - s_record_start_us;
@@ -283,10 +347,15 @@ void voice_loop(void)
         if (!maxed && !silenced) {
             return;
         }
+        s_vad.in_speech = false;
         audio_capture_end_store();
         size_t pcm_len = audio_capture_size();
         if (pcm_len < (size_t)MIN_CLIP_BYTES) {
             ESP_LOGW(TAG, "drop short clip %u bytes", (unsigned)pcm_len);
+            if (s_stream_active) {
+                (void)net_ws_send_audio_end(s_session_id);
+                s_stream_active = false;
+            }
             audio_capture_clear();
             show("IDLE", "");
             s_phase = VOICE_LISTEN;
@@ -297,7 +366,7 @@ void voice_loop(void)
         s_upload_done = false;
         s_upload_pending = true;
         s_phase = VOICE_UPLOADING;
-        show("THINKING", "正在上传");
+        /* stay on listening caption; skip upload caption */
     }
 }
 
@@ -306,6 +375,38 @@ void voice_net_poll(void)
 #if !VOICE_HARDWARE_ENABLED
     return;
 #endif
+    /* During RECORDING: open stream once, then push 4KB chunks while capturing. */
+    if (s_phase == VOICE_RECORDING) {
+        if (!net_ws_ready()) {
+            return;
+        }
+        if (!s_stream_active && !s_stream_failed) {
+            s_session_id[0] = '\0';
+            if (net_ws_send_audio_stream_begin(s_session_id, sizeof(s_session_id))) {
+                s_stream_active = true;
+                ESP_LOGI(TAG, "stream begin session=%s", s_session_id);
+            } else {
+                s_stream_failed = true;
+                ESP_LOGW(TAG, "stream begin failed, will bulk-upload");
+            }
+        }
+        if (s_stream_active) {
+            const uint8_t *pcm = audio_capture_data();
+            size_t total = audio_capture_size();
+            while (total >= s_stream_sent + (size_t)VOICE_UPLOAD_CHUNK) {
+                if (!net_ws_send_audio_binary(pcm + s_stream_sent, (size_t)VOICE_UPLOAD_CHUNK)) {
+                    ESP_LOGW(TAG, "stream chunk failed @%u", (unsigned)s_stream_sent);
+                    s_stream_failed = true;
+                    s_stream_active = false;
+                    break;
+                }
+                s_stream_sent += (size_t)VOICE_UPLOAD_CHUNK;
+                break; /* one chunk per poll */
+            }
+        }
+        return;
+    }
+
     if (!s_upload_pending) {
         return;
     }
@@ -315,15 +416,39 @@ void voice_net_poll(void)
         s_upload_done = true;
         return;
     }
+
     const uint8_t *pcm = audio_capture_data();
     size_t pcm_len = audio_capture_size();
-    s_session_id[0] = '\0';
-    bool ok = net_ws_send_audio_upload(pcm, pcm_len, s_session_id, sizeof(s_session_id));
-    if (ok) {
-        ESP_LOGI(TAG, "uploaded %u bytes session=%s", (unsigned)pcm_len, s_session_id);
+    bool ok = false;
+
+    if (s_stream_active) {
+        /* Flush remainder then audio_end. */
+        if (pcm_len > s_stream_sent) {
+            size_t left = pcm_len - s_stream_sent;
+            if (!net_ws_send_audio_binary(pcm + s_stream_sent, left)) {
+                ESP_LOGW(TAG, "stream flush failed left=%u", (unsigned)left);
+                ok = false;
+            } else {
+                s_stream_sent = pcm_len;
+                ok = net_ws_send_audio_end(s_session_id);
+            }
+        } else {
+            ok = net_ws_send_audio_end(s_session_id);
+        }
+        ESP_LOGI(TAG, "stream end session=%s sent=%u ok=%d", s_session_id, (unsigned)s_stream_sent,
+                 (int)ok);
+        s_stream_active = false;
     } else {
-        ESP_LOGW(TAG, "upload failed len=%u", (unsigned)pcm_len);
+        /* Fallback: one-shot upload (legacy). */
+        s_session_id[0] = '\0';
+        ok = net_ws_send_audio_upload(pcm, pcm_len, s_session_id, sizeof(s_session_id));
+        if (ok) {
+            ESP_LOGI(TAG, "uploaded %u bytes session=%s", (unsigned)pcm_len, s_session_id);
+        } else {
+            ESP_LOGW(TAG, "upload failed len=%u", (unsigned)pcm_len);
+        }
     }
+
     s_upload_ok = ok;
     s_upload_pending = false;
     s_upload_done = true;

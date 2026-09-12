@@ -30,7 +30,7 @@ body{padding:0 0 24px}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
 .pill.ok .dot{background:var(--ok)}.pill.warn .dot{background:var(--warn)}.pill.bad .dot{background:var(--bad)}
 .wrap{max-width:1360px;margin:18px auto 0;padding:0 20px;display:grid;gap:16px}
-.workspace{display:grid;grid-template-columns:minmax(280px,1fr) minmax(340px,.85fr);gap:16px;align-items:stretch}
+.workspace{display:grid;grid-template-columns:minmax(320px,1.05fr) minmax(340px,.85fr);gap:16px;align-items:start}
 .stack{display:flex;flex-direction:column;gap:10px;min-width:0}
 .card{
   background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
@@ -40,22 +40,18 @@ body{padding:0 0 24px}
   margin:0 0 8px;font-size:11px;font-weight:600;letter-spacing:.1em;
   color:var(--muted);text-transform:uppercase
 }
-.status-hero{min-height:0;height:100%;overflow:hidden;display:flex;flex-direction:column}
-.status-face{
-  flex:1 1 0;min-height:0;display:flex;align-items:center;justify-content:center;
-  background:#10151B;border:1px solid var(--line);border-radius:10px;margin:0 0 8px;overflow:hidden
-}
-.status-face img{
-  width:90px;height:90px;max-width:90px;max-height:90px;
-  object-fit:contain;min-width:0;min-height:0
-}
-.status-name{font-size:22px;line-height:1.15;font-weight:700;color:var(--accent);letter-spacing:.03em;flex:0 0 auto}
-.status-src{margin-top:4px;color:var(--muted);font-size:13px;flex:0 0 auto}
+.status-hero{min-height:0;height:auto;overflow:hidden;display:flex;flex-direction:column;gap:12px}
+.status-main{display:flex;align-items:center;gap:16px;min-height:0;margin:0;flex:0 0 auto}
+.status-face{flex:0 0 auto;width:148px;height:148px;display:flex;align-items:center;justify-content:center;background:#10151B;border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.status-face img{width:148px;height:148px;max-width:148px;max-height:148px;object-fit:contain;min-width:0;min-height:0}
+.status-copy{min-width:0;flex:1 1 auto;display:flex;flex-direction:column;gap:4px;justify-content:center}
+.status-name{font-size:30px;line-height:1.12;font-weight:700;color:var(--accent);letter-spacing:.03em}
+.status-src{margin:0;color:var(--muted);font-size:13px}
 .status-text{
-  margin:6px 0 8px;color:#c5d0dc;font-size:14px;line-height:1.45;
-  overflow-wrap:anywhere;min-height:1.2em;max-height:2.8em;overflow:hidden;flex:0 0 auto
+  margin:0;color:#c5d0dc;font-size:14px;line-height:1.45;
+  overflow-wrap:anywhere;min-height:1.2em;max-height:2.8em;overflow:hidden
 }
-.meta{border-top:1px solid var(--line);padding-top:8px;display:grid;gap:6px;margin-top:auto;flex:0 0 auto}
+.meta{border-top:1px solid var(--line);padding-top:10px;display:grid;gap:6px;margin-top:0;flex:0 0 auto}
 .meta-row{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:13px}
 .meta-row b{color:var(--text);font-weight:550;text-align:right;overflow-wrap:anywhere}
 .composer{min-height:0}
@@ -64,7 +60,7 @@ body{padding:0 0 24px}
 .row.three{grid-template-columns:1fr 1fr auto}
 .row.two{grid-template-columns:minmax(0,1fr) auto auto;margin-top:8px}
 select,textarea,button{font:inherit}
-select,textarea{
+input[type=text],input[type=password],input[type=number],select,textarea{
   background:var(--panel2);border:1px solid var(--line);color:var(--text);
   border-radius:8px;padding:8px 10px;width:100%;min-width:0
 }
@@ -151,12 +147,16 @@ button:disabled{opacity:.5;cursor:not-allowed}
   <section class="workspace">
     <section class="card status-hero">
       <h2>当前显示</h2>
-      <div class="status-face">
-        <img id="status-gif" alt="当前状态表情" src="/gifs/IDLE.gif" data-status="IDLE" width="90" height="90">
+      <div class="status-main">
+        <div class="status-face">
+          <img id="status-gif" alt="当前状态表情" src="/gifs/IDLE.gif" data-status="IDLE" width="148" height="148">
+        </div>
+        <div class="status-copy">
+          <div id="status" class="status-name">等待中</div>
+          <div id="source" class="status-src">来源：BOT</div>
+          <div id="text" class="status-text">等待事件</div>
+        </div>
       </div>
-      <div id="status" class="status-name">等待中</div>
-      <div id="source" class="status-src">来源：BOT</div>
-      <div id="text" class="status-text">等待事件</div>
       <div class="meta">
         <div class="meta-row"><span>推送目标</span><b id="target">-</b></div>
         <div class="meta-row"><span>推送失败次数</span><b id="failures">0</b></div>
@@ -214,6 +214,41 @@ button:disabled{opacity:.5;cursor:not-allowed}
       </section>
     </div>
   </section>
+  
+  <section class="card" id="ble-card" style="margin-top:16px">
+    <h2>BLE 配网（替代 SerialTest）</h2>
+    <p style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.5">
+      先在设备上长按 <b>BOOT 3 秒</b>（不要按 RST），屏幕出现蓝牙标志后再点「扫描」。
+      <b>不会弹出</b> Windows 蓝牙配对框（这是 BLE GATT，不是经典蓝牙配对）。
+      也不要在「系统设置 → 蓝牙」里找/配对 AgentDisplay；请只用本页扫描。
+      本机蓝牙需保持开启；若扫不到请刷新页面（需后端已重启加载 BLE 接口）。
+    </p>
+    <div class="row three" style="margin-bottom:8px">
+      <button id="ble-scan-btn" type="button">扫描 AgentDisplay</button>
+      <select id="ble-device" aria-label="设备">
+        <option value="">先扫描设备</option>
+      </select>
+      <button id="ble-apply-btn" class="btn-status" type="button">写入并 APPLY</button>
+    </div>
+    <div class="row three">
+      <input id="ble-ssid" type="text" maxlength="32" placeholder="WiFi SSID" autocomplete="off">
+      <input id="ble-pass" type="password" maxlength="64" placeholder="WiFi 密码" autocomplete="off">
+      <span></span>
+    </div>
+    <div class="row three" style="margin-top:8px">
+      <input id="ble-host" type="text" maxlength="64" placeholder="后端 IP" autocomplete="off">
+      <input id="ble-port" type="number" min="1" max="65535" value="8000" placeholder="端口">
+      <span></span>
+    </div>
+    <div class="row three" style="margin-top:8px">
+      <input id="ble-ip" type="text" maxlength="15" placeholder="设备静态 IP（可选）" autocomplete="off">
+      <input id="ble-mask" type="text" maxlength="15" placeholder="掩码（可选）" autocomplete="off">
+      <input id="ble-gw" type="text" maxlength="15" placeholder="网关（可选）" autocomplete="off">
+    </div>
+    <div id="ble-result" class="send-result" style="margin-top:8px"></div>
+    <div id="ble-log" class="logs" style="max-height:140px;margin-top:8px;font-family:Consolas,monospace;font-size:12px;color:var(--muted)"></div>
+  </section>
+
   <section class="boards">
     <section class="card board">
       <div class="log-title"><h2>状态历史</h2><span id="log-count" class="log-count">0 条</span></div>
@@ -325,7 +360,7 @@ async function sendStatus(){
   try{
     const data=await postJson('/event/status',payload);
     result.className='send-result ok';
-    result.textContent=data.debounced?'状态已排队（防抖）':'状态已发送';
+    result.textContent=data.debounced?'已忽略（与上次相同）':'状态已发送';
     refresh();
   }catch(err){
     result.className='send-result bad';
@@ -362,6 +397,92 @@ async function sendText(speak=false){
     other.disabled=false;
   }
 }
+
+async function bleRefreshStatus(){
+  try{
+    const st=await fetch('/api/ble/status',{cache:'no-store'}).then(r=>r.json());
+    if($('ble-host') && !$('ble-host').dataset.touched && st.suggested_host){
+      $('ble-host').value=st.suggested_host;
+    }
+    if($('ble-port') && !$('ble-port').dataset.touched && st.suggested_port){
+      $('ble-port').value=st.suggested_port;
+    }
+    const box=$('ble-log');
+    if(box && Array.isArray(st.logs)){
+      box.innerHTML=st.logs.slice(0,12).map(x=>{
+        const t=new Date((x.ts||0)*1000).toLocaleTimeString('zh-CN');
+        return `<div>[${t}] ${x.level}: ${String(x.msg||'')}</div>`;
+      }).join('') || '<div class="empty">暂无 BLE 日志</div>';
+    }
+    if(st.bleak_ok===false){
+      const r=$('ble-result');
+      if(r){r.className='send-result bad';r.textContent='后端缺少 bleak，请 pip install bleak';}
+    }
+    return st;
+  }catch(e){
+    return null;
+  }
+}
+async function bleScan(){
+  const btn=$('ble-scan-btn');
+  const result=$('ble-result');
+  const sel=$('ble-device');
+  btn.disabled=true; result.className='send-result'; result.textContent='扫描中（约6秒）…';
+  try{
+    const data=await postJson('/api/ble/scan',{timeout:6});
+    const devices=data.devices||[];
+    sel.innerHTML='';
+    if(!devices.length){
+      sel.innerHTML='<option value="">未找到 AgentDisplay</option>';
+      result.className='send-result bad';
+      result.textContent='未找到设备，请确认已长按 BOOT 进入配网';
+    }else{
+      for(const d of devices){
+        const opt=document.createElement('option');
+        opt.value=d.address;
+        opt.textContent=`${d.name||'AgentDisplay'}  ${d.address}  RSSI ${d.rssi??'-'}`;
+        sel.appendChild(opt);
+      }
+      result.className='send-result ok';
+      result.textContent=`找到 ${devices.length} 台，可填写 WiFi 后点击写入`;
+    }
+    await bleRefreshStatus();
+  }catch(err){
+    result.className='send-result bad';
+    result.textContent=String(err.message||err);
+  }finally{btn.disabled=false;}
+}
+async function bleApply(){
+  const btn=$('ble-apply-btn');
+  const result=$('ble-result');
+  const payload={
+    ssid:$('ble-ssid').value.trim(),
+    password:$('ble-pass').value,
+    host:$('ble-host').value.trim(),
+    port:Number($('ble-port').value||8000),
+    address:$('ble-device').value||null,
+    ip:$('ble-ip').value.trim()||null,
+    netmask:$('ble-mask').value.trim()||null,
+    gateway:$('ble-gw').value.trim()||null,
+  };
+  if(!payload.ssid||!payload.host){
+    result.className='send-result bad';
+    result.textContent='请填写 SSID 与后端 IP';
+    return;
+  }
+  btn.disabled=true; result.className='send-result'; result.textContent='连接并写入中…';
+  try{
+    const data=await postJson('/api/ble/provision',payload);
+    result.className='send-result ok';
+    result.textContent=`配网成功：${data.ssid} -> ${data.host}（${data.apply||'OK'}）`;
+    await bleRefreshStatus();
+  }catch(err){
+    result.className='send-result bad';
+    result.textContent=String(err.message||err);
+    await bleRefreshStatus();
+  }finally{btn.disabled=false;}
+}
+
 async function refresh(){
   try{
     const d=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());
@@ -426,20 +547,34 @@ async function saveVolume(p){
   setVolumeUi(data.volume_percent);
 }
 $('volume-slider').addEventListener('pointerdown',()=>{volumeDragging=true});
-$('volume-slider').addEventListener('pointerup',()=>{volumeDragging=false});
+$('volume-slider').addEventListener('pointerup',()=>{
+  volumeDragging=false;
+  clearTimeout(volumeSaveTimer);
+  saveVolume($('volume-slider').value).catch(err=>{
+    $('text-result').className='send-result bad';
+    $('text-result').textContent=String(err.message||err);
+  });
+});
 $('volume-slider').addEventListener('pointercancel',()=>{volumeDragging=false});
 $('volume-slider').addEventListener('input',e=>{
   setVolumeUi(e.target.value);
-  clearTimeout(volumeSaveTimer);
-  volumeSaveTimer=setTimeout(()=>{
-    saveVolume(e.target.value).catch(err=>{
-      $('text-result').className='send-result bad';
-      $('text-result').textContent=String(err.message||err);
-    });
-  },280);
+  // 仅拖动时预览；松手再保存，避免页面轮询/误触把音量打回很低
+});
+$('volume-slider').addEventListener('change',e=>{
+  saveVolume(e.target.value).catch(err=>{
+    $('text-result').className='send-result bad';
+    $('text-result').textContent=String(err.message||err);
+  });
 });
 connectLogsWs();
 refresh();
+
+$('ble-scan-btn')?.addEventListener('click', bleScan);
+$('ble-apply-btn')?.addEventListener('click', bleApply);
+$('ble-host')?.addEventListener('input',()=>{$('ble-host').dataset.touched='1';});
+$('ble-port')?.addEventListener('input',()=>{$('ble-port').dataset.touched='1';});
+bleRefreshStatus();
+
 setInterval(refresh,1000);
 </script>
 </body>

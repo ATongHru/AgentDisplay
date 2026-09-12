@@ -5,6 +5,9 @@ idf_component_register(
         "ui.c"
         "anim_loader.c"
         "net_ws.c"
+        "ble_prov.c"
+        "btn_boot.c"
+        "agent_cfg.c"
         "audio.c"
         "voice.c"
         "font_cjk_16.c"
@@ -18,6 +21,7 @@ idf_component_register(
         esp_netif
         esp_timer
         nvs_flash
+        bt
         json
         vfs
         esp_partition

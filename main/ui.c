@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -59,6 +60,7 @@ static bool voice_listening;
 static bool voice_playing;
 static bool voice_text_visible;
 static bool voice_session;
+static bool s_ble_prov;
 static bool caption_mode;
 static bool caption_suppress_append;
 static bool bar_hidden;
@@ -231,9 +233,95 @@ static void decode_frame_rle(const frame_data_t *frame, uint8_t *dest, size_t de
     }
 }
 
+
+static void render_frame(void);
+static void apply_agent_status_label(const char *status);
+
+static void put_px(uint8_t *buf, int x, int y, uint16_t color)
+{
+    if (x < 0 || y < 0 || x >= FACE_SIZE || y >= FACE_SIZE) {
+        return;
+    }
+    size_t i = ((size_t)y * (size_t)FACE_SIZE + (size_t)x) * 2;
+    buf[i] = (uint8_t)(color & 0xFF);
+    buf[i + 1] = (uint8_t)(color >> 8);
+}
+
+static void draw_thick_line(uint8_t *buf, int x0, int y0, int x1, int y1, uint16_t color, int thick)
+{
+    int dx = abs(x1 - x0);
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0);
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        for (int ty = -thick; ty <= thick; ++ty) {
+            for (int tx = -thick; tx <= thick; ++tx) {
+                if (tx * tx + ty * ty <= thick * thick) {
+                    put_px(buf, x0 + tx, y0 + ty, color);
+                }
+            }
+        }
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+/* Classic Bluetooth rune on face background. Color #3B82F6. */
+static void render_bluetooth_face(void)
+{
+    fill_rgb565_bg(frame_buffer_a, sizeof(frame_buffer_a));
+    frame_buffer_front = frame_buffer_a;
+    const uint16_t blue = 0x3C1E; /* RGB565 #3B82F6 */
+    const int cx = FACE_SIZE / 2;
+    const int cy = FACE_SIZE / 2;
+    const int s = FACE_SIZE / 3;
+    draw_thick_line(frame_buffer_front, cx, cy - s, cx, cy + s, blue, 3);
+    draw_thick_line(frame_buffer_front, cx, cy - s, cx + (s * 2) / 3, cy - s / 3, blue, 3);
+    draw_thick_line(frame_buffer_front, cx + (s * 2) / 3, cy - s / 3, cx, cy, blue, 3);
+    draw_thick_line(frame_buffer_front, cx, cy + s, cx + (s * 2) / 3, cy + s / 3, blue, 3);
+    draw_thick_line(frame_buffer_front, cx + (s * 2) / 3, cy + s / 3, cx, cy, blue, 3);
+}
+
+static void apply_ble_prov_ui(bool on)
+{
+    s_ble_prov = on;
+    if (on) {
+        render_bluetooth_face();
+        display_blit_rgb565(frame_buffer_front, FACE_X, FACE_Y, FACE_SIZE, FACE_SIZE);
+        if (status_label) {
+            lv_obj_clear_flag(status_label, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(status_label, "蓝牙配网");
+            lv_obj_set_style_text_color(status_label, lv_color_hex(0x60A5FA), 0);
+        }
+        if (source_label) {
+            lv_label_set_text(source_label, "BLE");
+        }
+    } else {
+        if (source_label) {
+            lv_label_set_text(source_label, current_source[0] ? current_source : "BOT");
+        }
+        apply_agent_status_label(current_status);
+        render_frame();
+    }
+}
+
 static void blit_face_frame(void)
 {
-    if (!frame_buffer_front || animation_count == 0) {
+    if (!frame_buffer_front) {
+        return;
+    }
+    if (!s_ble_prov && animation_count == 0) {
         return;
     }
     display_blit_rgb565(frame_buffer_front, FACE_X, FACE_Y, FACE_SIZE, FACE_SIZE);
@@ -665,6 +753,8 @@ static void process_messages(void)
         } else if (msg.type == UI_MSG_TIME_TICK) {
             refresh_time_label();
             update_status_bar_ui();
+        } else if (msg.type == UI_MSG_BLE_PROV) {
+            apply_ble_prov_ui(msg.ble_prov);
         }
     }
 }
@@ -779,6 +869,12 @@ void ui_post_time_tick(void)
     ui_msg_t msg = {.type = UI_MSG_TIME_TICK};
     ui_post(&msg);
 }
+void ui_post_ble_prov(bool on)
+{
+    ui_msg_t msg = {.type = UI_MSG_BLE_PROV, .ble_prov = on};
+    ui_post(&msg);
+}
+
 
 esp_err_t ui_init(void)
 {
@@ -809,6 +905,9 @@ void ui_loop_once(void)
 
 void ui_tick_animation(uint32_t now_ms)
 {
+    if (s_ble_prov) {
+        return;
+    }
     if (animation_count == 0 || animations[animation_index].count == 0) {
         return;
     }

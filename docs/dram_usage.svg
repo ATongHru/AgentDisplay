@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="304" viewBox="0 0 1000 304">
+<rect width="1000" height="304" rx="16" fill="#0B1220"/>
+<text x="28" y="36" fill="#F8FAFC" font-size="22" font-family="Segoe UI,Microsoft YaHei,sans-serif" font-weight="700">片内 DRAM（约 512KB 可用池示意）</text>
+<text x="28" y="58" fill="#94A3B8" font-size="13" font-family="Segoe UI,Microsoft YaHei,sans-serif">左侧色条宽度相对 512KB 示意池；BLE 前需 wifi_deinit 腾连续块</text>
+<rect x="28.0" y="78" width="396.5" height="52" rx="8" fill="#1E293B" stroke="#475569" stroke-width="1.5"/>
+<rect x="28.0" y="78" width="61.9" height="52" rx="8" fill="#A78BFA"/>
+<text x="442.5" y="100" fill="#F8FAFC" font-size="15" font-weight="700" font-family="Segoe UI,Microsoft YaHei,sans-serif">1. 任务栈等（估）  ·  80.0 KB  (15.62% 示意池)</text>
+<text x="442.5" y="120" fill="#94A3B8" font-size="12" font-family="Consolas,Segoe UI,Microsoft YaHei,monospace">FreeRTOS 各任务栈</text>
+<rect x="28.0" y="144" width="396.5" height="52" rx="8" fill="#1E293B" stroke="#475569" stroke-width="1.5"/>
+<rect x="28.0" y="144" width="24.8" height="52" rx="8" fill="#C084FC"/>
+<text x="442.5" y="166" fill="#F8FAFC" font-size="15" font-weight="700" font-family="Segoe UI,Microsoft YaHei,sans-serif">2. SPIRAM 预留片内  ·  32.0 KB  (6.25% 示意池)</text>
+<text x="442.5" y="186" fill="#94A3B8" font-size="12" font-family="Consolas,Segoe UI,Microsoft YaHei,monospace">sdkconfig SPIRAM_MALLOC_RESERVE_INTERNAL</text>
+<rect x="28.0" y="210" width="396.5" height="52" rx="8" fill="#1E293B" stroke="#475569" stroke-width="1.5"/>
+<rect x="28.0" y="210" width="24.5" height="52" rx="8" fill="#E879F9"/>
+<text x="442.5" y="232" fill="#F8FAFC" font-size="15" font-weight="700" font-family="Segoe UI,Microsoft YaHei,sans-serif">3. 表情双缓冲 BSS  ·  31.6 KB  (6.18% 示意池)</text>
+<text x="442.5" y="252" fill="#94A3B8" font-size="12" font-family="Consolas,Segoe UI,Microsoft YaHei,monospace">main/ui.c → frame_buffer_a/b</text>
+</svg>

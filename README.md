@@ -102,44 +102,126 @@ menuconfig 必须：CPU **240 MHz**、双核（非 unicore）、OPI PSRAM、自�
 
 WiFi SSID、密码、静态 IP 与 WebSocket 后端地址在 menuconfig「Agent Display」中配置，不要把密钥提交进仓库。LLM 密钥只放 `backend/.env`。
 
-### 分区（16 MB）与占用
+### 存储占用图（Flash / PSRAM / 片内 DRAM）
 
-整片 Flash 16 MB。分区定义见 `partitions.csv`。**已用**指当前实际烧进去的镜像大小；NVS / coredump 为运行时写入，表中标「运行时」。
+下面三张图比表格更直观：
 
-启动区（不在 csv 里，偏移 0x0）：bootloader **22,208 B** / 32 KB 槽（IDF 计 **32% 空闲**）。
+1. **上部总览条**：整片介质按真实比例（Flash 按地址；PSRAM 按缓冲 + 空闲堆）
+2. **下方子长方形**：每项一行，色条宽度 = 相对整片占比，**由高占用到低**
+3. **右侧文字**：名称、大小、占比，以及对应**文件 / 源码位置**
 
-| 分区 | 偏移 | 容量 | 已用 | 占用 | 存什么 | 状态 |
-|------|------|------|------|------|--------|------|
-| nvs | 0x9000 | 20 KB | 运行时 | — | WiFi、校准、IDF 键值 | 系统 |
-| otadata | 0xE000 | 8 KB | 8,192 B | 100% | OTA 槽位选择 | 已烧录初始 otadata |
-| app0 | 0x10000 | 3 MB | **1,683,616 B**（1.61 MB） | **54%** | 固件、`font_cjk_16` 一级汉字库、业务代码 | 已烧录；余 1,462,112 B（46%） |
-| spiffs | 0x310000 | 896 KB | 0 | 0% | 遗留 SPIFFS，当前未挂载 | 空闲（遗留） |
-| coredump | 0x3F0000 | 64 KB | 运行时 | — | 崩溃转储 | 空闲，崩溃时写入 |
-| voice_font | 0x400000 | 2 MB | 0 | 0% | 旧语音 bin 字库槽；一级字已编进 app | 空闲 |
-| animations | 0x600000 | 6 MB | **3,557,266 B**（3.39 MB） | **57%** | 表情 RGB565 RLE（`animations.bin`） | 已烧录；余约 2.61 MB |
-| storage | 0xC00000 | 4 MB | 0 | 0% | 预留用户数据 / 后续资源 | 空闲预留 |
+![Flash 16MB 占用](docs/flash_usage.svg)
 
-app 内 `font_cjk_16` 位图 `.rodata.glyph_bitmap` = `0x669d1`（约 410 KB），加 glyph 描述后字库约 **446 KB**，计入上面的 1.61 MB app，不再占 `voice_font` 分区。
+![PSRAM 8MB 占用](docs/psram_usage.svg)
 
-整片当前**已烧录镜像合计约 5.03 MB / 16 MB**（bootloader + 表 + otadata + app + animations）。
+![片内 DRAM 示意](docs/dram_usage.svg)
 
-`scripts/flash_animations.py` 写偏移 **0x600000**。运行时 `esp_partition_find_first(DATA, 0x98, "animations")` + mmap。
+> 图片：`docs/flash_usage.svg` / `psram_usage.svg` / `dram_usage.svg`。体积变化后可运行 `python scripts/gen_mem_svg.py` 重新生成。  
+> 当前镜像体积：app ≈ **1.80 MB**，`animations.bin` ≈ **3.39 MB**（烧录偏移 `0x600000`）。
 
-### 烧录镜像
+#### Flash 分区速查表
 
-全量烧录需依次写入以下镜像（偏移见上表）：
+| 分区 | 偏移 | 容量 | 已用 | 文件 / 内容 |
+|------|------|------|------|-------------|
+| bootloader | `0x000000` | 32 KB | 21.8 KB | `build/bootloader/bootloader.bin` |
+| partition-table | `0x008000` | 4 KB | 3.0 KB | `build/partition_table/partition-table.bin` |
+| nvs | `0x009000` | 20 KB | 运行时 | BLE/`agent_cfg`、WiFi 等 NVS |
+| otadata | `0x00E000` | 8 KB | 8.0 KB | `build/ota_data_initial.bin` |
+| **app0** | `0x010000` | **3 MB** | **1.80 MB** | `build/esp32s3_agent_display.bin`（含 CJK） |
+| spiffs | `0x310000` | 896 KB | 0 | 遗留空 |
+| coredump | `0x3F0000` | 64 KB | 运行时 | 崩溃转储 |
+| voice_font | `0x400000` | 2 MB | 0 | 旧字库槽（空） |
+| **animations** | `0x600000` | **6 MB** | **3.39 MB** | `firmware/data/animations.bin`（mmap） |
+| storage | `0xC00000` | 4 MB | 0 | 预留 |
 
-| 镜像 | 偏移 |
+分区定义：`partitions.csv`。烧录动画：`scripts/flash_animations.py` → `0x600000`。
+
+#### 运行时缓冲速查
+
+| 缓冲 | 介质 | 大小 | 源码 |
+|------|------|------|------|
+| 录音 PCM | **PSRAM** | 320 KB | `main/audio.c` `VOICE_MAX_RECORD_BYTES` |
+| 播放 ring | **PSRAM** | 128 KB | `main/audio.c` `VOICE_PLAY_RING_BYTES` |
+| LVGL partial×2 | **PSRAM（优先）** | ≈19 KB | `main/display.c` `PARTIAL_BUF_LINES=20` |
+| 表情双缓冲 | **片内 DRAM** | ≈32 KB | `main/ui.c` BSS |
+| NimBLE/WiFi DMA | **片内 DRAM** | 动态 | 配网前 `wifi_deinit` 腾连续块 |
+
+## BLE 配网（实现说明）
+
+ESP32-S3 **仅 BLE**（无经典蓝牙 SPP）。配网使用 **NimBLE + Nordic UART Service（NUS）**；Windows 系统「蓝牙设置」里通常**不会**弹出配对框，也**搜不到/配不上**——请用本仓库网页或 SerialTest（LE）。
+
+### 触发方式
+
+| 操作 | 结果 |
 |------|------|
-| bootloader.bin | 0x0 |
-| partition-table.bin | 0x8000 |
-| ota_data_initial.bin | 0xE000 |
-| esp32s3_agent_display.bin | 0x10000 |
-| animations.bin | 0x600000 |
+| 运行中**长按 BOOT ≥ 3 秒**（不要按 RST） | 进入配网：广播名 `AgentDisplay`，屏幕大号蓝色蓝牙图标 |
+| 按住 BOOT → 短按 RST | 下载模式（strapping），与配网无关 |
 
-串口端口以本机检测结果为准（如 `COMx`）。烧录后需复位；未烧 `animations.bin` 则有字无表情。
+配网窗口最长约 **5 分钟**；`APPLY` 成功后约 0.5 s 结束广播并重连 WiFi/WS。
 
----
+### 固件实现要点
+
+| 模块 | 文件 | 作用 |
+|------|------|------|
+| 按键 | `main/btn_boot.c` | 独立任务轮询 GPIO0；按住满 3 s 即触发（不必等松手） |
+| BLE | `main/ble_prov.c` | 用户触发后才 `nimble_port_init`；NUS RX 收行、TX notify 回执 |
+| 配置 | `main/agent_cfg.c` | NVS 存 SSID/密码/`ws_url`/可选静态 IP·掩码·网关 |
+| 网络 | `main/net_ws.c` | 进 BLE 前 `net_pause_for_ble()`（`wifi_stop`+`wifi_deinit`）腾片内 RAM；结束后 `net_resume_after_ble()` |
+| UI | `main/ui.c` | `UI_MSG_BLE_PROV` 时画蓝牙标志并暂停 GIF 刷新 |
+
+**为何必须先拆 WiFi：** 与 WiFi 并存时片内连续空闲往往不足 10 KB，BT controller `Malloc failed` 会断言重启。实测 `wifi_deinit` 后 internal largest 可到 ~30 KB+，NimBLE 才能起来。LVGL 刷图缓冲也改为**优先 PSRAM**，避免占掉 BT 所需 DRAM。
+
+NUS UUID（标准 Nordic UART）：
+
+| 角色 | UUID |
+|------|------|
+| Service | `6E400001-B5A3-F393-E0A9-E50E24DCCA9E` |
+| RX（手机/PC → 设备，Write / Write NR） | `6E400002-…` |
+| TX（设备 → 手机/PC，Notify） | `6E400003-…` |
+
+### 文本协议（UTF-8，行尾 `\n`）
+
+```text
+WIFI:<ssid>,<password>
+HOST:<ip>:<port>
+IP:<x.x.x.x>          # 可选，设备静态 IP；空则 DHCP（或沿用 NVS/Kconfig）
+MASK:<x.x.x.x>        # 可选，子网掩码
+GW:<x.x.x.x>          # 可选，网关/DNS
+GET
+APPLY
+```
+
+| 命令 | 设备应答示例 | 说明 |
+|------|--------------|------|
+| `WIFI:…` | `OK wifi` | 写入内存中的 SSID/密码 |
+| `HOST:…` | `OK host` | 写成 `ws://<ip>:<port>/ws` |
+| `IP:` / `MASK:` / `GW:` | `OK ip` / `OK mask` / `OK gw` | 可选静态地址；仅当 `IP` 非空时 APPLY 后走静态 |
+| `GET` | `OK ssid=… host=… ip=… mask=… gw=…` | 不回传 WiFi 密码 |
+| `APPLY` | `OK apply` | `agent_cfg_save` → `net_apply_config` 重连 |
+
+出厂默认仍可读 menuconfig 的 WiFi/WS/静态 IP；BLE 写入 NVS 后优先用 NVS。
+
+### 推荐：网页配网（后端 Python + bleak）
+
+SerialTest 在部分 Windows 上连接会崩溃，故后端用 [bleak](https://github.com/hbldh/bleak) 直连 GATT，控制台填表下发。
+
+1. `pip install -r backend/requirements.txt`（含 `bleak`）
+2. **重启后端**后打开控制台 → **BLE 配网** 卡片  
+3. 设备长按 BOOT 出蓝牙图标 →「扫描 AgentDisplay」→ 填 WiFi / 后端 IP:端口（及可选 IP/掩码/网关）→「写入并 APPLY」
+
+| API | 说明 |
+|-----|------|
+| `GET /api/ble/status` | bleak 是否可用、建议本机 IP、最近日志 |
+| `POST /api/ble/scan` | `{"timeout":6}` → 设备列表 |
+| `POST /api/ble/provision` | `ssid` / `password` / `host` / `port` / 可选 `address` / `ip` / `netmask` / `gateway` |
+
+实现文件：`backend/ble_prov.py`、`backend/main.py`、控制台 `backend/dashboard.html`。
+
+**Windows 注意：** 不会弹出系统蓝牙配对请求；不要在「设置 → 蓝牙」里找 `AgentDisplay`。本机蓝牙保持开启即可。
+
+### 备选：SerialTest（Bluetooth LE）
+
+与下载模式不冲突。用 [SerialTest](https://github.com/wh201906/SerialTest) 选 **Bluetooth LE**，编码 UTF-8，Suffix 勾选 `\n`，按上行协议发送。若点击连接即崩溃，请改用网页配网。
 
 ## 引脚
 
@@ -185,7 +267,7 @@ GPIO3 复位采样会在 USB Serial/JTAG 与官方 JTAG 间切换，麦 DATA 接
 | 45 / 46 | strapping（VDD_SPI / boot） |
 | 48 | 板载 RGB LED |
 
-音频：16 kHz 单声道 16 bit PCM；单段上限约 10 s；播放 ring 32 KB（PSRAM）。
+音频：16 kHz 单声道 16 bit PCM；单段上限约 10 s；播放 ring 128 KB（PSRAM）。
 
 
 ---
@@ -273,7 +355,7 @@ python scripts/flash_animations.py -p COMx
 | `hello` / `ack` | 握手 | text | `ack` 含 `server_time` 可校时 |
 | `ping` / `pong` | 双向 | text | 保活 |
 | `status` | PC→ESP | text | `status` / `text` / `source` / `gif` / `time` |
-| `audio_upload` | ESP→PC | text + binary | 语音上传，见 [VOICE.md](VOICE.md) |
+| `audio_upload` | ESP→PC | text + binary | 语音上传，见 [VOICE.md](docs/VOICE.md) |
 | `session` | PC→ESP | text | 语音会话 ID |
 | `audio_chunk` / `append` | PC→ESP | text + binary 或 text | TTS 分片 / LLM 流式字幕 |
 | `config` | PC→ESP | text | 如 `volume_percent` |
@@ -281,7 +363,7 @@ python scripts/flash_animations.py -p COMx
 
 `source`：`PI` / `CURSOR` / `VOICE` / `BOT` / `UNKNOWN`。
 
-**语音全流程**（VAD 参数、双帧协议、ASR/LLM/TTS 流水线、环境变量）见 **[VOICE.md](VOICE.md)**。
+**语音全流程**（VAD 参数、双帧协议、ASR/LLM/TTS 流水线、环境变量）见 **[VOICE.md](docs/VOICE.md)**。
 
 
 ---
@@ -354,12 +436,12 @@ Cursor 注册事件：`sessionStart` `beforeSubmitPrompt` `preToolUse` `postTool
 
 ## 构建与烧录
 
-需 ESP-IDF 5.4.2 环境。Git Bash 下 `export.sh` 可能因 MSYS 失败，可在仓库根目录使用 `_idf_build.bat` 包装构建。
+需 ESP-IDF 5.4.2 环境。Git Bash 下 `export.sh` 可能因 MSYS 失败，可用 `scripts/idf_build.bat` 包装构建。更完整的本机安装步骤见 [开发环境搭建.md](docs/开发环境搭建.md)。
 
 于项目根目录执行：
 
 ```bat
-_idf_build.bat build
+scripts\idf_build.bat build
 idf.py -p COMx flash
 python scripts/flash_animations.py -p COMx
 idf.py -p COMx monitor
@@ -374,14 +456,16 @@ PowerShell 下先加载本机 ESP-IDF 环境配置，再 `cd` 到本项目根目
 ```text
 esp32s3-agent-display/
 ├── README.md
-├── VOICE.md                      语音收听→识别→回复全流程
 ├── start.bat / stop.bat          后端启停（打完日志退出）
-├── _idf_build.bat
 ├── partitions.csv
 ├── sdkconfig.defaults
+├── docs/                         文档与占用示意图
+│   ├── VOICE.md                  语音收听→识别→回复全流程
+│   ├── 开发环境搭建.md
+│   └── *_usage.svg               Flash / PSRAM / DRAM 图
 ├── backend/                      FastAPI + Dashboard + ASR/LLM
 ├── main/                         固件（ui / net_ws / audio / voice / font_cjk_16）
-├── scripts/                      动画、字库、烧录
+├── scripts/                      构建包装、动画、字库、烧录、内存图生成
 ├── third_party/emoji-gif/        状态 GIF
 ├── third_party/fonts/            一级字表
 └── firmware/data/animations.bin

@@ -5,9 +5,11 @@
 #include <string.h>
 #include <sys/time.h>
 
+#include "agent_cfg.h"
 #include "cJSON.h"
 #include "audio.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_sntp.h"
@@ -39,9 +41,12 @@ static bool s_expect_audio;
 static bool s_audio_end;
 static size_t s_audio_len;
 static char s_session[16];
+static char s_chunk_session[16];
 static char s_usb_line[512];
 static size_t s_usb_len;
 static bool s_usb_ready;
+static bool s_ble_paused;
+static esp_netif_t *s_sta;
 static uint32_t s_usj_sof;
 static uint32_t s_usj_ok_ms;
 
@@ -62,13 +67,17 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        if (!s_ble_paused) {
+            esp_wifi_connect();
+        }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         s_wifi = false;
         s_ws_on = false;
         xEventGroupClearBits(s_events, WIFI_OK);
         ui_post_link_state(net_usb_ready(), false, false, voice_is_listening(), audio_playback_is_active(), s_rssi);
-        esp_wifi_connect();
+        if (!s_ble_paused) {
+            esp_wifi_connect();
+        }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
         s_wifi = true;
@@ -126,17 +135,28 @@ static void handle_text(const char *text, int len)
         const cJSON *sid = cJSON_GetObjectItem(root, "session_id");
         if (cJSON_IsString(sid) && sid->valuestring) {
             strncpy(s_session, sid->valuestring, sizeof(s_session) - 1);
+            s_session[sizeof(s_session) - 1] = '\0';
             xEventGroupSetBits(s_events, SESSION_OK);
+        }
+        const cJSON *vol = cJSON_GetObjectItem(root, "volume_percent");
+        if (cJSON_IsNumber(vol)) {
+            audio_set_volume_percent((int)vol->valuedouble);
         }
     } else if (strcmp(t, "audio_chunk") == 0) {
         const cJSON *lenj = cJSON_GetObjectItem(root, "len");
         const cJSON *endj = cJSON_GetObjectItem(root, "end");
+        const cJSON *sid = cJSON_GetObjectItem(root, "session_id");
+        s_chunk_session[0] = '\0';
+        if (cJSON_IsString(sid) && sid->valuestring) {
+            strncpy(s_chunk_session, sid->valuestring, sizeof(s_chunk_session) - 1);
+            s_chunk_session[sizeof(s_chunk_session) - 1] = '\0';
+        }
         s_audio_len = cJSON_IsNumber(lenj) ? (size_t)lenj->valuedouble : 0;
         s_audio_end = cJSON_IsTrue(endj);
         if (s_audio_len > 0) {
             s_expect_audio = true;
         } else {
-            voice_on_audio_chunk(NULL, 0, s_audio_end);
+            voice_on_audio_chunk(s_chunk_session[0] ? s_chunk_session : NULL, NULL, 0, s_audio_end);
         }
     } else if (strcmp(t, "config") == 0) {
         const cJSON *vol = cJSON_GetObjectItem(root, "volume_percent");
@@ -176,7 +196,8 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                 const bool last_piece =
                     (evt->payload_len <= 0) ||
                     (evt->payload_offset + evt->data_len >= evt->payload_len);
-                voice_on_audio_chunk((const uint8_t *)evt->data_ptr, (size_t)evt->data_len,
+                voice_on_audio_chunk(s_chunk_session[0] ? s_chunk_session : NULL,
+                                     (const uint8_t *)evt->data_ptr, (size_t)evt->data_len,
                                      s_audio_end && last_piece);
                 if (last_piece) {
                     s_expect_audio = false;
@@ -222,13 +243,32 @@ static void poll_usb(void)
     }
 }
 
+static char s_ws_uri[AGENT_CFG_WS_URL_MAX];
+
+static void stop_ws(void)
+{
+    if (!s_ws) {
+        return;
+    }
+    esp_websocket_client_stop(s_ws);
+    esp_websocket_client_destroy(s_ws);
+    s_ws = NULL;
+    s_ws_on = false;
+    if (s_events) {
+        xEventGroupClearBits(s_events, WS_OK | SESSION_OK);
+    }
+}
+
 static void start_ws(void)
 {
     if (s_ws) {
         return;
     }
+    const agent_cfg_t *acfg = agent_cfg_get();
+    memset(s_ws_uri, 0, sizeof(s_ws_uri));
+    strncpy(s_ws_uri, acfg->ws_url, sizeof(s_ws_uri) - 1);
     esp_websocket_client_config_t cfg = {
-        .uri = CONFIG_AGENT_WS_URL,
+        .uri = s_ws_uri,
         .reconnect_timeout_ms = WS_RECONNECT_MS,
         .network_timeout_ms = 10000,
         .buffer_size = 8192,
@@ -236,7 +276,42 @@ static void start_ws(void)
     s_ws = esp_websocket_client_init(&cfg);
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event, NULL);
     esp_websocket_client_start(s_ws);
-    ESP_LOGI(TAG, "ws connecting %s", CONFIG_AGENT_WS_URL);
+    ESP_LOGI(TAG, "ws connecting %s", s_ws_uri);
+}
+
+
+static void apply_ip_from_cfg(void)
+{
+    if (!s_sta) {
+        return;
+    }
+    const agent_cfg_t *acfg = agent_cfg_get();
+    if (agent_cfg_has_static_ip()) {
+        esp_netif_dhcpc_stop(s_sta);
+        esp_netif_ip_info_t ip = {0};
+        ip.ip.addr = ipaddr_addr(acfg->ip);
+        const char *mask = acfg->netmask[0] ? acfg->netmask : "255.255.255.0";
+        const char *gw = acfg->gateway[0] ? acfg->gateway : "0.0.0.0";
+        ip.netmask.addr = ipaddr_addr(mask);
+        ip.gw.addr = ipaddr_addr(gw);
+        esp_err_t err = esp_netif_set_ip_info(s_sta, &ip);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "set_ip_info %s", esp_err_to_name(err));
+        }
+        if (acfg->gateway[0]) {
+            esp_netif_dns_info_t dns = {0};
+            dns.ip.u_addr.ip4.addr = ipaddr_addr(acfg->gateway);
+            dns.ip.type = ESP_IPADDR_TYPE_V4;
+            esp_netif_set_dns_info(s_sta, ESP_NETIF_DNS_MAIN, &dns);
+        }
+        ESP_LOGI(TAG, "static ip=%s mask=%s gw=%s", acfg->ip, mask, gw);
+    } else {
+        esp_err_t err = esp_netif_dhcpc_start(s_sta);
+        if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+            ESP_LOGW(TAG, "dhcpc_start %s", esp_err_to_name(err));
+        }
+        ESP_LOGI(TAG, "dhcp enabled");
+    }
 }
 
 esp_err_t net_init(void)
@@ -253,38 +328,118 @@ esp_err_t net_init(void)
     /* USB Serial/JTAG is the console; skip driver_install to avoid conflict. */
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_t *sta = esp_netif_create_default_wifi_sta();
-#if CONFIG_AGENT_WIFI_STATIC_IP
-    esp_netif_dhcpc_stop(sta);
-    esp_netif_ip_info_t ip = {0};
-    ip.ip.addr = ipaddr_addr(CONFIG_AGENT_WIFI_IP);
-    ip.gw.addr = ipaddr_addr(CONFIG_AGENT_WIFI_GATEWAY);
-    ip.netmask.addr = ipaddr_addr(CONFIG_AGENT_WIFI_NETMASK);
-    ESP_ERROR_CHECK(esp_netif_set_ip_info(sta, &ip));
-    esp_netif_dns_info_t dns = {0};
-    dns.ip.u_addr.ip4.addr = ipaddr_addr(CONFIG_AGENT_WIFI_GATEWAY);
-    dns.ip.type = ESP_IPADDR_TYPE_V4;
-    esp_netif_set_dns_info(sta, ESP_NETIF_DNS_MAIN, &dns);
-#endif
+    s_sta = esp_netif_create_default_wifi_sta();
+    apply_ip_from_cfg();
     wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event, NULL));
+    const agent_cfg_t *acfg = agent_cfg_get();
     wifi_config_t wifi_config = {0};
-    strncpy((char *)wifi_config.sta.ssid, CONFIG_AGENT_WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *)wifi_config.sta.password, CONFIG_AGENT_WIFI_PASSWORD, sizeof(wifi_config.sta.password) - 1);
+    strncpy((char *)wifi_config.sta.ssid, acfg->ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password, acfg->pass, sizeof(wifi_config.sta.password) - 1);
     wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "wifi start ssid=%s", CONFIG_AGENT_WIFI_SSID);
+    ESP_LOGI(TAG, "wifi start ssid=%s ws=%s", acfg->ssid, acfg->ws_url);
     return ESP_OK;
+}
+
+
+void net_pause_for_ble(void)
+{
+    if (s_ble_paused) {
+        return;
+    }
+    s_ble_paused = true;
+    stop_ws();
+    s_wifi = false;
+    if (s_events) {
+        xEventGroupClearBits(s_events, WIFI_OK | WS_OK | SESSION_OK);
+    }
+    esp_err_t err = esp_wifi_stop();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT) {
+        ESP_LOGW(TAG, "wifi_stop %s", esp_err_to_name(err));
+    }
+    err = esp_wifi_deinit();
+    ESP_LOGI(TAG, "deinit wifi for BLE: %s free_internal=%u largest=%u",
+             esp_err_to_name(err),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+}
+
+static esp_err_t wifi_driver_reinit_and_start(void)
+{
+    wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_err_t err = esp_wifi_init(&wcfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi_init %s", esp_err_to_name(err));
+        return err;
+    }
+    const agent_cfg_t *acfg = agent_cfg_get();
+    wifi_config_t wifi_config = {0};
+    strncpy((char *)wifi_config.sta.ssid, acfg->ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password, acfg->pass, sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (err != ESP_OK) {
+        return err;
+    }
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    apply_ip_from_cfg();
+    return esp_wifi_start();
+}
+
+void net_resume_after_ble(void)
+{
+    if (!s_ble_paused) {
+        return;
+    }
+    s_ble_paused = false;
+    esp_err_t err = wifi_driver_reinit_and_start();
+    ESP_LOGI(TAG, "resume wifi after BLE: %s", esp_err_to_name(err));
+}
+
+esp_err_t net_apply_config(void)
+{
+    const agent_cfg_t *acfg = agent_cfg_get();
+    stop_ws();
+    s_wifi = false;
+    if (s_events) {
+        xEventGroupClearBits(s_events, WIFI_OK | WS_OK | SESSION_OK);
+    }
+
+    if (s_ble_paused) {
+        s_ble_paused = false;
+        esp_err_t err = wifi_driver_reinit_and_start();
+        ESP_LOGI(TAG, "apply wifi (from BLE pause) ssid=%s start=%s", acfg->ssid, esp_err_to_name(err));
+        return err;
+    }
+    apply_ip_from_cfg();
+    wifi_config_t wifi_config = {0};
+    strncpy((char *)wifi_config.sta.ssid, acfg->ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password, acfg->pass, sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "set_config %s", esp_err_to_name(err));
+        return err;
+    }
+    esp_wifi_disconnect();
+    err = esp_wifi_connect();
+    ESP_LOGI(TAG, "apply wifi ssid=%s ws=%s connect=%s", acfg->ssid, acfg->ws_url, esp_err_to_name(err));
+    return err;
 }
 
 void net_loop(void)
 {
     poll_usb();
+    if (s_ble_paused) {
+        return;
+    }
     if (s_wifi && !s_ws) {
         start_ws();
     }
@@ -334,4 +489,63 @@ bool net_ws_send_audio_upload(const uint8_t *pcm, size_t pcm_len, char *session_
     strncpy(session_id, s_session, session_id_len - 1);
     session_id[session_id_len - 1] = '\0';
     return true;
+}
+
+bool net_ws_send_audio_stream_begin(char *session_id, size_t session_id_len)
+{
+    if (!net_ws_ready() || !session_id || session_id_len == 0) {
+        return false;
+    }
+    cJSON *meta = cJSON_CreateObject();
+    cJSON_AddStringToObject(meta, "type", "audio_upload");
+    cJSON_AddBoolToObject(meta, "stream", 1);
+    cJSON_AddNumberToObject(meta, "sample_rate", 16000);
+    cJSON_AddNumberToObject(meta, "channels", 1);
+    cJSON_AddNumberToObject(meta, "bit_depth", 16);
+    cJSON_AddNumberToObject(meta, "audio_len", 0);
+    char *txt = cJSON_PrintUnformatted(meta);
+    cJSON_Delete(meta);
+    if (!txt) {
+        return false;
+    }
+    xEventGroupClearBits(s_events, SESSION_OK);
+    s_session[0] = '\0';
+    esp_websocket_client_send_text(s_ws, txt, (int)strlen(txt), pdMS_TO_TICKS(2000));
+    free(txt);
+    EventBits_t bits = xEventGroupWaitBits(s_events, SESSION_OK, pdTRUE, pdTRUE, pdMS_TO_TICKS(8000));
+    if (!(bits & SESSION_OK) || s_session[0] == '\0') {
+        return false;
+    }
+    strncpy(session_id, s_session, session_id_len - 1);
+    session_id[session_id_len - 1] = '\0';
+    return true;
+}
+
+bool net_ws_send_audio_binary(const uint8_t *pcm, size_t pcm_len)
+{
+    if (!net_ws_ready() || !pcm || pcm_len == 0) {
+        return false;
+    }
+    int ret = esp_websocket_client_send_bin(s_ws, (const char *)pcm, (int)pcm_len, pdMS_TO_TICKS(5000));
+    return ret >= 0;
+}
+
+bool net_ws_send_audio_end(const char *session_id)
+{
+    if (!net_ws_ready()) {
+        return false;
+    }
+    cJSON *meta = cJSON_CreateObject();
+    cJSON_AddStringToObject(meta, "type", "audio_end");
+    if (session_id && session_id[0]) {
+        cJSON_AddStringToObject(meta, "session_id", session_id);
+    }
+    char *txt = cJSON_PrintUnformatted(meta);
+    cJSON_Delete(meta);
+    if (!txt) {
+        return false;
+    }
+    int ret = esp_websocket_client_send_text(s_ws, txt, (int)strlen(txt), pdMS_TO_TICKS(2000));
+    free(txt);
+    return ret >= 0;
 }

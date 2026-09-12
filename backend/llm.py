@@ -49,7 +49,11 @@ def _delta_text(data: dict) -> str:
     return ""
 
 
-async def llm_chat(user_text: str, on_partial: Callable[[str], None] | None = None) -> str:
+async def llm_chat(
+    user_text: str,
+    on_partial: Callable[[str], None] | None = None,
+    history: list[dict[str, str]] | None = None,
+) -> str:
     import httpx
 
     base, key, model = _settings()
@@ -61,15 +65,23 @@ async def llm_chat(user_text: str, on_partial: Callable[[str], None] | None = No
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
+    messages: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": "你是米思林智能助手小E，尽量满足用户的需求和提问。用简体中文简短回答，不要用 Markdown，不要返回 emoji。",
+        },
+    ]
+    if history:
+        for item in history:
+            role = item.get("role")
+            content = (item.get("content") or "").strip()
+            if role in {"user", "assistant"} and content:
+                messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": user_text})
+
     payload = {
         "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": "你是设备端语音助手。用简体中文简短回答，一两句即可，不要用 Markdown。",
-            },
-            {"role": "user", "content": user_text},
-        ],
+        "messages": messages,
         "stream": True,
         "temperature": 0.7,
     }

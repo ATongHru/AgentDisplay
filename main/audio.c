@@ -1,5 +1,6 @@
 #include "audio.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -29,8 +30,11 @@ static bool s_listening;
 static bool s_storing;
 static bool s_playing;
 static bool s_inited;
-static volatile size_t s_last_peak;
-static volatile size_t s_last_rms;
+static volatile float s_last_peak;
+static volatile float s_last_rms;
+static volatile uint32_t s_frame_seq;
+static float s_hp_x1;
+static float s_hp_y1;
 static i2s_pdm_slot_mask_t s_pdm_slot = I2S_PDM_SLOT_LEFT;
 static int s_quiet_reads;
 static bool s_tried_alt_slot;
@@ -150,15 +154,15 @@ static void switch_pdm_slot(void)
              esp_err_to_name(err));
 }
 
-static size_t read_peak(bool append)
+static float read_peak(bool append)
 {
     if (!s_listening || !s_rx) {
-        return 0;
+        return 0.0f;
     }
     int16_t sample_buf[256];
     size_t bytes_read = 0;
     if (i2s_channel_read(s_rx, sample_buf, sizeof(sample_buf), &bytes_read,
-                        pdMS_TO_TICKS(PDM_READ_TIMEOUT_MS)) != ESP_OK ||
+                         pdMS_TO_TICKS(PDM_READ_TIMEOUT_MS)) != ESP_OK ||
         bytes_read == 0) {
         return s_last_peak;
     }
@@ -169,31 +173,34 @@ static size_t read_peak(bool append)
     }
     mean /= (int32_t)samples;
 
-    int32_t peak = 0;
-    uint64_t acc = 0;
+    float sum_sq = 0.0f;
+    float peak_n = 0.0f;
     for (size_t i = 0; i < samples; ++i) {
-        int32_t v = ((int32_t)sample_buf[i] - mean) * PDM_AMPLIFY;
+        int32_t centered = (int32_t)sample_buf[i] - mean;
+        /* High-pass on raw, then amplify — VAD uses amplified scale (old behavior). */
+        float x = (float)centered / 32768.0f;
+        float y = 0.99f * (s_hp_y1 + x - s_hp_x1);
+        s_hp_x1 = x;
+        s_hp_y1 = y;
+
+        int32_t v = (int32_t)(y * 32768.0f) * PDM_AMPLIFY;
         if (v > 32767) {
             v = 32767;
         } else if (v < -32768) {
             v = -32768;
         }
         sample_buf[i] = (int16_t)v;
-        int32_t abs_v = v < 0 ? -v : v;
-        if (abs_v > peak) {
-            peak = abs_v;
+
+        float an = fabsf((float)v / 32768.0f);
+        if (an > peak_n) {
+            peak_n = an;
         }
-        acc += (uint64_t)abs_v * (uint32_t)abs_v;
+        sum_sq += an * an;
     }
-    uint32_t mean_sq = (uint32_t)(acc / samples);
-    uint32_t rms = mean_sq;
-    for (int i = 0; i < 12; ++i) {
-        if (rms == 0) {
-            break;
-        }
-        rms = (rms + mean_sq / rms) / 2;
-    }
-    s_last_rms = rms;
+    s_last_rms = sqrtf(sum_sq / (float)samples);
+    s_last_peak = peak_n;
+    s_frame_seq++;
+
     if (append && lock(pdMS_TO_TICKS(20))) {
         size_t copy = bytes_read;
         if (s_record_size + copy > s_record_cap) {
@@ -205,7 +212,7 @@ static size_t read_peak(bool append)
         }
         unlock();
     }
-    return (size_t)peak;
+    return peak_n;
 }
 
 bool audio_capture_listen_start(void)
@@ -276,12 +283,16 @@ void audio_capture_clear(void)
     unlock();
 }
 
-size_t audio_capture_poll(void)
+float audio_capture_peak(void) { return s_last_peak; }
+float audio_capture_rms(void) { return s_last_rms; }
+uint32_t audio_capture_frame_seq(void) { return s_frame_seq; }
+
+void audio_capture_reset_hp(void)
 {
-    return s_last_peak;
+    s_hp_x1 = 0.0f;
+    s_hp_y1 = 0.0f;
 }
 
-size_t audio_capture_rms(void) { return s_last_rms; }
 bool audio_capture_is_listening(void) { return s_listening; }
 const uint8_t *audio_capture_data(void) { return s_record; }
 size_t audio_capture_size(void) { return s_record_size; }
@@ -290,8 +301,9 @@ void audio_capture_reset(void)
 {
     audio_capture_listen_stop();
     s_record_size = 0;
-    s_last_peak = 0;
-    s_last_rms = 0;
+    s_last_peak = 0.0f;
+    s_last_rms = 0.0f;
+    audio_capture_reset_hp();
 }
 
 bool audio_playback_start(void)
@@ -491,8 +503,10 @@ void audio_task_loop(void)
 #if VOICE_HARDWARE_ENABLED
     bool blocked = false;
     if (s_listening) {
-        size_t peak = read_peak(s_storing);
-        if (peak < PDM_QUIET_PEAK) {
+        float peak = read_peak(s_storing);
+        /* 归一化峰值约对应旧 int16 阈值：0.001≈33，用于槽位探测 */
+        /* peak 已是放大后归一化；旧静音探测 peak<40（放大后 int16）≈0.0012 */
+        if (peak < (float)PDM_QUIET_PEAK / 32768.0f) {
             ++s_quiet_reads;
         } else {
             s_quiet_reads = 0;
@@ -505,7 +519,6 @@ void audio_task_loop(void)
             }
             s_quiet_reads = 0;
         }
-        s_last_peak = peak;
         blocked = true;
     }
     audio_playback_service();

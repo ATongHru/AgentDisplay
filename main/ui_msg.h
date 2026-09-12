@@ -9,6 +9,7 @@ typedef enum {
     UI_MSG_LINK_STATE = 3,
     UI_MSG_VOICE_LINK = 4,
     UI_MSG_TIME_TICK = 5,
+    UI_MSG_BLE_PROV = 6,
 } ui_msg_type_t;
 
 typedef struct {
@@ -20,6 +21,7 @@ typedef struct {
     bool ws;
     bool listening;
     bool playing;
+    bool ble_prov;
     int rssi;
 } ui_msg_t;
 
@@ -29,3 +31,4 @@ void ui_post_frame_dirty(void);
 void ui_post_link_state(bool usb, bool wifi, bool ws, bool listening, bool playing, int rssi);
 void ui_post_voice_link(bool listening, bool playing);
 void ui_post_time_tick(void);
+void ui_post_ble_prov(bool on);

@@ -23,6 +23,7 @@ from log_hub import install_capture, log_hub
 from settings_store import get_volume_percent, set_volume_percent
 from voice_pipeline import start_pipeline, warmup as voice_warmup
 from voice_session import session_store
+from ble_prov import ble_prov
 from ws_manager import WsHub, ws_endpoint
 
 install_capture()
@@ -89,6 +90,21 @@ class VolumeEvent(BaseModel):
     volume_percent: int = Field(ge=0, le=100)
 
 
+class BleScanRequest(BaseModel):
+    timeout: float = Field(default=6.0, ge=2.0, le=20.0)
+
+
+class BleProvRequest(BaseModel):
+    ssid: str = Field(min_length=1, max_length=32)
+    password: str = Field(default="", max_length=64)
+    host: str = Field(min_length=1, max_length=64)
+    port: int = Field(default=8000, ge=1, le=65535)
+    address: str | None = Field(default=None, max_length=64)
+    ip: str | None = Field(default=None, max_length=15)
+    netmask: str | None = Field(default=None, max_length=15)
+    gateway: str | None = Field(default=None, max_length=15)
+
+
 class TextEvent(BaseModel):
     text: str = Field(default="", max_length=240)
     source: str = Field(default="BOT", max_length=16)
@@ -101,12 +117,25 @@ class TextEvent(BaseModel):
         return {"text": self.text, "source": source}
 
 
+def _device_status_fingerprint(payload: dict) -> tuple:
+    """ESP 侧关心的状态键；连续相同则不重复下发。"""
+    return (
+        payload.get("status"),
+        payload.get("source"),
+        payload.get("status_detail"),
+        payload.get("tool_category"),
+        payload.get("task_label"),
+        payload.get("text") or "",
+    )
+
+
 class AppState:
     def __init__(self):
         self.lock = threading.Lock()
         self.current_event = {"status": "IDLE", "source": "BOT", "text": ""}
         self.history = deque(maxlen=50)
         self.transcripts = deque(maxlen=200)
+        self.last_device_status_fp: tuple | None = None
 
     def record_history(self, snapshot: dict) -> None:
         self.history.appendleft({**snapshot, "time": datetime.now().strftime("%H:%M:%S")})
@@ -186,26 +215,46 @@ def _on_backend_log(item: dict) -> None:
 log_hub.set_listener(_on_backend_log)
 
 
-def apply_event(event: Event) -> dict:
+def _queue_device_status(payload: dict, *, force: bool = False) -> bool:
+    """下发状态到 ESP。连续相同指纹只保留第一次；返回是否实际发送。"""
+    device_payload = dict(payload)
+    if not device_payload.get("text"):
+        device_payload.pop("text", None)
+    fp = _device_status_fingerprint(device_payload)
+    with state.lock:
+        if not force and fp == state.last_device_status_fp:
+            return False
+        state.last_device_status_fp = fp
+    if ws_hub.loop is not None:
+        asyncio.run_coroutine_threadsafe(ws_hub.push_status_event(device_payload), ws_hub.loop)
+    return True
+
+
+def apply_event(event: Event) -> tuple[dict, bool]:
     normalized = event.normalized()
+    device_payload = dict(normalized)
+    if not device_payload.get("text"):
+        device_payload.pop("text", None)
+    fp = _device_status_fingerprint(device_payload)
     with state.lock:
         merged = {**state.current_event, **normalized}
         if not normalized.get("text"):
             merged["text"] = state.current_event.get("text", "")
+        if fp == state.last_device_status_fp:
+            return merged, False
         state.record_history(merged)
-    device_payload = dict(normalized)
-    if not device_payload.get("text"):
-        device_payload.pop("text", None)
+        state.last_device_status_fp = fp
     if ws_hub.loop is not None:
         asyncio.run_coroutine_threadsafe(ws_hub.push_status_event(device_payload), ws_hub.loop)
-    return merged
+    return merged, True
 
 
 async def _sync_device_state(hub: WsHub) -> None:
     with state.lock:
         event = dict(state.current_event or {})
+        state.last_device_status_fp = None
     status_payload = {k: v for k, v in event.items() if k != "text"}
-    await hub.push_status_event(status_payload or {"status": "IDLE", "source": "BOT"})
+    _queue_device_status(status_payload or {"status": "IDLE", "source": "BOT"}, force=True)
     text = event.get("text") or ""
     if text:
         await hub.push_text_event({"text": text, "source": event.get("source") or "BOT"})
@@ -347,9 +396,47 @@ def api_volume_get():
 
 
 @app.post("/api/volume")
-def api_volume_set(payload: VolumeEvent):
-    return {"ok": True, "volume_percent": set_volume_percent(payload.volume_percent)}
+async def api_volume_set(payload: VolumeEvent):
+    percent = set_volume_percent(payload.volume_percent)
+    await ws_hub.push_volume_config(percent)
+    return {"ok": True, "volume_percent": percent}
 
+
+
+
+@app.get("/api/ble/status")
+def api_ble_status():
+    return ble_prov.status()
+
+
+@app.post("/api/ble/scan")
+async def api_ble_scan(payload: BleScanRequest = BleScanRequest()):
+    timeout = payload.timeout
+    try:
+        devices = await ble_prov.scan(timeout=timeout)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"ok": True, "devices": devices, **ble_prov.status()}
+
+
+@app.post("/api/ble/provision")
+async def api_ble_provision(payload: BleProvRequest):
+    try:
+        result = await ble_prov.provision(
+            ssid=payload.ssid,
+            password=payload.password,
+            host=payload.host,
+            port=payload.port,
+            address=payload.address,
+            ip=payload.ip,
+            netmask=payload.netmask,
+            gateway=payload.gateway,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return result
 
 @app.get("/api/logs")
 def api_logs():
@@ -381,20 +468,24 @@ def health():
 @app.post("/event")
 def event(payload: Event):
     try:
-        normalized = apply_event(payload)
+        normalized, sent = apply_event(payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"ok": True, "queued": normalized, "debounced": False}
+    return {"ok": True, "queued": normalized, "debounced": not sent}
 
 
 @app.post("/event/status")
 def event_status(payload: StatusEvent):
     try:
         status_fields = payload.normalized()
+        fp = _device_status_fingerprint(status_fields)
         with state.lock:
+            if fp == state.last_device_status_fp:
+                return {"ok": True, "queued": status_fields, "debounced": True}
             current = dict(state.current_event)
             current.update(status_fields)
             state.record_history(current)
+            state.last_device_status_fp = fp
         if ws_hub.loop is not None:
             asyncio.run_coroutine_threadsafe(ws_hub.push_status_event(status_fields), ws_hub.loop)
     except ValueError as exc:

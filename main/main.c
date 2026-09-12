@@ -8,6 +8,9 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "agent_cfg.h"
+#include "btn_boot.h"
+#include "ble_prov.h"
 #include "net_ws.h"
 #include "nvs_flash.h"
 #include "ui.h"
@@ -51,6 +54,8 @@ static void app_task(void *arg)
         uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
         ui_tick_animation(now);
         voice_loop();
+        btn_boot_poll();
+        ble_prov_loop();
 
         if (now - last_time >= 1000) {
             last_time = now;
@@ -81,12 +86,14 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(display_init());
     ESP_ERROR_CHECK(ui_init());
+    ESP_ERROR_CHECK(agent_cfg_load());
+    ESP_ERROR_CHECK(btn_boot_init());
     ESP_ERROR_CHECK(net_init());
     voice_init();
 
     xTaskCreatePinnedToCore(audio_task, "audio", 8192, NULL, 6, NULL, 0);
     xTaskCreatePinnedToCore(net_task, "net", 8192, NULL, 4, NULL, 0);
     xTaskCreatePinnedToCore(lvgl_task, "lvgl", 8192, NULL, 4, NULL, 1);
-    xTaskCreatePinnedToCore(app_task, "app", 4096, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(app_task, "app", 8192, NULL, 3, NULL, 1);
     ESP_LOGI(TAG, "tasks started");
 }
