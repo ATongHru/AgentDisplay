@@ -34,6 +34,11 @@ CONFIG_LV_FONT_MONTSERRAT_20=y
 CONFIG_LV_USE_GIF=n
 CONFIG_LV_USE_LOG=n
 CONFIG_LV_DEF_REFR_PERIOD=15
+# Load CJK binary font from flash via lv_binfont_create_from_buffer
+CONFIG_LV_USE_FS_MEMFS=y
+CONFIG_LV_FS_MEMFS_LETTER=77
+# binfont copies ~900KB glyphs; LVGL builtin pool is 64KB and panics.
+CONFIG_LV_USE_CLIB_MALLOC=y
 
 CONFIG_AGENT_VOICE_HW=y
 

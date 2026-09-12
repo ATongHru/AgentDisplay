@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import socket
 import time
 from collections import deque
@@ -251,6 +252,172 @@ class BleProvService:
                     "ip": ip or None,
                     "netmask": netmask or None,
                     "gateway": gateway or None,
+                }
+            except Exception as exc:
+                self._push("error", str(exc))
+                raise
+            finally:
+                self._busy = False
+
+
+    async def read_profiles(
+        self,
+        *,
+        address: str | None = None,
+        scan_timeout: float = 6.0,
+        reply_timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """Pull WiFi profiles from ESP NVS via BLE LIST."""
+        ok, err = _bleak_available()
+        if not ok:
+            raise RuntimeError(f"bleak 未安装或不可用: {err}")
+        from bleak import BleakClient, BleakScanner
+
+        replies: list[str] = []
+        notify_q: asyncio.Queue[str] = asyncio.Queue()
+
+        def on_notify(_handle: int, data: bytearray) -> None:
+            try:
+                text = bytes(data).decode("utf-8", errors="replace")
+            except Exception:
+                text = repr(bytes(data))
+            for line in text.replace("\r", "\n").split("\n"):
+                line = line.strip()
+                if line:
+                    replies.append(line)
+                    notify_q.put_nowait(line)
+                    self._push("info", f"<- {line}")
+
+        async def write_line(client: BleakClient, line: str) -> None:
+            payload = (line.rstrip("\n") + "\n").encode("utf-8")
+            self._push("info", f"-> {line}")
+            await client.write_gatt_char(NUS_RX, payload, response=False)
+
+        async def wait_prefix(prefix: str, timeout: float) -> str:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                remain = deadline - time.monotonic()
+                try:
+                    line = await asyncio.wait_for(notify_q.get(), timeout=max(0.05, remain))
+                except asyncio.TimeoutError:
+                    break
+                if line.startswith("ERR"):
+                    raise RuntimeError(line)
+                if line.startswith(prefix):
+                    return line
+            raise TimeoutError(f"等待设备回复超时（期望 {prefix}*）")
+
+        def parse_host(host: str) -> tuple[str, int]:
+            host = (host or "").strip()
+            if not host or host == "-":
+                return "", 8000
+            if ":" in host:
+                h, _, p = host.rpartition(":")
+                try:
+                    return h, int(p)
+                except ValueError:
+                    return host, 8000
+            return host, 8000
+
+        def parse_p_line(line: str) -> dict[str, Any] | None:
+            if not line.startswith("OK P "):
+                return None
+            body = line[5:]
+            keys = ["i", "ssid", "pass", "host", "ip", "mask", "gw"]
+            vals: dict[str, str] = {}
+            for idx, key in enumerate(keys):
+                token = f"{key}="
+                pos = body.find(token)
+                if pos < 0:
+                    continue
+                start = pos + len(token)
+                end = len(body)
+                for nxt in keys[idx + 1 :]:
+                    npos = body.find(f" {nxt}=", start)
+                    if npos >= 0:
+                        end = npos
+                        break
+                vals[key] = body[start:end].strip()
+            ssid = vals.get("ssid") or ""
+            if not ssid:
+                return None
+            host, port = parse_host(vals.get("host") or "")
+
+            def clean(v: str) -> str:
+                v = (v or "").strip()
+                return "" if v in {"", "-"} else v
+
+            return {
+                "index": int(vals.get("i") or 0),
+                "name": f"ESP[{vals.get('i') or 0}] {ssid}",
+                "ssid": ssid[:32],
+                "password": (vals.get("pass") or "")[:64],
+                "host": host[:64],
+                "port": port,
+                "ip": clean(vals.get("ip") or "")[:15],
+                "netmask": clean(vals.get("mask") or "")[:15],
+                "gateway": clean(vals.get("gw") or "")[:15],
+            }
+
+        async with self._lock:
+            self._busy = True
+            try:
+                addr = (address or "").strip()
+                if not addr:
+                    self._push("info", "未指定地址，先扫描…")
+                    found = await BleakScanner.discover(timeout=scan_timeout, return_adv=True)
+                    for a, (dev, adv) in found.items():
+                        name = dev.name or (adv.local_name if adv else None) or ""
+                        if name and DEVICE_NAME.lower() in name.lower():
+                            addr = a
+                            break
+                    if not addr:
+                        raise RuntimeError(f"未扫描到 {DEVICE_NAME}，请先长按 BOOT 进入配网")
+                    self._push("info", f"选用 {addr}")
+
+                self._push("info", f"连接 {addr} 读取 LIST…")
+                async with BleakClient(addr, timeout=20.0) as client:
+                    if not client.is_connected:
+                        raise RuntimeError("BLE 连接失败")
+                    await client.start_notify(NUS_TX, on_notify)
+                    await asyncio.sleep(0.3)
+                    try:
+                        while True:
+                            await asyncio.wait_for(notify_q.get(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        pass
+
+                    await write_line(client, "LIST")
+                    head = await wait_prefix("OK LIST", reply_timeout)
+                    m = re.search(r"count=(\d+)\s+active=(\d+)", head)
+                    count = int(m.group(1)) if m else 0
+                    active = int(m.group(2)) if m else 0
+                    profiles: list[dict[str, Any]] = []
+                    deadline = time.monotonic() + reply_timeout + max(2.0, float(count) * 0.5)
+                    while time.monotonic() < deadline:
+                        remain = deadline - time.monotonic()
+                        try:
+                            line = await asyncio.wait_for(notify_q.get(), timeout=max(0.05, remain))
+                        except asyncio.TimeoutError:
+                            break
+                        if line.startswith("OK LIST_END"):
+                            break
+                        item = parse_p_line(line)
+                        if item:
+                            profiles.append(item)
+                    try:
+                        await client.stop_notify(NUS_TX)
+                    except Exception:
+                        pass
+
+                self._push("info", f"设备返回 {len(profiles)} 条（active={active}）")
+                return {
+                    "ok": True,
+                    "address": addr,
+                    "count": count,
+                    "active": active,
+                    "profiles": profiles,
+                    "replies": replies,
                 }
             except Exception as exc:
                 self._push("error", str(exc))

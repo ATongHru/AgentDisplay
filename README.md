@@ -49,6 +49,8 @@ IDF 组件由 `main/idf_component.yml` 声明，首次 `idf.py build` 时自动�
 | `scripts/gen_frame_player.py` | Python 3 + Pillow | `pip install Pillow` |
 | `scripts/gen_cjk_font.py` | Python 3 + Node.js（`npx`）+ `lv_font_conv`；系统 TTF（如黑体） | 安装 [Node.js](https://nodejs.org/) 后首次运行由 `npx` 拉取 `lv_font_conv` |
 | `scripts/flash_animations.py` | Python 3 + esptool | 优先使用 ESP-IDF 自带；亦可 `pip install esptool` |
+| `scripts/flash_font.py` | Python 3 + esptool | 同 `flash_animations.py` |
+| `scripts/gen_mem_svg.py` | Python 3 | 无额外依赖；体积变化后重生成 `docs/*_usage.svg` |
 
 ### 后端 Python
 
@@ -117,7 +119,7 @@ WiFi SSID、密码、静态 IP 与 WebSocket 后端地址在 menuconfig「Agent 
 ![片内 DRAM 示意](docs/dram_usage.svg)
 
 > 图片：`docs/flash_usage.svg` / `psram_usage.svg` / `dram_usage.svg`。体积变化后可运行 `python scripts/gen_mem_svg.py` 重新生成。  
-> 当前镜像体积：app ≈ **1.80 MB**，`animations.bin` ≈ **3.39 MB**（烧录偏移 `0x600000`）。
+> 当前镜像体积：app ≈ **1.38 MB**（不含字库），`font_cjk_16.bin` ≈ **893 KB**（`0x400000`），`animations.bin` ≈ **4.41 MB**（`0x600000`）。
 
 #### Flash 分区速查表
 
@@ -127,24 +129,29 @@ WiFi SSID、密码、静态 IP 与 WebSocket 后端地址在 menuconfig「Agent 
 | partition-table | `0x008000` | 4 KB | 3.0 KB | `build/partition_table/partition-table.bin` |
 | nvs | `0x009000` | 20 KB | 运行时 | BLE/`agent_cfg`、WiFi 等 NVS |
 | otadata | `0x00E000` | 8 KB | 8.0 KB | `build/ota_data_initial.bin` |
-| **app0** | `0x010000` | **3 MB** | **1.80 MB** | `build/esp32s3_agent_display.bin`（含 CJK） |
+| **app0** | `0x010000` | **3 MB** | **1.38 MB** | `build/esp32s3_agent_display.bin`（不含字库） |
 | spiffs | `0x310000` | 896 KB | 0 | 遗留空 |
 | coredump | `0x3F0000` | 64 KB | 运行时 | 崩溃转储 |
-| voice_font | `0x400000` | 2 MB | 0 | 旧字库槽（空） |
-| **animations** | `0x600000` | **6 MB** | **3.39 MB** | `firmware/data/animations.bin`（mmap） |
+| **cjk_font** | `0x400000` | **2 MB** | **893 KB** | `firmware/data/font_cjk_16.bin`（运行时加载） |
+| **animations** | `0x600000` | **6 MB** | **4.41 MB** | `firmware/data/animations.bin`（mmap） |
 | storage | `0xC00000` | 4 MB | 0 | 预留 |
 
-分区定义：`partitions.csv`。烧录动画：`scripts/flash_animations.py` → `0x600000`。
+分区定义：`partitions.csv`。烧录动画：`scripts/flash_animations.py` → `0x600000`。烧录字库：`scripts/flash_font.py` → `0x400000`。
+
+Flash 已烧录占用排名（与图一致）：**animations (4.41 MB) > app0 (1.38 MB) > cjk_font (893 KB) > bootloader > otadata > part-table**。
 
 #### 运行时缓冲速查
 
 | 缓冲 | 介质 | 大小 | 源码 |
 |------|------|------|------|
-| 录音 PCM | **PSRAM** | 320 KB | `main/audio.c` `VOICE_MAX_RECORD_BYTES` |
-| 播放 ring | **PSRAM** | 128 KB | `main/audio.c` `VOICE_PLAY_RING_BYTES` |
+| CJK 字库运行时 | **PSRAM** | ≈893 KB | `main/font_loader.c`（从 `cjk_font` 分区拷贝） |
+| 录音 PCM | **PSRAM** | 625 KB | `main/board_pins.h` `VOICE_MAX_RECORD_BYTES`（16 kHz × 20 s） |
+| 播放 ring | **PSRAM** | 256 KB | `main/board_pins.h` `VOICE_PLAY_RING_BYTES` |
 | LVGL partial×2 | **PSRAM（优先）** | ≈19 KB | `main/display.c` `PARTIAL_BUF_LINES=20` |
 | 表情双缓冲 | **片内 DRAM** | ≈32 KB | `main/ui.c` BSS |
 | NimBLE/WiFi DMA | **片内 DRAM** | 动态 | 配网前 `wifi_deinit` 腾连续块 |
+
+PSRAM 已知缓冲排名（与图一致）：**CJK 字库 > 录音 PCM > 播放 ring > LVGL partial×2**。
 
 ## BLE 配网（实现说明）
 
@@ -267,7 +274,7 @@ GPIO3 复位采样会在 USB Serial/JTAG 与官方 JTAG 间切换，麦 DATA 接
 | 45 / 46 | strapping（VDD_SPI / boot） |
 | 48 | 板载 RGB LED |
 
-音频：16 kHz 单声道 16 bit PCM；单段上限约 10 s；播放 ring 128 KB（PSRAM）。
+音频：16 kHz 单声道 16 bit PCM；单段上限约 10 s；播放 ring 256 KB（PSRAM）。
 
 
 ---
@@ -326,8 +333,11 @@ mmap(animations 分区) → 按 gif_id 取帧表 → Core1 RLE 解到双缓冲 �
 | 8 | OFFLINE | 离线 | `OFFLINE.gif` |
 | 9 | STALE | 已过期 | `STALE.gif` |
 | 10 | UNKNOWN | 未知 | `UNKNOWN.gif` |
+| 11 | TOOL | 使用工具 | `TOOL.gif` |
+| 12 | EAR | 收听中 | `EAR.gif` |
+| 13 | SPEAKING | 播报中 | `SPEAKING.gif` |
 
-`TOOL.gif` 在目录里，**不进入** `animations.bin` 索引。重新生成：
+重新生成：
 
 ```bash
 python scripts/gen_frame_player.py
@@ -340,7 +350,14 @@ python scripts/flash_animations.py -p COMx
 
 ## 中文字库
 
-开机即用 `font_cjk_16`：《通用规范汉字表》一级 3500 字 + ASCII `0x20-0x7F` + 常用中文标点，16px / 4bpp，源字体 `simhei.ttf`。重新生成：`python scripts/gen_cjk_font.py`（依赖见「依赖 → PC 脚本工具」）。不要用 `0x4E00-0x9FFF` 整段代替一级字。
+与 app 分开烧录：`cjk_font` 分区（`0x400000`，2 MB）。内容为《现代汉语通用字表》7000 字 + ASCII `0x20-0x7F` + 常用中文标点，16px / 4bpp，源字体 `simhei.ttf`。字表文件 `third_party/fonts/tyz_7000_chars.txt`。
+
+```bash
+python scripts/gen_cjk_font.py
+python scripts/flash_font.py -p COMx
+```
+
+生成物：`firmware/data/font_cjk_16.bin`、`main/font_size.h`。固件启动后 `font_cjk_init()` 从分区加载（`lv_binfont` 拷贝约 900KB 到 PSRAM，须 `CONFIG_LV_USE_CLIB_MALLOC`；LVGL 默认 64KB 池会启动即重启）。未烧字库时中文退回 Montserrat。不要用 `0x4E00-0x9FFF` 整段代替通用字表。只烧 app、不烧字库则无中文显示。
 
 ---
 
@@ -427,6 +444,9 @@ Cursor 3.x **不要**注册 `beforeAgentResponse`，非法事件名会导致整�
 | OFFLINE | 离线 | OFFLINE.gif | `session_shutdown` | `sessionEnd` |
 | STALE | 已过期 | STALE.gif | 30 秒无事件 | 无对应 Hook |
 | UNKNOWN | 未知 | UNKNOWN.gif | 未识别工具 | 未识别工具归 THINKING |
+| TOOL | 使用工具 | TOOL.gif | 工具调用 | `preToolUse` |
+| EAR | 收听中 | EAR.gif | — | 语音收听 |
+| SPEAKING | 播报中 | SPEAKING.gif | — | 语音播放 |
 
 Cursor 注册事件：`sessionStart` `beforeSubmitPrompt` `preToolUse` `postToolUse` `postToolUseFailure` `afterAgentThought` `afterAgentResponse` `afterFileEdit` `stop` `sessionEnd`。
 
@@ -443,11 +463,14 @@ Cursor 注册事件：`sessionStart` `beforeSubmitPrompt` `preToolUse` `postTool
 ```bat
 scripts\idf_build.bat build
 idf.py -p COMx flash
+python scripts/flash_font.py -p COMx
 python scripts/flash_animations.py -p COMx
 idf.py -p COMx monitor
 ```
 
 PowerShell 下先加载本机 ESP-IDF 环境配置，再 `cd` 到本项目根目录，执行与上相同的 `idf.py` / `python scripts/...` 命令。
+
+字库与表情分区可单独更新，不必每次全量 `flash`。
 
 ---
 
@@ -464,11 +487,11 @@ esp32s3-agent-display/
 │   ├── 开发环境搭建.md
 │   └── *_usage.svg               Flash / PSRAM / DRAM 图
 ├── backend/                      FastAPI + Dashboard + ASR/LLM
-├── main/                         固件（ui / net_ws / audio / voice / font_cjk_16）
+├── main/                         固件（ui / net_ws / audio / voice / font_loader）
 ├── scripts/                      构建包装、动画、字库、烧录、内存图生成
 ├── third_party/emoji-gif/        状态 GIF
-├── third_party/fonts/            一级字表
-└── firmware/data/animations.bin
+├── third_party/fonts/            通用字表（tyz_7000_chars.txt）
+└── firmware/data/                animations.bin / font_cjk_16.bin
 ```
 
 ---

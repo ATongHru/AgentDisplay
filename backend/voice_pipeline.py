@@ -11,6 +11,7 @@ from typing import Callable
 from asr import transcribe_pcm, warmup as asr_warmup
 from chat_context import chat_context
 from llm import llm_chat, llm_configured
+from llm_history import append_record
 from settings_store import get_volume_percent
 from voice_session import SessionPhase, VoiceSession, session_store
 
@@ -213,12 +214,53 @@ def run_pipeline(
 
             last = ""
             started = False
+            tts_q: asyncio.Queue[str | None] = asyncio.Queue()
+            tts_idx = 0
+
+            def take_ready(full: str, final: bool) -> list[str]:
+                nonlocal tts_idx
+                chunk = full[tts_idx:]
+                last_cut = 0
+                out: list[str] = []
+                for i, ch in enumerate(chunk):
+                    if ch in "。！？!?；;\n":
+                        piece = chunk[last_cut : i + 1].strip()
+                        if len(piece) >= 2:
+                            out.append(piece)
+                            last_cut = i + 1
+                if final:
+                    piece = chunk[last_cut:].strip()
+                    if piece:
+                        out.append(piece)
+                        last_cut = len(chunk)
+                tts_idx += last_cut
+                return out
+
+            async def tts_worker() -> int:
+                total = 0
+                while True:
+                    part = await tts_q.get()
+                    if part is None:
+                        break
+                    t0 = time.monotonic()
+                    pcm = await tts_to_pcm(part)
+                    dt = time.monotonic() - t0
+                    if not pcm:
+                        continue
+                    session.append_tts_pcm(pcm)
+                    total += len(pcm)
+                    print(
+                        f"[tts] live chars={len(part)} pcm={len(pcm)} "
+                        f"in {dt:.2f}s queued={total}"
+                    )
+                return total
 
             def emit_delta(delta: str) -> None:
                 if push_append:
                     push_append(delta, "VOICE", False)
 
             coalescer = _DeltaCoalescer(emit_delta)
+            worker = asyncio.create_task(tts_worker()) if VOICE_TTS else None
 
             def on_partial(full: str) -> None:
                 nonlocal last, started
@@ -232,25 +274,68 @@ def run_pipeline(
                     if push_append:
                         push_append("", "VOICE", True)
                 coalescer.add(delta)
+                if VOICE_TTS:
+                    for part in take_ready(full, False):
+                        tts_q.put_nowait(part)
 
-            history = chat_context.history_for_llm()
-            reply = await llm_chat(asr_text, on_partial, history=history)
-            coalescer.flush()
-            if not reply:
-                session.set_error("LLM 无回复")
-                push_event("ERROR", "LLM 无回复", "VOICE")
-                return
-            chat_context.add_turn(asr_text, reply)
-            session.append_llm(reply)
-            if on_transcript:
-                on_transcript(session_id, reply, "assistant")
-            if not VOICE_TTS:
-                session.mark_done()
-                push_event("IDLE", reply, "VOICE")
-                print(f"[voice] llm {session_id}: {reply}")
-                return
-            total = await synthesize_to_session(session, reply)
-            print(f"[voice] session {session_id} ready audio={total} bytes (streamed)")
+            try:
+                history = chat_context.history_for_llm()
+                llm_result = await llm_chat(asr_text, on_partial, history=history)
+                coalescer.flush()
+                if isinstance(llm_result, dict):
+                    reply = (llm_result.get("text") or "").strip()
+                    usage = llm_result.get("usage") or {}
+                    model = llm_result.get("model") or ""
+                    latency_ms = llm_result.get("latency_ms")
+                else:
+                    reply = str(llm_result or "").strip()
+                    usage, model, latency_ms = {}, "", None
+                if not reply:
+                    append_record(
+                        user=asr_text,
+                        assistant="",
+                        model=model,
+                        usage=usage,
+                        source="VOICE",
+                        session_id=session_id,
+                        latency_ms=latency_ms,
+                        error="LLM 无回复",
+                    )
+                    session.set_error("LLM 无回复")
+                    push_event("ERROR", "LLM 无回复", "VOICE")
+                    return
+                chat_context.add_turn(asr_text, reply)
+                append_record(
+                    user=asr_text,
+                    assistant=reply,
+                    model=model,
+                    usage=usage,
+                    source="VOICE",
+                    session_id=session_id,
+                    latency_ms=latency_ms,
+                )
+                session.append_llm(reply)
+                if on_transcript:
+                    on_transcript(session_id, reply, "assistant")
+                tok = int((usage or {}).get("total_tokens") or 0)
+                print(f"[voice] llm {session_id}: tokens={tok} latency_ms={latency_ms} {reply[:80]}")
+                if not VOICE_TTS:
+                    session.mark_done()
+                    push_event("IDLE", reply, "VOICE")
+                    return
+                for part in take_ready(reply, True):
+                    await tts_q.put(part)
+                await tts_q.put(None)
+                total = await worker
+                session.finish_tts()
+                print(f"[voice] session {session_id} ready audio={total} bytes (streamed)")
+            finally:
+                if worker is not None and not worker.done():
+                    tts_q.put_nowait(None)
+                    try:
+                        await worker
+                    except Exception:
+                        pass
         except Exception as exc:
             import traceback
 

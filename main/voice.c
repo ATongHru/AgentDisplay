@@ -29,14 +29,15 @@ enum {
 #define VAD_PEAK_START_FLOOR 0.045f
 #define VAD_NOISE_MULT 3.0f
 #define VAD_RMS_HOLD_FLOOR 0.003f
-#define VAD_PEAK_HOLD_FLOOR 0.020f
 #define VAD_NOISE_ALPHA 0.05f
-#define VAD_NOISE_INIT_FRAMES 10
-#define VAD_MIN_MS 500
-#define VAD_SILENCE_MS 1100
-#define VAD_MAX_MS 10000
+#define VAD_NOISE_INIT_FRAMES 24
+#define VAD_NOISE_RMS_CAP 0.024f
+#define VAD_NOISE_PEAK_CAP 0.16f
+#define VAD_MIN_MS 300
+#define VAD_SILENCE_MS 400
+#define VAD_MAX_MS 8000
 #define VAD_COOLDOWN_MS 800
-#define WAIT_REPLY_MS 40000
+#define WAIT_REPLY_MS 55000
 #define MIN_CLIP_BYTES 6400
 
 typedef struct {
@@ -56,6 +57,7 @@ static int64_t s_wait_start_us;
 static bool s_audio_end;
 static bool s_session;
 static bool s_listening;
+static bool s_voice_enabled = true;
 static volatile bool s_upload_pending;
 static volatile bool s_upload_done;
 static volatile bool s_upload_ok;
@@ -86,15 +88,27 @@ static void show(const char *status, const char *text)
     ui_post_event_json(json, false);
 }
 
-static void post_voice_icons(void)
+static void post_voice_ui(void)
 {
-    ui_post_voice_link(s_listening, audio_playback_is_active());
+    bool hold = false;
+    const char *overlay = "";
+    if (s_phase == VOICE_RECORDING || s_phase == VOICE_UPLOADING) {
+        hold = true;
+        overlay = "EAR";
+    } else if (s_phase == VOICE_WAIT_REPLY) {
+        hold = true;
+        overlay = "THINKING";
+    } else if (s_phase == VOICE_PLAYING) {
+        hold = true;
+        overlay = "SPEAKING";
+    }
+    ui_post_voice_link(s_listening, audio_playback_is_active(), hold, overlay);
 }
 
 static void set_listening(bool on)
 {
     s_listening = on;
-    post_voice_icons();
+    post_voice_ui();
 }
 
 static float start_rms_th(void)
@@ -112,11 +126,6 @@ static float hold_rms_th(void)
     return fmaxf(VAD_RMS_HOLD_FLOOR, start_rms_th() * 0.5f);
 }
 
-static float hold_peak_th(void)
-{
-    return fmaxf(VAD_PEAK_HOLD_FLOOR, start_peak_th() * 0.5f);
-}
-
 static void update_noise_baseline(float rms, float peak)
 {
     if (s_vad.in_speech) {
@@ -124,6 +133,12 @@ static void update_noise_baseline(float rms, float peak)
     }
     s_vad.noise_rms = (1.0f - VAD_NOISE_ALPHA) * s_vad.noise_rms + VAD_NOISE_ALPHA * rms;
     s_vad.noise_peak = (1.0f - VAD_NOISE_ALPHA) * s_vad.noise_peak + VAD_NOISE_ALPHA * peak;
+    if (s_vad.noise_rms > VAD_NOISE_RMS_CAP) {
+        s_vad.noise_rms = VAD_NOISE_RMS_CAP;
+    }
+    if (s_vad.noise_peak > VAD_NOISE_PEAK_CAP) {
+        s_vad.noise_peak = VAD_NOISE_PEAK_CAP;
+    }
 }
 
 static void reset_vad_baseline(void)
@@ -140,6 +155,12 @@ static void resume_listen(void)
 #if VOICE_HARDWARE_ENABLED
     reset_vad_baseline();
     s_cooldown_until_us = now_us() + (int64_t)VAD_COOLDOWN_MS * 1000;
+    if (!s_voice_enabled) {
+        audio_capture_listen_stop();
+        set_listening(false);
+        s_phase = VOICE_LISTEN;
+        return;
+    }
     if (audio_capture_listen_start()) {
         audio_capture_clear();
         set_listening(true);
@@ -157,13 +178,9 @@ static void finish_turn(bool announce)
         audio_playback_stop();
     }
     s_audio_end = false;
-    post_voice_icons();
-    if (announce) {
-        show("IDLE", "");
-    } else {
-        s_session = false;
-        snprintf(s_last_show, sizeof(s_last_show), "IDLE");
-    }
+    post_voice_ui();
+    (void)announce;
+    s_session = false;
     resume_listen();
 }
 
@@ -195,15 +212,15 @@ void voice_on_audio_chunk(const char *session_id, const uint8_t *data, size_t le
 #if VOICE_HARDWARE_ENABLED
             audio_capture_listen_stop();
 #endif
-            set_listening(false);
+            s_listening = false;
             if (!audio_playback_is_active()) {
                 audio_playback_start();
             }
-            post_voice_icons();
-            show("THINKING", "正在回复（不采集）");
+            s_phase = VOICE_PLAYING;
+            post_voice_ui();
             ESP_LOGI(TAG, "play start sid=%s", s_session_id);
         }
-        s_phase = VOICE_PLAYING;
+        s_vad.in_speech = true;
         audio_playback_write(data, len);
     }
     if (end) {
@@ -220,6 +237,11 @@ void voice_on_server_status(const char *status)
     if (!status || s_phase != VOICE_WAIT_REPLY) {
         return;
     }
+    if (strcmp(status, "THINKING") == 0 || strcmp(status, "SPEAKING") == 0 ||
+        strcmp(status, "EAR") == 0) {
+        s_wait_start_us = now_us();
+        return;
+    }
     if (strcmp(status, "IDLE") == 0 || strcmp(status, "ERROR") == 0) {
         ESP_LOGI(TAG, "server status %s, resume listen", status);
         finish_turn(false);
@@ -232,6 +254,26 @@ void voice_loop(void)
     return;
 #endif
     if (ble_prov_active()) {
+        return;
+    }
+    if (!s_voice_enabled) {
+        if (s_phase == VOICE_PLAYING) {
+            if (s_audio_end && audio_playback_pending() == 0 && audio_playback_should_stop()) {
+                finish_turn(false);
+            }
+            return;
+        }
+        if (s_phase == VOICE_RECORDING || s_phase == VOICE_UPLOADING || s_phase == VOICE_WAIT_REPLY) {
+            if (audio_playback_is_active()) {
+                audio_playback_stop();
+            }
+            s_upload_pending = false;
+            s_stream_active = false;
+            s_vad.in_speech = false;
+            audio_capture_listen_stop();
+            set_listening(false);
+            s_phase = VOICE_LISTEN;
+        }
         return;
     }
     if (s_phase == VOICE_PLAYING) {
@@ -270,7 +312,7 @@ void voice_loop(void)
             set_listening(false);
             s_wait_start_us = now_us();
             s_phase = VOICE_WAIT_REPLY;
-            show("THINKING", "正在思考");
+            post_voice_ui();
         }
         return;
     }
@@ -328,14 +370,14 @@ void voice_loop(void)
         s_stream_failed = false;
         s_session_id[0] = '\0';
         s_phase = VOICE_RECORDING;
+        post_voice_ui();
         ESP_LOGI(TAG, "VAD start rms=%.4f peak=%.4f th=%.4f/%.4f", rms, peak, start_rms_th(),
                  start_peak_th());
-        show("THINKING", "正在聆听");
         return;
     }
 
     if (s_phase == VOICE_RECORDING) {
-        bool hold = (rms > hold_rms_th()) || (peak > hold_peak_th());
+        bool hold = (rms > hold_rms_th());
         if (hold) {
             s_last_voice_us = now_us();
         }
@@ -347,18 +389,21 @@ void voice_loop(void)
         if (!maxed && !silenced) {
             return;
         }
-        s_vad.in_speech = false;
         audio_capture_end_store();
         size_t pcm_len = audio_capture_size();
+        ESP_LOGI(TAG, "VAD end dur=%.0fms silence=%.0fms pcm=%u max=%d sil=%d",
+                 (double)dur_us / 1000.0, (double)silence_us / 1000.0, (unsigned)pcm_len,
+                 (int)maxed, (int)silenced);
         if (pcm_len < (size_t)MIN_CLIP_BYTES) {
             ESP_LOGW(TAG, "drop short clip %u bytes", (unsigned)pcm_len);
             if (s_stream_active) {
-                (void)net_ws_send_audio_end(s_session_id);
+                (void)net_ws_send_audio_end(s_session_id, pcm_len, true);
                 s_stream_active = false;
             }
+            s_vad.in_speech = false;
             audio_capture_clear();
-            show("IDLE", "");
             s_phase = VOICE_LISTEN;
+            post_voice_ui();
             s_cooldown_until_us = now_us() + (int64_t)VAD_COOLDOWN_MS * 1000;
             return;
         }
@@ -366,6 +411,7 @@ void voice_loop(void)
         s_upload_done = false;
         s_upload_pending = true;
         s_phase = VOICE_UPLOADING;
+        post_voice_ui();
         /* stay on listening caption; skip upload caption */
     }
 }
@@ -393,7 +439,8 @@ void voice_net_poll(void)
         if (s_stream_active) {
             const uint8_t *pcm = audio_capture_data();
             size_t total = audio_capture_size();
-            while (total >= s_stream_sent + (size_t)VOICE_UPLOAD_CHUNK) {
+            int burst = 0;
+            while (burst < 8 && total >= s_stream_sent + (size_t)VOICE_UPLOAD_CHUNK) {
                 if (!net_ws_send_audio_binary(pcm + s_stream_sent, (size_t)VOICE_UPLOAD_CHUNK)) {
                     ESP_LOGW(TAG, "stream chunk failed @%u", (unsigned)s_stream_sent);
                     s_stream_failed = true;
@@ -401,7 +448,7 @@ void voice_net_poll(void)
                     break;
                 }
                 s_stream_sent += (size_t)VOICE_UPLOAD_CHUNK;
-                break; /* one chunk per poll */
+                burst++;
             }
         }
         return;
@@ -430,10 +477,10 @@ void voice_net_poll(void)
                 ok = false;
             } else {
                 s_stream_sent = pcm_len;
-                ok = net_ws_send_audio_end(s_session_id);
+                ok = net_ws_send_audio_end(s_session_id, pcm_len, false);
             }
         } else {
-            ok = net_ws_send_audio_end(s_session_id);
+            ok = net_ws_send_audio_end(s_session_id, pcm_len, false);
         }
         ESP_LOGI(TAG, "stream end session=%s sent=%u ok=%d", s_session_id, (unsigned)s_stream_sent,
                  (int)ok);
@@ -454,5 +501,30 @@ void voice_net_poll(void)
     s_upload_done = true;
 }
 
+void voice_set_enabled(bool enabled)
+{
+    if (s_voice_enabled == enabled) {
+        ui_post_voice_enabled(enabled);
+        return;
+    }
+    s_voice_enabled = enabled;
+    ESP_LOGI(TAG, "voice_enabled=%d", (int)enabled);
+    ui_post_voice_enabled(enabled);
+    if (!enabled) {
+        if (audio_playback_is_active()) {
+            audio_playback_stop();
+        }
+        s_upload_pending = false;
+        s_stream_active = false;
+        s_vad.in_speech = false;
+        audio_capture_listen_stop();
+        set_listening(false);
+        s_phase = VOICE_LISTEN;
+    } else {
+        resume_listen();
+    }
+}
+
+bool voice_is_enabled(void) { return s_voice_enabled; }
 bool voice_session_active(void) { return s_session; }
 bool voice_is_listening(void) { return s_listening; }

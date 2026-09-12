@@ -15,6 +15,7 @@ out_size = root / "main" / "anim_size.h"
 names = [
     "idle", "thinking", "coding", "reading", "testing", "waiting",
     "done", "error", "offline", "stale", "unknown",
+    "tool", "ear", "speaking",
 ]
 WIDTH = HEIGHT = 90
 MAX_FRAMES = 40

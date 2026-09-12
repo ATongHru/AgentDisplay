@@ -10,7 +10,7 @@ idf_component_register(
         "agent_cfg.c"
         "audio.c"
         "voice.c"
-        "font_cjk_16.c"
+        "font_loader.c"
         "font_status_icons.c"
     INCLUDE_DIRS "."
     REQUIRES

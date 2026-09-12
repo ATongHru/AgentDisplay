@@ -6,6 +6,7 @@
 #include "board_pins.h"
 #include "display.h"
 #include "esp_log.h"
+#include "font_cjk_16.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "agent_cfg.h"
@@ -85,6 +86,9 @@ void app_main(void)
         ESP_LOGE(TAG, "animations missing; flash firmware/data/animations.bin to 0x600000");
     }
     ESP_ERROR_CHECK(display_init());
+    if (!font_cjk_init()) {
+        ESP_LOGE(TAG, "CJK font missing; flash firmware/data/font_cjk_16.bin to 0x400000");
+    }
     ESP_ERROR_CHECK(ui_init());
     ESP_ERROR_CHECK(agent_cfg_load());
     ESP_ERROR_CHECK(btn_boot_init());

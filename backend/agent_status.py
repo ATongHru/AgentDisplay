@@ -12,6 +12,9 @@ AGENTLAMP_STATUSES = {
     "OFFLINE",
     "STALE",
     "UNKNOWN",
+    "TOOL",
+    "EAR",
+    "SPEAKING",
 }
 
 STATUS_DETAILS = {"compacting", "tool_running", "subagent", "unknown"}
@@ -30,7 +33,7 @@ TASK_LABELS = {
 }
 
 # Existing project clients used this name before AgentLamp compatibility was added.
-LEGACY_STATUS = {"tool_call": ("THINKING", "tool_running")}
+LEGACY_STATUS = {"tool_call": ("TOOL", "tool_running")}
 
 
 def normalize_status(value: str) -> tuple[str, str | None]:

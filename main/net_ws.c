@@ -46,6 +46,8 @@ static char s_usb_line[512];
 static size_t s_usb_len;
 static bool s_usb_ready;
 static bool s_ble_paused;
+static uint32_t s_profile_try_ms;
+#define PROFILE_ROTATE_MS 15000u
 static esp_netif_t *s_sta;
 static uint32_t s_usj_sof;
 static uint32_t s_usj_ok_ms;
@@ -83,11 +85,181 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_wifi = true;
         xEventGroupSetBits(s_events, WIFI_OK);
         ESP_LOGI(TAG, "got ip " IPSTR, IP2STR(&event->ip_info.ip));
+        s_profile_try_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
         esp_sntp_stop();
         esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
         esp_sntp_setservername(0, "ntp.aliyun.com");
         esp_sntp_init();
     }
+}
+
+static void split_ws_host_port(const char *ws_url, char *host, size_t host_len, int *port)
+{
+    host[0] = 0;
+    *port = 8000;
+    if (!ws_url) {
+        return;
+    }
+    const char *u = ws_url;
+    if (strncmp(u, "ws://", 5) == 0) {
+        u += 5;
+    } else if (strncmp(u, "wss://", 6) == 0) {
+        u += 6;
+    }
+    char tmp[AGENT_CFG_HOST_MAX];
+    size_t n = strlen(u);
+    if (n >= 3 && strcmp(u + n - 3, "/ws") == 0) {
+        n -= 3;
+    }
+    if (n >= sizeof(tmp)) {
+        n = sizeof(tmp) - 1;
+    }
+    memcpy(tmp, u, n);
+    tmp[n] = 0;
+    char *colon = strrchr(tmp, ':');
+    if (colon) {
+        *colon = 0;
+        strncpy(host, tmp, host_len - 1);
+        host[host_len - 1] = 0;
+        int p = atoi(colon + 1);
+        if (p > 0 && p <= 65535) {
+            *port = p;
+        }
+    } else {
+        strncpy(host, tmp, host_len - 1);
+        host[host_len - 1] = 0;
+    }
+}
+
+static void send_wifi_profiles(void)
+{
+    if (!s_ws) {
+        return;
+    }
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_CreateArray();
+    if (!root || !arr) {
+        cJSON_Delete(root);
+        cJSON_Delete(arr);
+        return;
+    }
+    uint8_t count = agent_cfg_profile_count();
+    uint8_t active = agent_cfg_active_index();
+    cJSON_AddStringToObject(root, "type", "wifi_profiles");
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddNumberToObject(root, "count", count);
+    cJSON_AddNumberToObject(root, "active", active);
+    for (uint8_t i = 0; i < count; i++) {
+        const agent_cfg_t *cfg = agent_cfg_get_profile(i);
+        if (!cfg) {
+            continue;
+        }
+        cJSON *item = cJSON_CreateObject();
+        if (!item) {
+            continue;
+        }
+        char host[AGENT_CFG_HOST_MAX];
+        int port = 8000;
+        split_ws_host_port(cfg->ws_url, host, sizeof(host), &port);
+        cJSON_AddNumberToObject(item, "index", i);
+        cJSON_AddStringToObject(item, "ssid", cfg->ssid);
+        cJSON_AddStringToObject(item, "password", cfg->pass);
+        cJSON_AddStringToObject(item, "host", host);
+        cJSON_AddNumberToObject(item, "port", port);
+        cJSON_AddStringToObject(item, "ip", cfg->ip);
+        cJSON_AddStringToObject(item, "netmask", cfg->netmask);
+        cJSON_AddStringToObject(item, "gateway", cfg->gateway);
+        cJSON_AddItemToArray(arr, item);
+    }
+    cJSON_AddItemToObject(root, "profiles", arr);
+    char *dump = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!dump) {
+        return;
+    }
+    esp_websocket_client_send_text(s_ws, dump, strlen(dump), pdMS_TO_TICKS(1000));
+    ESP_LOGI(TAG, "sent wifi_profiles count=%u", (unsigned)count);
+    free(dump);
+}
+
+static bool json_copy_str(const cJSON *obj, const char *key, char *out, size_t out_len)
+{
+    out[0] = 0;
+    const cJSON *v = cJSON_GetObjectItem(obj, key);
+    if (!cJSON_IsString(v) || !v->valuestring) {
+        return false;
+    }
+    strncpy(out, v->valuestring, out_len - 1);
+    out[out_len - 1] = 0;
+    return true;
+}
+
+static esp_err_t cfg_from_wifi_json(const cJSON *root, agent_cfg_t *cfg)
+{
+    memset(cfg, 0, sizeof(*cfg));
+    if (!json_copy_str(root, "ssid", cfg->ssid, sizeof(cfg->ssid)) || !cfg->ssid[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    json_copy_str(root, "password", cfg->pass, sizeof(cfg->pass));
+    char host[AGENT_CFG_HOST_MAX] = {0};
+    json_copy_str(root, "host", host, sizeof(host));
+    int port = 8000;
+    const cJSON *pj = cJSON_GetObjectItem(root, "port");
+    if (cJSON_IsNumber(pj)) {
+        port = (int)pj->valuedouble;
+    }
+    char *colon = strrchr(host, ':');
+    if (colon && colon != host && colon[1] >= '0' && colon[1] <= '9') {
+        *colon = 0;
+        int parsed = atoi(colon + 1);
+        if (parsed > 0 && parsed <= 65535) {
+            port = parsed;
+        }
+    }
+    if (!host[0] || port < 1 || port > 65535) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    int n = snprintf(cfg->ws_url, sizeof(cfg->ws_url), "ws://%s:%d/ws", host, port);
+    if (n <= 0 || n >= (int)sizeof(cfg->ws_url)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    json_copy_str(root, "ip", cfg->ip, sizeof(cfg->ip));
+    json_copy_str(root, "netmask", cfg->netmask, sizeof(cfg->netmask));
+    json_copy_str(root, "gateway", cfg->gateway, sizeof(cfg->gateway));
+    return ESP_OK;
+}
+
+static void send_wifi_profiles_error(const char *detail)
+{
+    if (!s_ws || !detail) {
+        return;
+    }
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "{\"type\":\"wifi_profiles\",\"ok\":false,\"error\":\"%s\",\"count\":0,\"active\":0,\"profiles\":[]}",
+             detail);
+    esp_websocket_client_send_text(s_ws, buf, strlen(buf), pdMS_TO_TICKS(1000));
+}
+
+static void reply_wifi_profiles(esp_err_t err, bool apply)
+{
+    send_wifi_profiles();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "wifi profile cmd failed %s", esp_err_to_name(err));
+        return;
+    }
+    if (apply) {
+        (void)net_apply_config();
+    }
+}
+
+static int json_index(const cJSON *root, int fallback)
+{
+    const cJSON *ij = cJSON_GetObjectItem(root, "index");
+    if (cJSON_IsNumber(ij)) {
+        return (int)ij->valuedouble;
+    }
+    return fallback;
 }
 
 static void send_hello(void)
@@ -113,7 +285,7 @@ static void handle_text(const char *text, int len)
     } else if (strcmp(t, "ping") == 0) {
         const char *pong = "{\"type\":\"pong\"}";
         esp_websocket_client_send_text(s_ws, pong, strlen(pong), pdMS_TO_TICKS(500));
-    } else if (strcmp(t, "status") == 0 || strcmp(t, "text") == 0) {
+    } else if (strcmp(t, "status") == 0 || strcmp(t, "text") == 0 || strcmp(t, "append") == 0) {
         char *dump = cJSON_PrintUnformatted(root);
         if (dump) {
             ui_post_event_json(dump, false);
@@ -140,7 +312,9 @@ static void handle_text(const char *text, int len)
         }
         const cJSON *vol = cJSON_GetObjectItem(root, "volume_percent");
         if (cJSON_IsNumber(vol)) {
-            audio_set_volume_percent((int)vol->valuedouble);
+            int pct = (int)vol->valuedouble;
+            audio_set_volume_percent(pct);
+            ui_post_volume(pct);
         }
     } else if (strcmp(t, "audio_chunk") == 0) {
         const cJSON *lenj = cJSON_GetObjectItem(root, "len");
@@ -161,7 +335,47 @@ static void handle_text(const char *text, int len)
     } else if (strcmp(t, "config") == 0) {
         const cJSON *vol = cJSON_GetObjectItem(root, "volume_percent");
         if (cJSON_IsNumber(vol)) {
-            audio_set_volume_percent((int)vol->valuedouble);
+            int pct = (int)vol->valuedouble;
+            audio_set_volume_percent(pct);
+            ui_post_volume(pct);
+        }
+        const cJSON *ven = cJSON_GetObjectItem(root, "voice_enabled");
+        if (cJSON_IsBool(ven)) {
+            voice_set_enabled(cJSON_IsTrue(ven));
+        }
+    } else if (strcmp(t, "get_wifi_profiles") == 0) {
+        send_wifi_profiles();
+    } else if (strcmp(t, "wifi_profile_save") == 0) {
+        agent_cfg_t cfg;
+        uint8_t slot = 0;
+        uint8_t prev_active = agent_cfg_active_index();
+        int idx = json_index(root, -1);
+        esp_err_t err = cfg_from_wifi_json(root, &cfg);
+        if (err == ESP_OK) {
+            err = agent_cfg_upsert_at(idx, &cfg, &slot);
+        }
+        if (err != ESP_OK) {
+            send_wifi_profiles_error(err == ESP_ERR_NO_MEM ? "最多保存 5 条" : "保存失败");
+        } else {
+            reply_wifi_profiles(err, slot == prev_active);
+        }
+    } else if (strcmp(t, "wifi_profile_delete") == 0) {
+        int idx = json_index(root, -1);
+        uint8_t prev_active = agent_cfg_active_index();
+        esp_err_t err = (idx < 0) ? ESP_ERR_INVALID_ARG : agent_cfg_delete_at((uint8_t)idx);
+        if (err != ESP_OK) {
+            send_wifi_profiles_error(err == ESP_ERR_NOT_ALLOWED ? "至少保留 1 条" : "删除失败");
+        } else {
+            reply_wifi_profiles(err, (uint8_t)idx == prev_active);
+        }
+    } else if (strcmp(t, "wifi_profile_activate") == 0) {
+        int idx = json_index(root, -1);
+        uint8_t prev_active = agent_cfg_active_index();
+        esp_err_t err = (idx < 0) ? ESP_ERR_INVALID_ARG : agent_cfg_activate((uint8_t)idx);
+        if (err != ESP_OK) {
+            send_wifi_profiles_error("切换失败");
+        } else {
+            reply_wifi_profiles(err, (uint8_t)idx != prev_active);
         }
     } else if (strcmp(t, "error") == 0) {
         ESP_LOGW(TAG, "ws error frame");
@@ -450,6 +664,22 @@ void net_loop(void)
             s_rssi = ap.rssi;
         }
     }
+
+    /* Round-robin saved BLE profiles until WiFi+WS are both up. */
+    if (agent_cfg_profile_count() > 1) {
+        uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        if (net_ws_ready()) {
+            s_profile_try_ms = now;
+        } else if (s_profile_try_ms == 0) {
+            s_profile_try_ms = now;
+        } else if ((now - s_profile_try_ms) >= PROFILE_ROTATE_MS) {
+            if (agent_cfg_next_profile()) {
+                ESP_LOGW(TAG, "profile rotate -> idx=%u", (unsigned)agent_cfg_active_index());
+                (void)net_apply_config();
+            }
+            s_profile_try_ms = now;
+        }
+    }
 }
 
 bool net_wifi_ready(void) { return s_wifi; }
@@ -482,7 +712,7 @@ bool net_ws_send_audio_upload(const uint8_t *pcm, size_t pcm_len, char *session_
     esp_websocket_client_send_text(s_ws, txt, (int)strlen(txt), pdMS_TO_TICKS(2000));
     free(txt);
     esp_websocket_client_send_bin(s_ws, (const char *)pcm, (int)pcm_len, pdMS_TO_TICKS(5000));
-    EventBits_t bits = xEventGroupWaitBits(s_events, SESSION_OK, pdTRUE, pdTRUE, pdMS_TO_TICKS(8000));
+    EventBits_t bits = xEventGroupWaitBits(s_events, SESSION_OK, pdTRUE, pdTRUE, pdMS_TO_TICKS(2500));
     if (!(bits & SESSION_OK) || s_session[0] == '\0') {
         return false;
     }
@@ -512,7 +742,7 @@ bool net_ws_send_audio_stream_begin(char *session_id, size_t session_id_len)
     s_session[0] = '\0';
     esp_websocket_client_send_text(s_ws, txt, (int)strlen(txt), pdMS_TO_TICKS(2000));
     free(txt);
-    EventBits_t bits = xEventGroupWaitBits(s_events, SESSION_OK, pdTRUE, pdTRUE, pdMS_TO_TICKS(8000));
+    EventBits_t bits = xEventGroupWaitBits(s_events, SESSION_OK, pdTRUE, pdTRUE, pdMS_TO_TICKS(2500));
     if (!(bits & SESSION_OK) || s_session[0] == '\0') {
         return false;
     }
@@ -530,7 +760,7 @@ bool net_ws_send_audio_binary(const uint8_t *pcm, size_t pcm_len)
     return ret >= 0;
 }
 
-bool net_ws_send_audio_end(const char *session_id)
+bool net_ws_send_audio_end(const char *session_id, size_t total_bytes, bool discard)
 {
     if (!net_ws_ready()) {
         return false;
@@ -539,6 +769,10 @@ bool net_ws_send_audio_end(const char *session_id)
     cJSON_AddStringToObject(meta, "type", "audio_end");
     if (session_id && session_id[0]) {
         cJSON_AddStringToObject(meta, "session_id", session_id);
+    }
+    cJSON_AddNumberToObject(meta, "total_bytes", (double)total_bytes);
+    if (discard) {
+        cJSON_AddBoolToObject(meta, "discard", 1);
     }
     char *txt = cJSON_PrintUnformatted(meta);
     cJSON_Delete(meta);

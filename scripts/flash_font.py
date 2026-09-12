@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Flash animations.bin to the animations partition (offset 0x600000)."""
+"""Flash font_cjk_16.bin to the cjk_font partition (offset 0x400000)."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-BIN = ROOT / "firmware" / "data" / "animations.bin"
-PARTITION_OFFSET = 0x600000
+BIN = ROOT / "firmware" / "data" / "font_cjk_16.bin"
+PARTITION_OFFSET = 0x400000
 
 
 def find_python() -> str:
@@ -34,7 +34,6 @@ def find_python() -> str:
 
 
 def find_esptool() -> list[str]:
-    """Prefer IDF/python esptool; do not use Arduino esptool.exe paths."""
     python = find_python()
     idf_candidates = [
         os.environ.get("IDF_PATH", ""),
@@ -60,12 +59,12 @@ def find_esptool() -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--port", default="COM4")
+    parser.add_argument("-p", "--port", default="COM5")
     parser.add_argument("--baud", default="921600")
     args = parser.parse_args()
 
     if not BIN.exists():
-        print(f"Missing {BIN}. Run: python scripts/gen_frame_player.py", file=sys.stderr)
+        print(f"Missing {BIN}. Run: python scripts/gen_cjk_font.py", file=sys.stderr)
         return 1
 
     esptool = find_esptool()

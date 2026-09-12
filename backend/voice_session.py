@@ -34,6 +34,7 @@ class VoiceSession:
     channels: int = 1
     bit_depth: int = 16
     created_at: float = field(default_factory=time.time)
+    last_active: float = field(default_factory=time.time)
     phase: SessionPhase = SessionPhase.RECEIVED
     asr_text: str = ""
     asr_ready: bool = False
@@ -48,8 +49,11 @@ class VoiceSession:
     def age(self) -> float:
         return time.time() - self.created_at
 
+    def touch(self) -> None:
+        self.last_active = time.time()
+
     def expired(self) -> bool:
-        return self.age() > SESSION_TIMEOUT_SEC
+        return (time.time() - self.last_active) > SESSION_TIMEOUT_SEC
 
     def set_error(self, message: str) -> None:
         with self.lock:
@@ -62,6 +66,7 @@ class VoiceSession:
             return
         with self.lock:
             self.pcm_data += data
+            self.last_active = time.time()
 
     def set_asr(self, text: str) -> None:
         with self.lock:
@@ -133,6 +138,7 @@ class VoiceSession:
     def pop_audio_chunk(self) -> tuple[bytes | None, bool]:
         """Return next PCM chunk and whether this is the final chunk."""
         with self.lock:
+            self.last_active = time.time()
             if self.audio_chunks:
                 chunk = self.audio_chunks.popleft()
                 is_end = (not self.audio_chunks) and self.audio_end

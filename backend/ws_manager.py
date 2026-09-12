@@ -13,14 +13,14 @@ AUDIO_CHUNK_BYTES = 4096
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_BYTES_PER_SAMPLE = 2
 AUDIO_SEND_INTERVAL_SEC = 0.02
-AUDIO_BURST_BYTES = 65536
-VOICE_BUSY_TIMEOUT_SEC = 50.0
+AUDIO_BURST_BYTES = 16384
+VOICE_BUSY_TIMEOUT_SEC = 55.0
 from typing import Any, Callable
 
 from fastapi import WebSocket, WebSocketDisconnect
 
 from asr import VoskStreamRecognizer
-from settings_store import get_volume_percent
+from settings_store import get_volume_percent, get_voice_enabled
 from voice_pipeline import start_pipeline, synthesize_to_session, tts_to_pcm
 from voice_session import session_store
 
@@ -56,6 +56,8 @@ class WsHub:
         self._busy_since = 0.0
         self._speak_sessions: set[str] = set()
         self._push_append: Callable[..., None] | None = None
+        self._profiles_future: asyncio.Future | None = None
+        self._last_asr_partial_ts = 0.0
 
     def set_push_append(self, callback: Callable[..., None] | None) -> None:
         self._push_append = callback
@@ -123,6 +125,10 @@ class WsHub:
                 self._device.stream_asr = None
                 self._speak_sessions.clear()
                 self._clear_busy("device disconnect")
+                fut = self._profiles_future
+                if fut is not None and not fut.done():
+                    fut.set_exception(RuntimeError("设备已断开"))
+                self._profiles_future = None
             self._dashboards.discard(websocket)
 
     async def handle_text(self, websocket: WebSocket, raw: str) -> None:
@@ -152,6 +158,9 @@ class WsHub:
             if websocket is not self._device.websocket:
                 return
             self._device.last_seen = time.time()
+            if not get_voice_enabled():
+                await self._send_ws_json(websocket, {"type": "error", "detail": "voice chat disabled"})
+                return
             streaming = bool(msg.get("stream")) or int(msg.get("audio_len", -1) or 0) == 0
             if streaming:
                 await self._begin_audio_stream(websocket, msg)
@@ -168,6 +177,14 @@ class WsHub:
 
         if msg_type == "status":
             await self._broadcast_dashboard(msg)
+            return
+
+        if msg_type == "wifi_profiles":
+            if websocket is not self._device.websocket:
+                return
+            fut = self._profiles_future
+            if fut is not None and not fut.done():
+                fut.set_result(msg)
             return
 
     async def handle_binary(self, websocket: WebSocket, data: bytes) -> None:
@@ -190,6 +207,12 @@ class WsHub:
                 partial = ""
             if partial:
                 print(f"[asr] partial={partial!r}")
+                now = time.time()
+                if now - self._last_asr_partial_ts >= 0.2:
+                    self._last_asr_partial_ts = now
+                    await self.push_append_event(
+                        {"text": partial, "source": "VOICE", "reset": True}
+                    )
             return
 
         meta = self._device.waiting_audio
@@ -298,12 +321,36 @@ class WsHub:
             await self._send_ws_json(websocket, {"type": "error", "detail": "stream session missing"})
             self._clear_busy("stream session missing")
             return
+        if msg.get("discard"):
+            session.mark_done()
+            self._clear_busy("stream discarded")
+            print(f"[voice] stream discarded session={session_id}")
+            return
         try:
             text = asr.finish()
         except Exception as exc:
             print(f"[asr] stream finish failed: {exc}")
             text = ""
         pcm_len = len(session.pcm_data)
+        expected = msg.get("total_bytes")
+        if expected is not None:
+            try:
+                expected_n = int(expected)
+            except (TypeError, ValueError):
+                expected_n = -1
+            if expected_n >= 0 and expected_n != pcm_len:
+                print(f"[voice] total_bytes mismatch expect={expected_n} got={pcm_len}")
+                await self._send_ws_json(
+                    websocket,
+                    {
+                        "type": "error",
+                        "detail": f"total_bytes mismatch: expected {expected_n}, got {pcm_len}",
+                    },
+                )
+                session.mark_done()
+                self._clear_busy("total_bytes mismatch")
+                self._push_status_threadsafe("IDLE", "", "VOICE")
+                return
         print(f"[voice] stream end session={session_id} pcm={pcm_len} text={text!r}")
         if pcm_len < 6400 or not text:
             session.mark_done()
@@ -322,10 +369,57 @@ class WsHub:
         )
 
     async def push_volume_config(self, percent: int | None = None) -> None:
-        """Sync dashboard volume to device playback gain."""
+        """Sync dashboard volume / voice switch to device."""
         value = get_volume_percent() if percent is None else int(percent)
-        await self._send_device({"type": "config", "volume_percent": value})
-        print(f"[volume] pushed to device {value}%")
+        enabled = get_voice_enabled()
+        await self._send_device(
+            {"type": "config", "volume_percent": value, "voice_enabled": enabled}
+        )
+        print(f"[volume] pushed to device {value}% voice_enabled={enabled}")
+
+    async def push_voice_config(self, enabled: bool | None = None) -> None:
+        value = get_voice_enabled() if enabled is None else bool(enabled)
+        await self._send_device(
+            {
+                "type": "config",
+                "volume_percent": get_volume_percent(),
+                "voice_enabled": value,
+            }
+        )
+        print(f"[voice] pushed enabled={value}")
+
+    async def request_wifi_profiles(self, timeout: float = 5.0) -> dict[str, Any]:
+        return await self.request_wifi_command({"type": "get_wifi_profiles"}, timeout=timeout)
+
+    async def request_wifi_command(self, message: dict[str, Any], timeout: float = 8.0) -> dict[str, Any]:
+        """Send a WiFi-profile command and wait for the device wifi_profiles reply."""
+        if self._device.websocket is None:
+            raise RuntimeError("设备未连接 WebSocket，无法读写网络配置")
+        loop = asyncio.get_running_loop()
+        if self._profiles_future is not None and not self._profiles_future.done():
+            raise RuntimeError("正在与设备交换网络配置")
+        fut = loop.create_future()
+        self._profiles_future = fut
+        try:
+            await self._send_device(message)
+            msg = await asyncio.wait_for(asyncio.shield(fut), timeout)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("设备未在超时内返回配置，请确认已烧录支持该接口的固件") from exc
+        finally:
+            if self._profiles_future is fut:
+                self._profiles_future = None
+        if msg.get("ok") is False:
+            raise RuntimeError(str(msg.get("error") or "设备拒绝该操作"))
+        profiles = msg.get("profiles") or []
+        if not isinstance(profiles, list):
+            profiles = []
+        cleaned = [item for item in profiles if isinstance(item, dict)]
+        return {
+            "ok": True,
+            "count": int(msg.get("count") or len(cleaned)),
+            "active": int(msg.get("active") or 0),
+            "profiles": cleaned,
+        }
 
     def _mark_busy(self) -> None:
 
@@ -457,7 +551,6 @@ class WsHub:
                 self._clear_busy("speak done")
                 print(f"[tts] speak done session={session_id}")
             elif chunk:
-                self._push_status_threadsafe("IDLE", "", "VOICE")
                 self._clear_busy("voice audio done")
 
     def schedule_audio_chunk(self, session_id: str, chunk: bytes, is_end: bool) -> None:

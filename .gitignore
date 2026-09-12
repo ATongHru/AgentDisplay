@@ -19,3 +19,13 @@ backend/*.log
 _esp_*.txt
 _patch_*.py
 backend.pid
+
+# LLM chat history (keep directory)
+log/*.jsonl
+
+# Local secrets / editable runtime config
+backend/llm.json
+backend/wifi_profiles.json
+
+# Generated embedded CJK source (use firmware/data/font_cjk_16.bin instead)
+main/font_cjk_16.c

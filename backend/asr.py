@@ -12,7 +12,7 @@ from pathlib import Path
 ASR_ENGINE = os.getenv("ASR_ENGINE", "vosk").strip().lower()
 
 # Vosk recommended feed size: 4096 bytes ≈ 128ms @ 16kHz s16le mono
-VOSK_CHUNK_BYTES = 4096
+VOSK_CHUNK_BYTES = 8192
 
 
 def _default_vosk_path() -> str:
@@ -108,6 +108,10 @@ class VoskStreamRecognizer:
         self._bit_depth = bit_depth
         self._rec = KaldiRecognizer(model, sample_rate)
         self._rec.SetWords(False)
+        try:
+            self._rec.SetPartialWords(False)
+        except Exception:
+            pass
         self._parts: list[str] = []
         self._partial = ""
         self._buf = bytearray()

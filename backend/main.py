@@ -20,7 +20,20 @@ from pydantic import BaseModel, Field
 
 from agent_status import STATUS_DETAILS, TASK_LABELS, TOOL_CATEGORIES, normalize_status
 from log_hub import install_capture, log_hub
-from settings_store import get_volume_percent, set_volume_percent
+from llm_history import query_records
+from settings_store import (
+    get_volume_percent,
+    set_volume_percent,
+    get_voice_enabled,
+    set_voice_enabled,
+)
+from wifi_profiles_store import (
+    list_profiles as list_wifi_profiles,
+    upsert_profile as upsert_wifi_profile,
+    delete_profile as delete_wifi_profile,
+    get_profile as get_wifi_profile,
+)
+from llm_config import get_llm_config, set_llm_config, load_llm_config
 from voice_pipeline import start_pipeline, warmup as voice_warmup
 from voice_session import session_store
 from ble_prov import ble_prov
@@ -29,10 +42,12 @@ from ws_manager import WsHub, ws_endpoint
 install_capture()
 
 DASHBOARD_HTML = Path(__file__).with_name("dashboard.html")
+CHAT_HISTORY_HTML = Path(__file__).with_name("chat_history.html")
 GIF_DIR = Path(__file__).resolve().parent.parent / "third_party" / "emoji-gif"
 GIF_STATUSES = {
     "IDLE", "THINKING", "CODING", "READING", "TESTING", "WAITING",
     "DONE", "ERROR", "OFFLINE", "STALE", "UNKNOWN",
+    "TOOL", "EAR", "SPEAKING",
 }
 
 
@@ -90,8 +105,49 @@ class VolumeEvent(BaseModel):
     volume_percent: int = Field(ge=0, le=100)
 
 
+class VoiceToggleEvent(BaseModel):
+    voice_enabled: bool
+
+
+class WifiProfileEvent(BaseModel):
+    id: str | None = None
+    name: str = ""
+    ssid: str = Field(min_length=1, max_length=32)
+    password: str = Field(default="", max_length=64)
+    host: str = Field(min_length=1, max_length=64)
+    port: int = Field(default=8000, ge=1, le=65535)
+    ip: str = Field(default="", max_length=15)
+    netmask: str = Field(default="", max_length=15)
+    gateway: str = Field(default="", max_length=15)
+
+
+class DeviceWifiProfileSave(BaseModel):
+    index: int | None = Field(default=None, ge=-1, le=4)
+    ssid: str = Field(min_length=1, max_length=32)
+    password: str = Field(default="", max_length=64)
+    host: str = Field(min_length=1, max_length=64)
+    port: int = Field(default=8000, ge=1, le=65535)
+    ip: str = Field(default="", max_length=15)
+    netmask: str = Field(default="", max_length=15)
+    gateway: str = Field(default="", max_length=15)
+
+
+class DeviceWifiIndexEvent(BaseModel):
+    index: int = Field(ge=0, le=4)
+
+
+class LlmConfigEvent(BaseModel):
+    base_url: str = Field(min_length=1, max_length=256)
+    api_key: str = Field(default="", max_length=256)
+    model: str = Field(min_length=1, max_length=128)
+
+
 class BleScanRequest(BaseModel):
     timeout: float = Field(default=6.0, ge=2.0, le=20.0)
+
+
+class BleReadRequest(BaseModel):
+    address: str | None = Field(default=None, max_length=64)
 
 
 class BleProvRequest(BaseModel):
@@ -157,29 +213,20 @@ state = AppState()
 
 
 def _push_voice_event(status: str, text: str, source: str = "VOICE") -> None:
+    """Voice captions only. Do not overwrite agent status/source/GIF."""
     if text and len(text) > 240:
         text = text[:237] + "..."
-    try:
-        apply_event(Event(status=status, text=text, source=source))
-    except ValueError as exc:
-        print(f"[voice] push failed: {exc}")
+    if ws_hub.loop is None:
+        return
+    asyncio.run_coroutine_threadsafe(
+        ws_hub.push_text_event({"text": text or "", "source": source, "status": status}),
+        ws_hub.loop,
+    )
 
 
 def _push_voice_append(text: str, source: str = "VOICE", reset: bool = False) -> None:
     if text and len(text) > 80:
         text = text[:80]
-    with state.lock:
-        current = dict(state.current_event)
-        current["status"] = "THINKING"
-        current["source"] = source
-        if reset:
-            current["text"] = text or ""
-        elif text:
-            merged = (current.get("text") or "") + text
-            if len(merged) > 240:
-                merged = merged[:237] + "..."
-            current["text"] = merged
-        state.current_event = current
     if ws_hub.loop is not None:
         asyncio.run_coroutine_threadsafe(
             ws_hub.push_append_event({"text": text or "", "source": source, "reset": bool(reset)}),
@@ -348,6 +395,33 @@ def dashboard():
     return HTMLResponse(DASHBOARD_HTML.read_text(encoding="utf-8"))
 
 
+@app.get("/chat-history", response_class=HTMLResponse)
+def chat_history_page():
+    if not CHAT_HISTORY_HTML.is_file():
+        raise HTTPException(status_code=404, detail="chat history page missing")
+    return HTMLResponse(CHAT_HISTORY_HTML.read_text(encoding="utf-8"))
+
+
+@app.get("/api/chat-history")
+def api_chat_history(
+    page: int = 1,
+    page_size: int = 20,
+    q: str = "",
+    source: str = "",
+    date_from: str = "",
+    date_to: str = "",
+):
+    return query_records(
+        page=page,
+        page_size=page_size,
+        q=q,
+        source=source,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+
+
 @app.get("/gifs/{name}")
 def status_gif(name: str):
     stem = Path(name).stem.upper()
@@ -386,6 +460,9 @@ def api_status():
         "transcripts": transcripts,
         "logs": log_hub.items(),
         "volume_percent": get_volume_percent(),
+        "voice_enabled": get_voice_enabled(),
+        "wifi_profiles": list_wifi_profiles(),
+        "llm": get_llm_config(mask_key=True),
         "updated": time.time(),
     }
 
@@ -402,6 +479,53 @@ async def api_volume_set(payload: VolumeEvent):
     return {"ok": True, "volume_percent": percent}
 
 
+@app.get("/api/voice")
+def api_voice_get():
+    return {"voice_enabled": get_voice_enabled()}
+
+
+@app.post("/api/voice")
+async def api_voice_set(payload: VoiceToggleEvent):
+    enabled = set_voice_enabled(payload.voice_enabled)
+    await ws_hub.push_voice_config(enabled)
+    return {"ok": True, "voice_enabled": enabled}
+
+
+
+@app.get("/api/wifi-profiles")
+def api_wifi_profiles_list():
+    return {"profiles": list_wifi_profiles()}
+
+
+@app.post("/api/wifi-profiles")
+def api_wifi_profiles_upsert(payload: WifiProfileEvent):
+    try:
+        item = upsert_wifi_profile(payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "profile": item, "profiles": list_wifi_profiles()}
+
+
+@app.delete("/api/wifi-profiles/{profile_id}")
+def api_wifi_profiles_delete(profile_id: str):
+    ok = delete_wifi_profile(profile_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="profile not found")
+    return {"ok": True, "profiles": list_wifi_profiles()}
+
+
+@app.get("/api/llm")
+def api_llm_get():
+    return get_llm_config(mask_key=True)
+
+
+@app.post("/api/llm")
+def api_llm_set(payload: LlmConfigEvent):
+    try:
+        set_llm_config(payload.model_dump())
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"写入 llm.json 失败: {exc}") from exc
+    return {"ok": True, "llm": get_llm_config(mask_key=True)}
 
 
 @app.get("/api/ble/status")
@@ -436,7 +560,99 @@ async def api_ble_provision(payload: BleProvRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    try:
+        upsert_wifi_profile(
+            {
+                "name": payload.ssid,
+                "ssid": payload.ssid,
+                "password": payload.password,
+                "host": payload.host,
+                "port": payload.port,
+                "ip": payload.ip or "",
+                "netmask": payload.netmask or "",
+                "gateway": payload.gateway or "",
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[wifi-profile] auto-save skipped: {exc}")
     return result
+
+
+@app.post("/api/device/wifi-profiles")
+async def api_device_wifi_profiles():
+    try:
+        result = await ws_hub.request_wifi_profiles()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "via": "ws",
+        "count": result.get("count"),
+        "active": result.get("active"),
+        "profiles": result.get("profiles") or [],
+    }
+
+
+@app.post("/api/device/wifi-profiles/save")
+async def api_device_wifi_profile_save(payload: DeviceWifiProfileSave):
+    body = payload.model_dump()
+    body["type"] = "wifi_profile_save"
+    if body.get("index") is None:
+        body["index"] = -1
+    try:
+        result = await ws_hub.request_wifi_command(body)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return result
+
+
+@app.post("/api/device/wifi-profiles/delete")
+async def api_device_wifi_profile_delete(payload: DeviceWifiIndexEvent):
+    try:
+        result = await ws_hub.request_wifi_command(
+            {"type": "wifi_profile_delete", "index": payload.index}
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return result
+
+
+@app.post("/api/device/wifi-profiles/activate")
+async def api_device_wifi_profile_activate(payload: DeviceWifiIndexEvent):
+    try:
+        result = await ws_hub.request_wifi_command(
+            {"type": "wifi_profile_activate", "index": payload.index}
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return result
+
+
+@app.post("/api/ble/read-profiles")
+async def api_ble_read_profiles(payload: BleReadRequest = BleReadRequest()):
+    try:
+        result = await ble_prov.read_profiles(address=payload.address)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    imported = []
+    for item in result.get("profiles") or []:
+        try:
+            imported.append(upsert_wifi_profile(item))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[wifi-profile] import skipped: {exc}")
+    return {
+        "ok": True,
+        "address": result.get("address"),
+        "count": result.get("count"),
+        "active": result.get("active"),
+        "device_profiles": result.get("profiles") or [],
+        "profiles": list_wifi_profiles(),
+        "imported": imported,
+        "replies": result.get("replies") or [],
+        **ble_prov.status(),
+    }
 
 @app.get("/api/logs")
 def api_logs():

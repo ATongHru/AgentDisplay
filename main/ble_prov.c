@@ -155,6 +155,49 @@ static void handle_line(const char *line_in)
         return;
     }
 
+
+    if (strcmp(line, "LIST") == 0) {
+        uint8_t count = agent_cfg_profile_count();
+        uint8_t active = agent_cfg_active_index();
+        char head[64];
+        snprintf(head, sizeof(head), "OK LIST count=%u active=%u", (unsigned)count, (unsigned)active);
+        notify_text(head);
+        for (uint8_t i = 0; i < count; i++) {
+            const agent_cfg_t *cfg = agent_cfg_get_profile(i);
+            if (!cfg) {
+                continue;
+            }
+            char host[AGENT_CFG_HOST_MAX];
+            host[0] = 0;
+            {
+                const char *u = cfg->ws_url;
+                if (strncmp(u, "ws://", 5) == 0) {
+                    u += 5;
+                } else if (strncmp(u, "wss://", 6) == 0) {
+                    u += 6;
+                }
+                size_t n = strlen(u);
+                if (n >= 3 && strcmp(u + n - 3, "/ws") == 0) {
+                    n -= 3;
+                }
+                if (n >= sizeof(host)) {
+                    n = sizeof(host) - 1;
+                }
+                memcpy(host, u, n);
+                host[n] = 0;
+            }
+            char reply[280];
+            snprintf(reply, sizeof(reply),
+                     "OK P i=%u ssid=%s pass=%s host=%s ip=%s mask=%s gw=%s",
+                     (unsigned)i, cfg->ssid, cfg->pass, host,
+                     cfg->ip[0] ? cfg->ip : "-", cfg->netmask[0] ? cfg->netmask : "-",
+                     cfg->gateway[0] ? cfg->gateway : "-");
+            notify_text(reply);
+        }
+        notify_text("OK LIST_END");
+        return;
+    }
+
     if (strncmp(line, "WIFI:", 5) == 0) {
         const char *body = line + 5;
         const char *comma = strchr(body, ',');
@@ -325,7 +368,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
             ESP_LOGI(TAG, "connected handle=%u", s_conn_handle);
-            notify_text("OK ready WIFI:/HOST:/IP:/MASK:/GW:/GET/APPLY");
+            notify_text("OK ready WIFI:/HOST:/IP:/MASK:/GW:/GET/LIST/APPLY");
         } else {
             start_advertise();
         }
