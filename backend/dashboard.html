@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent 状态显示监控</title>
+<style>
+:root{
+  --bg:#0b1017;--panel:#121a24;--panel2:#182230;--line:#273548;
+  --text:#edf2f7;--muted:#8492a6;--ok:#44d483;--warn:#f5b83d;--bad:#ff6670;
+  --accent:#8b9cff;--accent2:#5eead4;--radius:10px;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+main{
+  height:100%;max-width:1180px;margin:auto;padding:18px 22px;
+  display:grid;gap:12px;
+  grid-template-rows:auto auto auto minmax(0,1.15fr) minmax(148px,.7fr);
+  min-height:0;
+}
+header{display:flex;align-items:end;justify-content:space-between;gap:16px}
+h1{font-size:24px;line-height:1.1;margin:0;letter-spacing:.02em}
+header p{margin:0;color:var(--muted);font-size:12px;white-space:nowrap}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px 16px}
+.label{color:var(--muted);font-size:11px;letter-spacing:.08em}
+.value{font-size:20px;font-weight:650;margin-top:4px}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+.senders{display:grid;grid-template-columns:1fr 1fr;gap:12px;min-width:0}
+.sender{
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:12px 16px;display:grid;gap:8px;align-content:start;min-width:0
+}
+.sender h2,.display h2,.history h2,.voice-log h2{
+  font-size:12px;color:var(--muted);font-weight:500;margin:0;letter-spacing:.08em
+}
+.sender p.hint{margin:0;font-size:12px;color:var(--muted);line-height:1.45}
+.sender-row{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;align-items:center}
+.sender-row.text-row{grid-template-columns:minmax(0,1fr) auto}
+.sender select,.sender textarea,.sender button{font:inherit}
+.sender select,.sender textarea{
+  background:var(--panel2);border:1px solid var(--line);color:var(--text);
+  border-radius:6px;padding:7px 9px;width:100%;min-width:0
+}
+.sender textarea{min-height:64px;resize:vertical}
+.sender button{
+  border:0;border-radius:6px;padding:8px 13px;font-weight:650;cursor:pointer;
+  white-space:nowrap;min-height:36px
+}
+.sender button:disabled{opacity:.55;cursor:not-allowed}
+.status-sender button{background:var(--accent);color:#0b1017}
+.sender.text button{background:var(--accent2);color:#0b1017}
+.quick{display:flex;flex-wrap:wrap;gap:8px}
+.quick button{
+  background:var(--panel2);color:var(--text);border:1px solid var(--line);
+  border-radius:999px;padding:6px 12px;font-size:12px;cursor:pointer
+}
+.quick button:hover{border-color:var(--accent);color:var(--accent)}
+.sender.text .quick button:hover{border-color:var(--accent2);color:var(--accent2)}
+.send-result{font-size:12px;color:var(--muted);min-height:18px}
+.send-result.ok{color:var(--ok)}.send-result.bad{color:var(--bad)}
+.content{
+  min-height:0;display:grid;grid-template-columns:minmax(0,.95fr) minmax(320px,1.15fr);
+  gap:12px
+}
+.display,.history,.voice-log{
+  min-height:0;background:var(--panel);border:1px solid var(--line);
+  border-radius:var(--radius);padding:14px 16px;display:flex;flex-direction:column
+}
+.display h2,.history h2,.voice-log h2{margin:0 0 10px}
+.status{font-size:40px;letter-spacing:.04em;color:var(--accent);font-weight:700;line-height:1.15}
+.source{color:var(--muted);font-size:13px;margin-top:6px}
+.text{color:#b8c3d1;min-height:24px;margin:12px 0 14px}
+.meta{margin-top:auto;border-top:1px solid var(--line);padding-top:10px;display:grid;gap:0}
+.meta-row{
+  display:grid;grid-template-columns:max-content minmax(0,1fr);gap:12px;
+  align-items:baseline;padding:6px 0;border-bottom:1px solid #202c3a;
+  color:var(--muted);font-size:13px
+}
+.meta-row:last-child{border-bottom:0;padding-bottom:0}
+.meta-row b{
+  color:var(--text);font-weight:500;text-align:right;min-width:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap
+}
+.log-title{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:8px;flex-shrink:0}
+.log-title h2{margin:0}
+.log-count{color:var(--muted);font-size:12px}
+.logs{min-height:0;flex:1;overflow-y:auto;overflow-x:hidden;padding-right:6px}
+.logs::-webkit-scrollbar{width:8px}
+.logs::-webkit-scrollbar-track{background:#0d141d}
+.logs::-webkit-scrollbar-thumb{background:#40516a;border-radius:4px}
+.log{
+  display:grid;grid-template-columns:70px 76px 92px minmax(0,1fr);gap:8px;
+  padding:8px 0;border-bottom:1px solid #202c3a;color:#b8c3d1
+}
+.log time,.log .src{color:var(--muted)}
+.log .st{color:var(--accent);font-weight:650}
+.log .msg{overflow-wrap:anywhere;min-width:0}
+.empty{color:var(--muted);padding:8px 0}
+.asr-log{
+  display:grid;grid-template-columns:170px 52px minmax(0,1fr);gap:10px;align-items:start;
+  padding:8px 0;border-bottom:1px solid #202c3a;color:#d7e3f0
+}
+.asr-log time{color:var(--accent2);font-variant-numeric:tabular-nums;white-space:nowrap}
+.asr-log .role{color:var(--muted);font-size:12px;padding-top:1px}
+.asr-log.assistant .role{color:var(--accent)}
+.asr-log .msg{overflow-wrap:anywhere;min-width:0}
+@media(max-width:900px){.senders{grid-template-columns:1fr}}
+@media(max-width:760px){
+  html,body{height:auto}
+  main{height:auto;min-height:100vh;padding:14px 10px;grid-template-rows:auto;gap:10px}
+  h1{font-size:22px}
+  header{align-items:start;flex-wrap:wrap}
+  .cards{grid-template-columns:1fr;gap:8px}
+  .card{padding:10px 12px}.value{font-size:18px}
+  .sender-row{grid-template-columns:1fr 1fr}
+  .sender-row.text-row{grid-template-columns:1fr}
+  .sender button{grid-column:1/-1}
+  .content{grid-template-columns:1fr}
+  .display,.history,.voice-log{min-height:220px}
+  .logs{max-height:320px}
+  .log{grid-template-columns:58px 1fr;gap:2px 8px}
+  .log .src,.log .st{grid-column:2}
+  .log .msg{grid-column:2}
+  .asr-log{grid-template-columns:1fr;gap:2px}
+}
+</style>
+</head>
+<body><main>
+<header><h1>Agent 状态显示监控</h1><p id="updated">正在连接后端...</p></header>
+<section class="cards">
+  <div class="card"><div class="label">后端服务</div><div id="backend" class="value">...</div></div>
+  <div class="card"><div class="label">设备 WebSocket</div><div id="usb" class="value">...</div></div>
+  <div class="card"><div class="label">PC→ESP 推送</div><div id="wifi" class="value">...</div></div>
+</section>
+<section class="senders">
+  <section class="sender status-sender">
+    <h2>推送状态（GIF / 表情）</h2>
+    <p class="hint">只切换状态与来源，不修改屏幕文字。先发状态，再单独发文字。</p>
+    <div class="sender-row">
+      <select id="send-status" aria-label="状态">
+        <option value="IDLE">空闲</option>
+        <option value="THINKING">思考中</option>
+        <option value="CODING" selected>编码中</option>
+        <option value="READING">读取中</option>
+        <option value="TESTING">测试中</option>
+        <option value="WAITING">等待中</option>
+        <option value="DONE">已完成</option>
+        <option value="ERROR">错误</option>
+        <option value="OFFLINE">离线</option>
+      </select>
+      <select id="status-source" aria-label="来源">
+        <option value="BOT">BOT</option>
+        <option value="CURSOR" selected>CURSOR</option>
+        <option value="PI">PI</option>
+        <option value="VOICE">VOICE</option>
+      </select>
+      <button id="send-status-btn" type="button">发送状态</button>
+    </div>
+    <div class="quick" id="quick-status"></div>
+    <div id="status-result" class="send-result"></div>
+  </section>
+  <section class="sender text">
+    <h2>推送文字（状态行文案）</h2>
+    <p class="hint">只更新文字，不改变当前 GIF。留空并发送可恢复为状态默认文字。</p>
+    <div class="sender-row text-row">
+      <select id="text-source" aria-label="来源">
+        <option value="BOT">BOT</option>
+        <option value="CURSOR" selected>CURSOR</option>
+        <option value="PI">PI</option>
+        <option value="VOICE">VOICE</option>
+      </select>
+      <button id="send-text-btn" type="button">发送文字</button>
+    </div>
+    <textarea id="send-text" maxlength="240" placeholder="例如：正在修改代码"></textarea>
+    <div class="quick" id="quick-text"></div>
+    <div id="text-result" class="send-result"></div>
+  </section>
+</section>
+<section class="content">
+  <section class="display">
+    <h2>当前显示状态</h2>
+    <div id="status" class="status">等待中</div>
+    <div id="source" class="source">来源：BOT</div>
+    <div id="text" class="text">等待事件</div>
+    <div class="meta">
+      <div class="meta-row"><span>推送目标</span><b id="target">-</b></div>
+      <div class="meta-row"><span>推送失败次数</span><b id="failures">0</b></div>
+      <div class="meta-row"><span>ESP 路由 WiFi</span><b id="router-wifi">-</b></div>
+      <div class="meta-row"><span>设备状态</span><b id="device">-</b></div>
+      <div class="meta-row"><span>最后事件</span><b id="event-time">-</b></div>
+    </div>
+  </section>
+  <section class="history">
+    <div class="log-title"><h2>状态历史 / 日志打印</h2><span id="log-count" class="log-count">0 条</span></div>
+    <div id="logs" class="logs"><div class="empty">暂无事件记录</div></div>
+  </section>
+</section>
+<section class="voice-log">
+  <div class="log-title"><h2>语音识别日志</h2><span id="asr-count" class="log-count">0 条</span></div>
+  <div id="asr-logs" class="logs"><div class="empty">等待设备收听并上传语音</div></div>
+</section>
+</main><script>
+const $=id=>document.getElementById(id);
+const statusNames={IDLE:'空闲',THINKING:'思考中',CODING:'编码中',READING:'读取中',TESTING:'测试中',WAITING:'等待中',DONE:'已完成',ERROR:'错误',OFFLINE:'离线',STALE:'已过期',UNKNOWN:'未知'};
+const sourceNames={PI:'Pi',CURSOR:'Cursor',UNKNOWN:'未知',BOT:'BOT',VOICE:'Voice'};
+const linkNames={ONLINE:'在线',CONNECTED:'已连接',OFFLINE:'离线',CHECKING:'检查中',UNKNOWN:'未知'};
+const quickStatus=[
+  {label:'空闲',status:'IDLE',source:'BOT'},
+  {label:'思考中',status:'THINKING',source:'CURSOR'},
+  {label:'编码中',status:'CODING',source:'CURSOR'},
+  {label:'测试中',status:'TESTING',source:'CURSOR'},
+  {label:'等待中',status:'WAITING',source:'BOT'},
+  {label:'已完成',status:'DONE',source:'BOT'},
+  {label:'错误',status:'ERROR',source:'VOICE'}
+];
+const quickText=[
+  {label:'正在修改代码',text:'正在修改代码',source:'CURSOR'},
+  {label:'请稍等片刻',text:'请稍等片刻',source:'BOT'},
+  {label:'聆听中',text:'聆听中',source:'VOICE'},
+  {label:'回复中',text:'回复中',source:'VOICE'},
+  {label:'语音问候',text:'你好，有什么可以帮你的？',source:'VOICE'},
+  {label:'清空文字',text:'',source:'BOT'}
+];
+function statusText(v){return statusNames[v]||v||'未知'}
+function linkText(v){return linkNames[v]||v||'未知'}
+function set(id,v,kind){$(id).textContent=v;$(id).className='value '+(kind||'')}
+function renderLogs(items){$('log-count').textContent=`${items.length} 条`;$('logs').innerHTML=items.length?items.map(e=>`<div class="log"><time>${e.time||'-'}</time><span class="src">${sourceNames[e.source]||e.source||'未知'}</span><span class="st">${statusText(e.status)}</span><span class="msg">${e.text||'（无附加信息）'}</span></div>`).join(''):'<div class="empty">暂无事件记录</div>'}
+function renderAsr(items){const roleNames={user:'用户',assistant:'助手'};$('asr-count').textContent=`${items.length} 条`;$('asr-logs').innerHTML=items.length?items.map(e=>`<div class="asr-log ${e.role||'user'}"><time>${e.time||'-'}</time><span class="role">${roleNames[e.role]||'用户'}</span><span class="msg">${e.text||'（未识别到语音）'}</span></div>`).join(''):'<div class="empty">等待设备收听并上传语音</div>'}
+function renderQuickButtons(containerId,items,onPick){
+  $(containerId).innerHTML=items.map((item,i)=>`<button type="button" data-i="${i}">${item.label}</button>`).join('');
+  $(containerId).addEventListener('click',e=>{
+    const btn=e.target.closest('button[data-i]');
+    if(!btn)return;
+    onPick(items[Number(btn.dataset.i)]);
+  });
+}
+async function postJson(url,payload){
+  const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json; charset=utf-8'},body:JSON.stringify(payload)});
+  const data=await res.json().catch(()=>({}));
+  if(!res.ok)throw new Error(data.detail||res.statusText||'发送失败');
+  return data;
+}
+async function sendStatus(){
+  const btn=$('send-status-btn');
+  const result=$('status-result');
+  const payload={status:$('send-status').value,source:$('status-source').value};
+  btn.disabled=true;
+  result.className='send-result';
+  result.textContent='发送状态中...';
+  try{
+    const data=await postJson('/event/status',payload);
+    result.className='send-result ok';
+    result.textContent=data.debounced?'状态已排队（防抖）':'状态已发送';
+    refresh();
+  }catch(err){
+    result.className='send-result bad';
+    result.textContent=String(err.message||err);
+  }finally{
+    btn.disabled=false;
+  }
+}
+async function sendText(){
+  const btn=$('send-text-btn');
+  const result=$('text-result');
+  const payload={text:$('send-text').value,source:$('text-source').value};
+  btn.disabled=true;
+  result.className='send-result';
+  result.textContent='发送文字中...';
+  try{
+    await postJson('/event/text',payload);
+    result.className='send-result ok';
+    result.textContent=payload.text?'文字已发送':'已清空文字';
+    refresh();
+  }catch(err){
+    result.className='send-result bad';
+    result.textContent=String(err.message||err);
+  }finally{
+    btn.disabled=false;
+  }
+}
+async function refresh(){try{const d=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json()),w=d.wifi||{},e=d.event||{},dev=w.device||{};set('backend',linkText(d.backend),d.backend==='ONLINE'?'ok':'bad');set('usb',(w.device&&w.device.connected)?'已连接':'离线',(w.device&&w.device.connected)?'ok':'bad');set('wifi',linkText(w.status||'CHECKING'),w.status==='CONNECTED'?'ok':w.status==='CHECKING'?'warn':'bad');$('status').textContent=statusText(e.status);$('source').textContent='来源：'+(sourceNames[e.source]||e.source||'BOT');$('text').textContent=e.text||'暂无附加信息';$('target').textContent=w.target||'未启用';$('failures').textContent=w.failures??0;$('router-wifi').textContent=w.router_wifi===true?'已连接':w.router_wifi===false?'未连接':'未检测';$('device').textContent=dev.connected?'WebSocket 已连接':(dev.connected===false?'WebSocket 未连接':'未检测');$('event-time').textContent=e.time||statusText(e.status);renderLogs(d.history||[]);renderAsr(d.transcripts||[]);$('updated').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN')}catch{$('updated').textContent='后端不可用';set('backend','离线','bad');set('usb','离线','bad');set('wifi','离线','bad')}}
+renderQuickButtons('quick-status',quickStatus,item=>{$('send-status').value=item.status;$('status-source').value=item.source});
+renderQuickButtons('quick-text',quickText,item=>{$('send-text').value=item.text;$('text-source').value=item.source});
+$('send-status-btn').addEventListener('click',sendStatus);
+$('send-text-btn').addEventListener('click',sendText);
+refresh();setInterval(refresh,1000);
+</script></body></html>

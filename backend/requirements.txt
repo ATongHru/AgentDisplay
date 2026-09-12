@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+httpx
+SpeechRecognition
+vosk
+python-dotenv

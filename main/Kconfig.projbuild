@@ -1,0 +1,41 @@
+menu "Agent Display"
+
+    config AGENT_WIFI_SSID
+        string "WiFi SSID"
+        default "MSL803"
+
+    config AGENT_WIFI_PASSWORD
+        string "WiFi password"
+        default "1234567890"
+
+    config AGENT_WIFI_STATIC_IP
+        bool "Use static IP"
+        default y
+
+    config AGENT_WIFI_IP
+        string "ESP static IP"
+        default "192.168.10.162"
+        depends on AGENT_WIFI_STATIC_IP
+
+    config AGENT_WIFI_GATEWAY
+        string "Gateway / DNS"
+        default "192.168.10.1"
+        depends on AGENT_WIFI_STATIC_IP
+
+    config AGENT_WIFI_NETMASK
+        string "Netmask"
+        default "255.255.255.0"
+        depends on AGENT_WIFI_STATIC_IP
+
+    config AGENT_WS_URL
+        string "Backend WebSocket URL"
+        default "ws://192.168.10.167:8000/ws"
+
+    config AGENT_VOICE_HW
+        bool "Enable PDM mic + I2S amp"
+        default y
+        help
+            PDM DATA=GPIO16, CLK=GPIO15. Clock starts only in audio_task after app_main.
+            Device listens continuously (VAD), no BOOT record button.
+
+endmenu

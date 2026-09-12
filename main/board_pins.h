@@ -1,0 +1,40 @@
+#pragma once
+
+#include "sdkconfig.h"
+
+#define PIN_LCD_MOSI 11
+#define PIN_LCD_SCLK 12
+#define PIN_LCD_CS   8
+#define PIN_LCD_DC   9
+#define PIN_LCD_RST  10
+
+#define PIN_I2S_DIN  5
+#define PIN_I2S_LRC  6
+#define PIN_I2S_BCLK 7
+
+#define PIN_PDM_CLK  15
+#define PIN_PDM_DATA 16
+
+#define PIN_BOOT     0
+
+#define LCD_W 240
+#define LCD_H 240
+#define FACE_BG_RGB565 0x10AB
+#define PARTIAL_BUF_LINES 40
+
+#define VOICE_SAMPLE_RATE 16000
+#define VOICE_CHANNELS 1
+#define VOICE_BIT_DEPTH 16
+#define VOICE_MAX_RECORD_BYTES (VOICE_SAMPLE_RATE * 2 * 10)
+#define VOICE_PLAY_RING_BYTES 32768
+#define VOICE_UPLOAD_CHUNK 4096
+
+#define WS_RECONNECT_MS 3000
+#define OFFLINE_TIMEOUT_MS 8000
+#define WIFI_RETRY_MS 5000
+
+#ifdef CONFIG_AGENT_VOICE_HW
+#define VOICE_HARDWARE_ENABLED 1
+#else
+#define VOICE_HARDWARE_ENABLED 0
+#endif

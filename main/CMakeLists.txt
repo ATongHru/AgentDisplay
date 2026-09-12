@@ -1,0 +1,26 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "display.c"
+        "ui.c"
+        "anim_loader.c"
+        "net_ws.c"
+        "audio.c"
+        "voice.c"
+        "font_cjk_16.c"
+        "font_status_icons.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        driver
+        esp_lcd
+        esp_wifi
+        esp_event
+        esp_netif
+        esp_timer
+        nvs_flash
+        json
+        vfs
+        esp_partition
+        esp_psram
+        lwip
+)

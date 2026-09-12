@@ -1,0 +1,5 @@
+dependencies:
+  lvgl/lvgl:
+    version: "^9.2.2"
+  espressif/esp_websocket_client:
+    version: "^1.4.0"

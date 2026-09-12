@@ -1,0 +1,10 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# AgentDisplay 16MB: app 3MB | voice_font 2MB | animations 6MB | storage 4MB
+nvs,        data, nvs,     0x9000,  0x5000,
+otadata,    data, ota,     0xe000,  0x2000,
+app0,       app,  ota_0,   0x10000, 0x300000,
+spiffs,     data, spiffs,  0x310000,0xE0000,
+coredump,   data, coredump,0x3F0000,0x10000,
+voice_font, data, 0x99,    0x400000,0x200000,
+animations, data, 0x98,    0x600000,0x600000,
+storage,    data, spiffs,  0xC00000,0x400000,
