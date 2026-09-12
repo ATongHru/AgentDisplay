@@ -22,7 +22,7 @@ class SessionPhase(str, Enum):
     ERROR = "error"
 
 
-CHUNK_SIZE = 1024
+CHUNK_SIZE = 4096
 SESSION_TIMEOUT_SEC = 60.0
 
 

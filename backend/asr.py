@@ -56,8 +56,9 @@ def _get_vosk_model():
                     f"{model_dir}，或设置环境变量 VOSK_MODEL_PATH。"
                     " 下载: https://alphacephei.com/vosk/models"
                 )
-            from vosk import Model
+            from vosk import Model, SetLogLevel
 
+            SetLogLevel(-1)
             print(f"[asr] loading vosk model from {model_dir}")
             _vosk_model = Model(str(model_dir))
         return _vosk_model
@@ -74,19 +75,40 @@ def _get_faster_whisper():
         return _whisper_model
 
 
-def _transcribe_vosk(wav_path: str) -> str:
-    import speech_recognition as sr
+def _pcm_to_mono_s16(pcm: bytes, channels: int, bit_depth: int) -> bytes:
+    if bit_depth != 16:
+        raise RuntimeError(f"Vosk 仅支持 16bit PCM，当前 bit_depth={bit_depth}")
+    if channels == 1:
+        return pcm
+    if channels != 2:
+        raise RuntimeError(f"不支持的声道数 channels={channels}")
+    import array
 
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    mono = array.array("h", (samples[i] for i in range(0, len(samples), 2)))
+    return mono.tobytes()
+
+
+def _transcribe_vosk_pcm(pcm: bytes, sample_rate: int, channels: int, bit_depth: int) -> str:
+    from vosk import KaldiRecognizer, SetLogLevel
+
+    SetLogLevel(-1)
     model = _get_vosk_model()
-    recognizer = sr.Recognizer()
-    with sr.AudioFile(wav_path) as source:
-        audio = recognizer.record(source)
-    raw = recognizer.recognize_vosk(audio, model)
-    try:
-        data = json.loads(raw)
-        return str(data.get("text", "")).strip()
-    except (json.JSONDecodeError, TypeError):
-        return str(raw).strip()
+    mono = _pcm_to_mono_s16(pcm, channels, bit_depth)
+    rec = KaldiRecognizer(model, sample_rate)
+    rec.SetWords(False)
+    step = 4000 * 2
+    for offset in range(0, len(mono), step):
+        rec.AcceptWaveform(mono[offset:offset + step])
+    data = json.loads(rec.FinalResult())
+    return str(data.get("text", "")).strip()
+
+
+def _transcribe_vosk(wav_path: str) -> str:
+    with wave.open(wav_path, "rb") as wf:
+        pcm = wf.readframes(wf.getnframes())
+        return _transcribe_vosk_pcm(pcm, wf.getframerate(), wf.getnchannels(), wf.getsampwidth() * 8)
 
 
 def _transcribe_google(wav_path: str) -> str:
@@ -105,15 +127,23 @@ def _transcribe_faster_whisper(wav_path: str) -> str:
 
 
 def transcribe_pcm(pcm: bytes, sample_rate: int = 16000, channels: int = 1, bit_depth: int = 16) -> str:
+    if not pcm:
+        return ""
+    print(f"[asr] start engine={ASR_ENGINE} bytes={len(pcm)} sr={sample_rate} ch={channels} bits={bit_depth}")
+    if ASR_ENGINE == "vosk":
+        text = _transcribe_vosk_pcm(pcm, sample_rate, channels, bit_depth)
+        print(f"[asr] vosk text={text!r}")
+        return text
     wav_path = _pcm_to_wav_path(pcm, sample_rate, channels, bit_depth)
     try:
-        if ASR_ENGINE == "vosk":
-            return _transcribe_vosk(wav_path)
         if ASR_ENGINE == "google":
-            return _transcribe_google(wav_path)
-        if ASR_ENGINE in {"faster_whisper", "whisper"}:
-            return _transcribe_faster_whisper(wav_path)
-        raise RuntimeError(f"unsupported ASR_ENGINE: {ASR_ENGINE}")
+            text = _transcribe_google(wav_path)
+        elif ASR_ENGINE in {"faster_whisper", "whisper"}:
+            text = _transcribe_faster_whisper(wav_path)
+        else:
+            raise RuntimeError(f"unsupported ASR_ENGINE: {ASR_ENGINE}")
+        print(f"[asr] {ASR_ENGINE} text={text!r}")
+        return text
     finally:
         try:
             os.unlink(wav_path)

@@ -16,30 +16,47 @@ enum {
     VOICE_LISTEN = 0,
     VOICE_RECORDING,
     VOICE_UPLOADING,
+    VOICE_WAIT_REPLY,
     VOICE_PLAYING,
     VOICE_ERROR,
 };
 
-#define VAD_PEAK_START 800
-#define VAD_MIN_MS 400
-#define VAD_SILENCE_MS 1500
-#define VAD_MAX_MS 10000
+#define VAD_PEAK_START 1400
+#define VAD_RMS_START 280
+#define VAD_PEAK_HOLD 480
+#define VAD_RMS_HOLD 90
+#define VAD_MIN_MS 500
+#define VAD_SILENCE_MS 900
+#define VAD_MAX_MS 6000
+#define VAD_COOLDOWN_MS 1500
+#define WAIT_REPLY_MS 25000
+#define MIN_CLIP_BYTES (VOICE_SAMPLE_RATE * 2 * 2 / 5)
 
 static int s_phase = VOICE_LISTEN;
 static char s_session_id[16];
 static int64_t s_record_start_us;
 static int64_t s_last_voice_us;
+static int64_t s_last_diag_us;
+static int64_t s_cooldown_until_us;
+static int64_t s_wait_start_us;
 static bool s_audio_end;
 static bool s_session;
 static bool s_listening;
 static volatile bool s_upload_pending;
 static volatile bool s_upload_done;
 static volatile bool s_upload_ok;
+static char s_last_show[24];
+static size_t s_noise_peak = 180;
+static size_t s_noise_rms = 40;
 
 static int64_t now_us(void) { return esp_timer_get_time(); }
 
 static void show(const char *status, const char *text)
 {
+    if (status && strcmp(status, "IDLE") == 0 && strcmp(s_last_show, "IDLE") == 0 &&
+        (!text || text[0] == '\0')) {
+        return;
+    }
     char json[192];
     if (text && text[0]) {
         snprintf(json, sizeof(json),
@@ -47,6 +64,7 @@ static void show(const char *status, const char *text)
     } else {
         snprintf(json, sizeof(json), "{\"status\":\"%s\",\"source\":\"VOICE\"}", status);
     }
+    snprintf(s_last_show, sizeof(s_last_show), "%s", status ? status : "");
     s_session = strcmp(status, "IDLE") != 0;
     ui_post_event_json(json, false);
 }
@@ -62,9 +80,40 @@ static void set_listening(bool on)
     post_voice_icons();
 }
 
+static void update_noise(size_t peak, size_t rms)
+{
+    s_noise_peak = (s_noise_peak * 31 + peak) / 32;
+    s_noise_rms = (s_noise_rms * 31 + rms) / 32;
+}
+
+static size_t start_peak_th(void)
+{
+    size_t adaptive = s_noise_peak * 5 + 350;
+    return adaptive > VAD_PEAK_START ? adaptive : VAD_PEAK_START;
+}
+
+static size_t start_rms_th(void)
+{
+    size_t adaptive = s_noise_rms * 4 + 80;
+    return adaptive > VAD_RMS_START ? adaptive : VAD_RMS_START;
+}
+
+static size_t hold_peak_th(void)
+{
+    size_t adaptive = s_noise_peak * 2 + 120;
+    return adaptive > VAD_PEAK_HOLD ? adaptive : VAD_PEAK_HOLD;
+}
+
+static size_t hold_rms_th(void)
+{
+    size_t adaptive = s_noise_rms * 2 + 30;
+    return adaptive > VAD_RMS_HOLD ? adaptive : VAD_RMS_HOLD;
+}
+
 static void resume_listen(void)
 {
 #if VOICE_HARDWARE_ENABLED
+    s_cooldown_until_us = now_us() + (int64_t)VAD_COOLDOWN_MS * 1000;
     if (audio_capture_listen_start()) {
         audio_capture_clear();
         set_listening(true);
@@ -74,6 +123,22 @@ static void resume_listen(void)
 #endif
     set_listening(false);
     s_phase = VOICE_ERROR;
+}
+
+static void finish_turn(bool announce)
+{
+    if (audio_playback_is_active()) {
+        audio_playback_stop();
+    }
+    s_audio_end = false;
+    post_voice_icons();
+    if (announce) {
+        show("IDLE", "");
+    } else {
+        s_session = false;
+        snprintf(s_last_show, sizeof(s_last_show), "IDLE");
+    }
+    resume_listen();
 }
 
 void voice_init(void)
@@ -96,13 +161,28 @@ void voice_on_audio_chunk(const uint8_t *data, size_t len, bool end)
                 audio_playback_start();
             }
             post_voice_icons();
-            show("DONE", NULL);
+            ESP_LOGI(TAG, "play start");
         }
         s_phase = VOICE_PLAYING;
         audio_playback_write(data, len);
     }
     if (end) {
         s_audio_end = true;
+        if (s_phase != VOICE_PLAYING) {
+            ESP_LOGI(TAG, "server finished with no audio");
+            finish_turn(false);
+        }
+    }
+}
+
+void voice_on_server_status(const char *status)
+{
+    if (!status || s_phase != VOICE_WAIT_REPLY) {
+        return;
+    }
+    if (strcmp(status, "IDLE") == 0 || strcmp(status, "ERROR") == 0) {
+        ESP_LOGI(TAG, "server status %s, resume listen", status);
+        finish_turn(false);
     }
 }
 
@@ -112,18 +192,21 @@ void voice_loop(void)
     return;
 #endif
     if (s_phase == VOICE_PLAYING) {
-        if (s_audio_end && audio_playback_pending() == 0) {
-            audio_playback_stop();
-            s_audio_end = false;
-            post_voice_icons();
-            show("IDLE", "");
-            resume_listen();
+        if (s_audio_end && audio_playback_should_stop()) {
+            finish_turn(false);
+        }
+        return;
+    }
+
+    if (s_phase == VOICE_WAIT_REPLY) {
+        if (now_us() - s_wait_start_us > (int64_t)WAIT_REPLY_MS * 1000) {
+            ESP_LOGW(TAG, "wait reply timeout");
+            finish_turn(true);
         }
         return;
     }
 
     if (s_phase == VOICE_ERROR) {
-        show("IDLE", "");
         resume_listen();
         return;
     }
@@ -138,34 +221,58 @@ void voice_loop(void)
                 return;
             }
             audio_capture_clear();
-            show("IDLE", "");
-            resume_listen();
+#if VOICE_HARDWARE_ENABLED
+            audio_capture_listen_stop();
+#endif
+            set_listening(false);
+            s_wait_start_us = now_us();
+            s_phase = VOICE_WAIT_REPLY;
+            show("THINKING", "正在思考");
         }
         return;
     }
 
     if (!audio_capture_is_listening()) {
         resume_listen();
-        if (s_phase == VOICE_LISTEN) {
-            show("IDLE", "");
-        }
         return;
     }
 
-    size_t level = audio_capture_poll();
+    size_t peak = audio_capture_poll();
+    size_t rms = audio_capture_rms();
+    if (now_us() - s_last_diag_us > 2000000) {
+        s_last_diag_us = now_us();
+        ESP_LOGI(TAG,
+                 "phase=%d listen=%d peak=%u rms=%u noise=%u/%u th=%u/%u pcm=%u ws=%d",
+                 s_phase, (int)s_listening, (unsigned)peak, (unsigned)rms,
+                 (unsigned)s_noise_peak, (unsigned)s_noise_rms,
+                 (unsigned)start_peak_th(), (unsigned)start_rms_th(),
+                 (unsigned)audio_capture_size(), (int)net_ws_ready());
+    }
     if (s_phase == VOICE_LISTEN) {
-        if (level > VAD_PEAK_START && net_ws_ready()) {
-            audio_capture_begin_store();
-            s_record_start_us = now_us();
-            s_last_voice_us = now_us();
-            s_phase = VOICE_RECORDING;
-            show("THINKING", "正在聆听");
+        if (now_us() < s_cooldown_until_us) {
+            update_noise(peak, rms);
+            return;
         }
+        bool speech = peak >= start_peak_th() && rms >= start_rms_th();
+        if (!speech) {
+            update_noise(peak, rms);
+            return;
+        }
+        if (!net_ws_ready()) {
+            return;
+        }
+        audio_capture_begin_store();
+        s_record_start_us = now_us();
+        s_last_voice_us = now_us();
+        s_phase = VOICE_RECORDING;
+        ESP_LOGI(TAG, "VAD start peak=%u rms=%u th=%u/%u", (unsigned)peak, (unsigned)rms,
+                 (unsigned)start_peak_th(), (unsigned)start_rms_th());
+        show("THINKING", "正在聆听");
         return;
     }
 
     if (s_phase == VOICE_RECORDING) {
-        if (level > VAD_PEAK_START) {
+        if (peak >= hold_peak_th() || rms >= hold_rms_th()) {
             s_last_voice_us = now_us();
         }
         int64_t dur_us = now_us() - s_record_start_us;
@@ -178,10 +285,12 @@ void voice_loop(void)
         }
         audio_capture_end_store();
         size_t pcm_len = audio_capture_size();
-        if (pcm_len < (size_t)VOICE_SAMPLE_RATE * 2 / 5) {
+        if (pcm_len < (size_t)MIN_CLIP_BYTES) {
+            ESP_LOGW(TAG, "drop short clip %u bytes", (unsigned)pcm_len);
             audio_capture_clear();
             show("IDLE", "");
             s_phase = VOICE_LISTEN;
+            s_cooldown_until_us = now_us() + (int64_t)VAD_COOLDOWN_MS * 1000;
             return;
         }
         s_upload_ok = false;

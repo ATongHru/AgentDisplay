@@ -23,4 +23,5 @@ idf_component_register(
         esp_partition
         esp_psram
         lwip
+        esp_driver_usb_serial_jtag
 )

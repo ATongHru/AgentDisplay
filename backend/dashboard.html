@@ -3,207 +3,250 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Agent 状态显示监控</title>
+<title>Agent Display</title>
 <style>
 :root{
-  --bg:#0b1017;--panel:#121a24;--panel2:#182230;--line:#273548;
-  --text:#edf2f7;--muted:#8492a6;--ok:#44d483;--warn:#f5b83d;--bad:#ff6670;
-  --accent:#8b9cff;--accent2:#5eead4;--radius:10px;
+  --bg:#080b10;--bar:#0d1219;--panel:#121820;--panel2:#18212c;--line:#2a3646;
+  --text:#edf3fa;--muted:#8090a3;--ok:#3dcc86;--warn:#e6b23c;--bad:#ff6b74;
+  --accent:#7c96ff;--teal:#3ee0c5;--chip:#1c2734;--radius:12px;
 }
 *{box-sizing:border-box}
-html,body{height:100%;margin:0}
-body{background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
-main{
-  height:100%;max-width:1180px;margin:auto;padding:18px 22px;
-  display:grid;gap:12px;
-  grid-template-rows:auto auto auto minmax(0,1.15fr) minmax(148px,.7fr);
-  min-height:0;
+html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);
+  font:14px/1.5 "Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+body{padding:0 0 24px}
+.topbar{
+  position:sticky;top:0;z-index:20;background:rgba(13,18,25,.92);
+  backdrop-filter:blur(10px);border-bottom:1px solid var(--line);
+  padding:14px 24px;display:flex;align-items:center;justify-content:space-between;gap:16px
 }
-header{display:flex;align-items:end;justify-content:space-between;gap:16px}
-h1{font-size:24px;line-height:1.1;margin:0;letter-spacing:.02em}
-header p{margin:0;color:var(--muted);font-size:12px;white-space:nowrap}
-.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px 16px}
-.label{color:var(--muted);font-size:11px;letter-spacing:.08em}
-.value{font-size:20px;font-weight:650;margin-top:4px}
-.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
-.senders{display:grid;grid-template-columns:1fr 1fr;gap:12px;min-width:0}
-.sender{
+.brand{display:flex;flex-direction:column;gap:2px;min-width:0}
+.brand h1{margin:0;font-size:18px;font-weight:650;letter-spacing:.04em}
+.brand span{color:var(--muted);font-size:12px}
+.pills{display:flex;flex-wrap:wrap;gap:8px}
+.pill{
+  background:var(--chip);border:1px solid var(--line);border-radius:999px;
+  padding:6px 12px;display:flex;align-items:center;gap:8px;font-size:12px
+}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.pill.ok .dot{background:var(--ok)}.pill.warn .dot{background:var(--warn)}.pill.bad .dot{background:var(--bad)}
+.wrap{max-width:1360px;margin:18px auto 0;padding:0 20px;display:grid;gap:16px}
+.workspace{display:grid;grid-template-columns:minmax(280px,1fr) minmax(340px,.85fr);gap:16px;align-items:stretch}
+.stack{display:flex;flex-direction:column;gap:10px;min-width:0}
+.card{
   background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
-  padding:12px 16px;display:grid;gap:8px;align-content:start;min-width:0
+  padding:14px 16px;min-width:0
 }
-.sender h2,.display h2,.history h2,.voice-log h2{
-  font-size:12px;color:var(--muted);font-weight:500;margin:0;letter-spacing:.08em
+.card h2{
+  margin:0 0 8px;font-size:11px;font-weight:600;letter-spacing:.1em;
+  color:var(--muted);text-transform:uppercase
 }
-.sender p.hint{margin:0;font-size:12px;color:var(--muted);line-height:1.45}
-.sender-row{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;align-items:center}
-.sender-row.text-row{grid-template-columns:minmax(0,1fr) auto}
-.sender select,.sender textarea,.sender button{font:inherit}
-.sender select,.sender textarea{
+.status-hero{min-height:0;height:100%;overflow:hidden;display:flex;flex-direction:column}
+.status-face{
+  flex:1 1 0;min-height:0;display:flex;align-items:center;justify-content:center;
+  background:#10151B;border:1px solid var(--line);border-radius:10px;margin:0 0 8px;overflow:hidden
+}
+.status-face img{
+  width:90px;height:90px;max-width:90px;max-height:90px;
+  object-fit:contain;min-width:0;min-height:0
+}
+.status-name{font-size:22px;line-height:1.15;font-weight:700;color:var(--accent);letter-spacing:.03em;flex:0 0 auto}
+.status-src{margin-top:4px;color:var(--muted);font-size:13px;flex:0 0 auto}
+.status-text{
+  margin:6px 0 8px;color:#c5d0dc;font-size:14px;line-height:1.45;
+  overflow-wrap:anywhere;min-height:1.2em;max-height:2.8em;overflow:hidden;flex:0 0 auto
+}
+.meta{border-top:1px solid var(--line);padding-top:8px;display:grid;gap:6px;margin-top:auto;flex:0 0 auto}
+.meta-row{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:13px}
+.meta-row b{color:var(--text);font-weight:550;text-align:right;overflow-wrap:anywhere}
+.composer{min-height:0}
+.composer.text-card{flex:0 0 auto}
+.row{display:grid;gap:8px;align-items:center}
+.row.three{grid-template-columns:1fr 1fr auto}
+.row.two{grid-template-columns:minmax(0,1fr) auto auto;margin-top:8px}
+select,textarea,button{font:inherit}
+select,textarea{
   background:var(--panel2);border:1px solid var(--line);color:var(--text);
-  border-radius:6px;padding:7px 9px;width:100%;min-width:0
+  border-radius:8px;padding:8px 10px;width:100%;min-width:0
 }
-.sender textarea{min-height:64px;resize:vertical}
-.sender button{
-  border:0;border-radius:6px;padding:8px 13px;font-weight:650;cursor:pointer;
-  white-space:nowrap;min-height:36px
+textarea{
+  min-height:40px;height:44px;max-height:72px;resize:vertical;
+  line-height:1.4;margin-top:8px
 }
-.sender button:disabled{opacity:.55;cursor:not-allowed}
-.status-sender button{background:var(--accent);color:#0b1017}
-.sender.text button{background:var(--accent2);color:#0b1017}
-.quick{display:flex;flex-wrap:wrap;gap:8px}
+button{
+  border:0;border-radius:8px;padding:8px 14px;font-weight:650;cursor:pointer;
+  white-space:nowrap;min-height:38px
+}
+button:disabled{opacity:.5;cursor:not-allowed}
+.btn-status{background:var(--accent);color:#0b1017}
+.btn-text{background:var(--teal);color:#0b1017}
+.btn-speak{background:var(--warn);color:#0b1017}
+.quick{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
 .quick button{
-  background:var(--panel2);color:var(--text);border:1px solid var(--line);
-  border-radius:999px;padding:6px 12px;font-size:12px;cursor:pointer
+  background:var(--chip);color:var(--text);border:1px solid var(--line);
+  border-radius:999px;padding:4px 10px;font-size:12px;font-weight:500;min-height:0
 }
 .quick button:hover{border-color:var(--accent);color:var(--accent)}
-.sender.text .quick button:hover{border-color:var(--accent2);color:var(--accent2)}
-.send-result{font-size:12px;color:var(--muted);min-height:18px}
+.text-card .quick button:hover{border-color:var(--teal);color:var(--teal)}
+.send-result{margin-top:6px;font-size:12px;color:var(--muted);min-height:16px}
 .send-result.ok{color:var(--ok)}.send-result.bad{color:var(--bad)}
-.content{
-  min-height:0;display:grid;grid-template-columns:minmax(0,.95fr) minmax(320px,1.15fr);
-  gap:12px
+.volume-row{
+  display:flex;align-items:center;gap:10px;margin-top:8px;
+  color:var(--muted);font-size:12px
 }
-.display,.history,.voice-log{
-  min-height:0;background:var(--panel);border:1px solid var(--line);
-  border-radius:var(--radius);padding:14px 16px;display:flex;flex-direction:column
-}
-.display h2,.history h2,.voice-log h2{margin:0 0 10px}
-.status{font-size:40px;letter-spacing:.04em;color:var(--accent);font-weight:700;line-height:1.15}
-.source{color:var(--muted);font-size:13px;margin-top:6px}
-.text{color:#b8c3d1;min-height:24px;margin:12px 0 14px}
-.meta{margin-top:auto;border-top:1px solid var(--line);padding-top:10px;display:grid;gap:0}
-.meta-row{
-  display:grid;grid-template-columns:max-content minmax(0,1fr);gap:12px;
-  align-items:baseline;padding:6px 0;border-bottom:1px solid #202c3a;
-  color:var(--muted);font-size:13px
-}
-.meta-row:last-child{border-bottom:0;padding-bottom:0}
-.meta-row b{
-  color:var(--text);font-weight:500;text-align:right;min-width:0;
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap
-}
-.log-title{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:8px;flex-shrink:0}
+.volume-row input[type=range]{flex:1;min-width:0;accent-color:var(--warn)}
+.volume-row b{color:var(--text);font-variant-numeric:tabular-nums;min-width:3.2em;text-align:right}
+.boards{display:grid;grid-template-columns:1fr 1fr;gap:16px;min-height:240px}
+.board{display:flex;flex-direction:column;min-height:240px;max-height:38vh}
+.blog-row{min-height:200px}
+.blog-row .board{min-height:200px;max-height:32vh}
+.log-title{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:8px}
 .log-title h2{margin:0}
 .log-count{color:var(--muted);font-size:12px}
-.logs{min-height:0;flex:1;overflow-y:auto;overflow-x:hidden;padding-right:6px}
+.logs{min-height:0;flex:1;overflow:auto;padding-right:4px}
 .logs::-webkit-scrollbar{width:8px}
 .logs::-webkit-scrollbar-track{background:#0d141d}
-.logs::-webkit-scrollbar-thumb{background:#40516a;border-radius:4px}
-.log{
-  display:grid;grid-template-columns:70px 76px 92px minmax(0,1fr);gap:8px;
-  padding:8px 0;border-bottom:1px solid #202c3a;color:#b8c3d1
+.logs::-webkit-scrollbar-thumb{background:#3b4d64;border-radius:4px}
+.log,.asr-log,.blog{
+  display:grid;gap:8px;padding:9px 0;border-bottom:1px solid #1e2a38;color:#c9d6e4
 }
-.log time,.log .src{color:var(--muted)}
+.log{grid-template-columns:64px 64px 72px minmax(0,1fr)}
+.asr-log{grid-template-columns:148px 44px minmax(0,1fr)}
+.blog{grid-template-columns:64px 52px minmax(0,1fr);font-family:Consolas,"Cascadia Mono",monospace;font-size:12px}
+.log time,.log .src,.asr-log time,.blog time{color:var(--muted);white-space:nowrap}
 .log .st{color:var(--accent);font-weight:650}
-.log .msg{overflow-wrap:anywhere;min-width:0}
-.empty{color:var(--muted);padding:8px 0}
-.asr-log{
-  display:grid;grid-template-columns:170px 52px minmax(0,1fr);gap:10px;align-items:start;
-  padding:8px 0;border-bottom:1px solid #202c3a;color:#d7e3f0
-}
-.asr-log time{color:var(--accent2);font-variant-numeric:tabular-nums;white-space:nowrap}
-.asr-log .role{color:var(--muted);font-size:12px;padding-top:1px}
+.asr-log time{color:var(--teal);font-variant-numeric:tabular-nums}
+.asr-log .role{color:var(--muted);font-size:12px}
 .asr-log.assistant .role{color:var(--accent)}
-.asr-log .msg{overflow-wrap:anywhere;min-width:0}
-@media(max-width:900px){.senders{grid-template-columns:1fr}}
-@media(max-width:760px){
-  html,body{height:auto}
-  main{height:auto;min-height:100vh;padding:14px 10px;grid-template-rows:auto;gap:10px}
-  h1{font-size:22px}
-  header{align-items:start;flex-wrap:wrap}
-  .cards{grid-template-columns:1fr;gap:8px}
-  .card{padding:10px 12px}.value{font-size:18px}
-  .sender-row{grid-template-columns:1fr 1fr}
-  .sender-row.text-row{grid-template-columns:1fr}
-  .sender button{grid-column:1/-1}
-  .content{grid-template-columns:1fr}
-  .display,.history,.voice-log{min-height:220px}
-  .logs{max-height:320px}
-  .log{grid-template-columns:58px 1fr;gap:2px 8px}
-  .log .src,.log .st{grid-column:2}
-  .log .msg{grid-column:2}
-  .asr-log{grid-template-columns:1fr;gap:2px}
+.msg{overflow-wrap:anywhere;min-width:0}
+.blog.info .lv{color:var(--muted)}
+.blog.warn .lv{color:var(--warn)}
+.blog.error .lv{color:var(--bad)}
+.blog.error .msg{color:#ffc2c6}
+.empty{color:var(--muted);padding:12px 0}
+@media(max-width:1100px){
+  .workspace,.boards{grid-template-columns:1fr}
+  .board{max-height:none;min-height:220px;height:280px}
+}
+@media(max-width:720px){
+  .topbar{flex-direction:column;align-items:flex-start}
+  .row.three,.row.two{grid-template-columns:1fr}
+  button{width:100%}
+  .log,.asr-log,.blog{grid-template-columns:1fr;gap:2px}
 }
 </style>
 </head>
-<body><main>
-<header><h1>Agent 状态显示监控</h1><p id="updated">正在连接后端...</p></header>
-<section class="cards">
-  <div class="card"><div class="label">后端服务</div><div id="backend" class="value">...</div></div>
-  <div class="card"><div class="label">设备 WebSocket</div><div id="usb" class="value">...</div></div>
-  <div class="card"><div class="label">PC→ESP 推送</div><div id="wifi" class="value">...</div></div>
-</section>
-<section class="senders">
-  <section class="sender status-sender">
-    <h2>推送状态（GIF / 表情）</h2>
-    <p class="hint">只切换状态与来源，不修改屏幕文字。先发状态，再单独发文字。</p>
-    <div class="sender-row">
-      <select id="send-status" aria-label="状态">
-        <option value="IDLE">空闲</option>
-        <option value="THINKING">思考中</option>
-        <option value="CODING" selected>编码中</option>
-        <option value="READING">读取中</option>
-        <option value="TESTING">测试中</option>
-        <option value="WAITING">等待中</option>
-        <option value="DONE">已完成</option>
-        <option value="ERROR">错误</option>
-        <option value="OFFLINE">离线</option>
-      </select>
-      <select id="status-source" aria-label="来源">
-        <option value="BOT">BOT</option>
-        <option value="CURSOR" selected>CURSOR</option>
-        <option value="PI">PI</option>
-        <option value="VOICE">VOICE</option>
-      </select>
-      <button id="send-status-btn" type="button">发送状态</button>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <h1>Agent Display</h1>
+    <span id="updated">正在连接后端...</span>
+  </div>
+  <div class="pills">
+    <div class="pill" id="pill-backend"><span class="dot"></span><span>后端 ...</span></div>
+    <div class="pill" id="pill-usb"><span class="dot"></span><span>设备 ...</span></div>
+    <div class="pill" id="pill-wifi"><span class="dot"></span><span>推送 ...</span></div>
+  </div>
+</header>
+<main class="wrap">
+  <section class="workspace">
+    <section class="card status-hero">
+      <h2>当前显示</h2>
+      <div class="status-face">
+        <img id="status-gif" alt="当前状态表情" src="/gifs/IDLE.gif" data-status="IDLE" width="90" height="90">
+      </div>
+      <div id="status" class="status-name">等待中</div>
+      <div id="source" class="status-src">来源：BOT</div>
+      <div id="text" class="status-text">等待事件</div>
+      <div class="meta">
+        <div class="meta-row"><span>推送目标</span><b id="target">-</b></div>
+        <div class="meta-row"><span>推送失败次数</span><b id="failures">0</b></div>
+        <div class="meta-row"><span>ESP 路由 WiFi</span><b id="router-wifi">-</b></div>
+        <div class="meta-row"><span>设备状态</span><b id="device">-</b></div>
+        <div class="meta-row"><span>最后事件</span><b id="event-time">-</b></div>
+      </div>
+    </section>
+    <div class="stack">
+      <section class="card composer">
+        <h2>推送状态（GIF / 表情）</h2>
+        <div class="row three">
+          <select id="send-status" aria-label="状态">
+            <option value="IDLE">空闲</option>
+            <option value="THINKING">思考中</option>
+            <option value="CODING" selected>编码中</option>
+            <option value="READING">读取中</option>
+            <option value="TESTING">测试中</option>
+            <option value="WAITING">等待中</option>
+            <option value="DONE">已完成</option>
+            <option value="ERROR">错误</option>
+            <option value="OFFLINE">离线</option>
+          </select>
+          <select id="status-source" aria-label="来源">
+            <option value="BOT">BOT</option>
+            <option value="CURSOR" selected>CURSOR</option>
+            <option value="PI">PI</option>
+            <option value="VOICE">VOICE</option>
+          </select>
+          <button id="send-status-btn" class="btn-status" type="button">发送状态</button>
+        </div>
+        <div class="quick" id="quick-status"></div>
+        <div id="status-result" class="send-result"></div>
+      </section>
+      <section class="card composer text-card">
+        <h2>推送文字（底部文案）</h2>
+        <div class="row two">
+          <select id="text-source" aria-label="来源">
+            <option value="BOT">BOT</option>
+            <option value="CURSOR" selected>CURSOR</option>
+            <option value="PI">PI</option>
+            <option value="VOICE">VOICE</option>
+          </select>
+          <button id="send-text-btn" class="btn-text" type="button">发送文字</button>
+          <button id="send-speak-btn" class="btn-speak" type="button">发送并播报</button>
+        </div>
+        <textarea id="send-text" maxlength="240" placeholder="例如：正在修改代码"></textarea>
+        <div class="volume-row">
+          <span>播报音量</span>
+          <input id="volume-slider" type="range" min="0" max="100" step="1" value="33" aria-label="播报音量">
+          <b id="volume-label">33%</b>
+        </div>
+        <div class="quick" id="quick-text"></div>
+        <div id="text-result" class="send-result"></div>
+      </section>
     </div>
-    <div class="quick" id="quick-status"></div>
-    <div id="status-result" class="send-result"></div>
   </section>
-  <section class="sender text">
-    <h2>推送文字（状态行文案）</h2>
-    <p class="hint">只更新文字，不改变当前 GIF。留空并发送可恢复为状态默认文字。</p>
-    <div class="sender-row text-row">
-      <select id="text-source" aria-label="来源">
-        <option value="BOT">BOT</option>
-        <option value="CURSOR" selected>CURSOR</option>
-        <option value="PI">PI</option>
-        <option value="VOICE">VOICE</option>
-      </select>
-      <button id="send-text-btn" type="button">发送文字</button>
-    </div>
-    <textarea id="send-text" maxlength="240" placeholder="例如：正在修改代码"></textarea>
-    <div class="quick" id="quick-text"></div>
-    <div id="text-result" class="send-result"></div>
+  <section class="boards">
+    <section class="card board">
+      <div class="log-title"><h2>状态历史</h2><span id="log-count" class="log-count">0 条</span></div>
+      <div id="logs" class="logs"><div class="empty">暂无事件记录</div></div>
+    </section>
+    <section class="card board">
+      <div class="log-title"><h2>语音识别</h2><span id="asr-count" class="log-count">0 条</span></div>
+      <div id="asr-logs" class="logs"><div class="empty">等待设备收听并上传语音</div></div>
+    </section>
   </section>
-</section>
-<section class="content">
-  <section class="display">
-    <h2>当前显示状态</h2>
-    <div id="status" class="status">等待中</div>
-    <div id="source" class="source">来源：BOT</div>
-    <div id="text" class="text">等待事件</div>
-    <div class="meta">
-      <div class="meta-row"><span>推送目标</span><b id="target">-</b></div>
-      <div class="meta-row"><span>推送失败次数</span><b id="failures">0</b></div>
-      <div class="meta-row"><span>ESP 路由 WiFi</span><b id="router-wifi">-</b></div>
-      <div class="meta-row"><span>设备状态</span><b id="device">-</b></div>
-      <div class="meta-row"><span>最后事件</span><b id="event-time">-</b></div>
-    </div>
+  <section class="blog-row">
+    <section class="card board">
+      <div class="log-title"><h2>后端日志</h2><span id="blog-count" class="log-count">0 条</span></div>
+      <div id="blog" class="logs"><div class="empty">等待 Python 后端输出</div></div>
+    </section>
   </section>
-  <section class="history">
-    <div class="log-title"><h2>状态历史 / 日志打印</h2><span id="log-count" class="log-count">0 条</span></div>
-    <div id="logs" class="logs"><div class="empty">暂无事件记录</div></div>
-  </section>
-</section>
-<section class="voice-log">
-  <div class="log-title"><h2>语音识别日志</h2><span id="asr-count" class="log-count">0 条</span></div>
-  <div id="asr-logs" class="logs"><div class="empty">等待设备收听并上传语音</div></div>
-</section>
-</main><script>
+</main>
+<script>
 const $=id=>document.getElementById(id);
 const statusNames={IDLE:'空闲',THINKING:'思考中',CODING:'编码中',READING:'读取中',TESTING:'测试中',WAITING:'等待中',DONE:'已完成',ERROR:'错误',OFFLINE:'离线',STALE:'已过期',UNKNOWN:'未知'};
+const gifNames={IDLE:1,THINKING:1,CODING:1,READING:1,TESTING:1,WAITING:1,DONE:1,ERROR:1,OFFLINE:1,STALE:1,UNKNOWN:1};
+function gifUrl(status){
+  const key=String(status||'IDLE').toUpperCase();
+  return '/gifs/'+(gifNames[key]?key:'UNKNOWN')+'.gif';
+}
+function setStatusGif(status){
+  const img=$('status-gif');
+  if(!img)return;
+  const key=String(status||'IDLE').toUpperCase();
+  if(img.dataset.status===key)return;
+  img.dataset.status=key;
+  img.src=gifUrl(key);
+}
 const sourceNames={PI:'Pi',CURSOR:'Cursor',UNKNOWN:'未知',BOT:'BOT',VOICE:'Voice'};
 const linkNames={ONLINE:'在线',CONNECTED:'已连接',OFFLINE:'离线',CHECKING:'检查中',UNKNOWN:'未知'};
 const quickStatus=[
@@ -223,13 +266,43 @@ const quickText=[
   {label:'语音问候',text:'你好，有什么可以帮你的？',source:'VOICE'},
   {label:'清空文字',text:'',source:'BOT'}
 ];
+let backendLogs=[];
+let volumeDragging=false;
+let volumeSaveTimer=null;
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function statusText(v){return statusNames[v]||v||'未知'}
 function linkText(v){return linkNames[v]||v||'未知'}
-function set(id,v,kind){$(id).textContent=v;$(id).className='value '+(kind||'')}
-function renderLogs(items){$('log-count').textContent=`${items.length} 条`;$('logs').innerHTML=items.length?items.map(e=>`<div class="log"><time>${e.time||'-'}</time><span class="src">${sourceNames[e.source]||e.source||'未知'}</span><span class="st">${statusText(e.status)}</span><span class="msg">${e.text||'（无附加信息）'}</span></div>`).join(''):'<div class="empty">暂无事件记录</div>'}
-function renderAsr(items){const roleNames={user:'用户',assistant:'助手'};$('asr-count').textContent=`${items.length} 条`;$('asr-logs').innerHTML=items.length?items.map(e=>`<div class="asr-log ${e.role||'user'}"><time>${e.time||'-'}</time><span class="role">${roleNames[e.role]||'用户'}</span><span class="msg">${e.text||'（未识别到语音）'}</span></div>`).join(''):'<div class="empty">等待设备收听并上传语音</div>'}
+function setPill(id,label,kind){
+  const el=$(id);
+  el.className='pill '+(kind||'');
+  el.innerHTML=`<span class="dot"></span><span>${esc(label)}</span>`;
+}
+function renderLogs(items){
+  $('log-count').textContent=`${items.length} 条`;
+  $('logs').innerHTML=items.length?items.map(e=>`<div class="log"><time>${esc(e.time||'-')}</time><span class="src">${esc(sourceNames[e.source]||e.source||'未知')}</span><span class="st">${esc(statusText(e.status))}</span><span class="msg">${esc(e.text||'（无附加信息）')}</span></div>`).join(''):'<div class="empty">暂无事件记录</div>';
+}
+function renderAsr(items){
+  const roleNames={user:'用户',assistant:'助手'};
+  $('asr-count').textContent=`${items.length} 条`;
+  $('asr-logs').innerHTML=items.length?items.map(e=>`<div class="asr-log ${esc(e.role||'user')}"><time>${esc(e.time||'-')}</time><span class="role">${esc(roleNames[e.role]||'用户')}</span><span class="msg">${esc(e.text||'（未识别到语音）')}</span></div>`).join(''):'<div class="empty">等待设备收听并上传语音</div>';
+}
+function sameLog(a,b){return a&&b&&a.time===b.time&&a.text===b.text&&a.level===b.level}
+function drawBackendLogs(){
+  $('blog-count').textContent=`${backendLogs.length} 条`;
+  $('blog').innerHTML=backendLogs.length?backendLogs.map(e=>`<div class="blog ${esc(e.level||'info')}"><time>${esc(e.time||'-')}</time><span class="lv">${esc((e.level||'info').toUpperCase())}</span><span class="msg">${esc(e.text||'')}</span></div>`).join(''):'<div class="empty">等待 Python 后端输出</div>';
+}
+function setBackendLogs(items){
+  backendLogs=Array.isArray(items)?items:[];
+  drawBackendLogs();
+}
+function prependBackendLog(item){
+  if(!item||!item.text)return;
+  if(sameLog(backendLogs[0],item))return;
+  backendLogs=[item,...backendLogs].slice(0,300);
+  drawBackendLogs();
+}
 function renderQuickButtons(containerId,items,onPick){
-  $(containerId).innerHTML=items.map((item,i)=>`<button type="button" data-i="${i}">${item.label}</button>`).join('');
+  $(containerId).innerHTML=items.map((item,i)=>`<button type="button" data-i="${i}">${esc(item.label)}</button>`).join('');
   $(containerId).addEventListener('click',e=>{
     const btn=e.target.closest('button[data-i]');
     if(!btn)return;
@@ -261,29 +334,113 @@ async function sendStatus(){
     btn.disabled=false;
   }
 }
-async function sendText(){
-  const btn=$('send-text-btn');
+async function sendText(speak=false){
+  const btn=$(speak?'send-speak-btn':'send-text-btn');
+  const other=$(speak?'send-text-btn':'send-speak-btn');
   const result=$('text-result');
-  const payload={text:$('send-text').value,source:$('text-source').value};
+  const payload={text:$('send-text').value,source:$('text-source').value,speak:!!speak};
   btn.disabled=true;
+  other.disabled=true;
   result.className='send-result';
-  result.textContent='发送文字中...';
+  result.textContent=speak?'合成语音并发送中...':'发送文字中...';
   try{
-    await postJson('/event/text',payload);
+    const data=await postJson('/event/text',payload);
     result.className='send-result ok';
-    result.textContent=payload.text?'文字已发送':'已清空文字';
+    if(speak){
+      const spoken=data.spoken||{};
+      result.textContent=spoken.ok?'文字已发送并开始播报':('文字已发送，播报失败：'+(spoken.detail||'未知错误'));
+      if(!spoken.ok) result.className='send-result bad';
+    }else{
+      result.textContent=payload.text?'文字已发送（底部文案）':'已清空底部文案';
+    }
     refresh();
   }catch(err){
     result.className='send-result bad';
     result.textContent=String(err.message||err);
   }finally{
     btn.disabled=false;
+    other.disabled=false;
   }
 }
-async function refresh(){try{const d=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json()),w=d.wifi||{},e=d.event||{},dev=w.device||{};set('backend',linkText(d.backend),d.backend==='ONLINE'?'ok':'bad');set('usb',(w.device&&w.device.connected)?'已连接':'离线',(w.device&&w.device.connected)?'ok':'bad');set('wifi',linkText(w.status||'CHECKING'),w.status==='CONNECTED'?'ok':w.status==='CHECKING'?'warn':'bad');$('status').textContent=statusText(e.status);$('source').textContent='来源：'+(sourceNames[e.source]||e.source||'BOT');$('text').textContent=e.text||'暂无附加信息';$('target').textContent=w.target||'未启用';$('failures').textContent=w.failures??0;$('router-wifi').textContent=w.router_wifi===true?'已连接':w.router_wifi===false?'未连接':'未检测';$('device').textContent=dev.connected?'WebSocket 已连接':(dev.connected===false?'WebSocket 未连接':'未检测');$('event-time').textContent=e.time||statusText(e.status);renderLogs(d.history||[]);renderAsr(d.transcripts||[]);$('updated').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN')}catch{$('updated').textContent='后端不可用';set('backend','离线','bad');set('usb','离线','bad');set('wifi','离线','bad')}}
+async function refresh(){
+  try{
+    const d=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());
+    const w=d.wifi||{};
+    const e=d.event||{};
+    const dev=w.device||{};
+    setPill('pill-backend','后端 '+linkText(d.backend),d.backend==='ONLINE'?'ok':'bad');
+    setPill('pill-usb',(dev.connected)?'设备已连接':'设备离线',dev.connected?'ok':'bad');
+    setPill('pill-wifi','推送 '+linkText(w.status||'CHECKING'),w.status==='CONNECTED'?'ok':w.status==='CHECKING'?'warn':'bad');
+    const offline=!dev.connected;
+    const showStatus=offline?'OFFLINE':e.status;
+    $('status').textContent=statusText(showStatus);
+    setStatusGif(showStatus);
+    $('source').textContent='来源：'+(offline?'设备':(sourceNames[e.source]||e.source||'BOT'));
+    $('text').textContent=offline?'设备未连接后端':(e.text||'暂无附加信息');
+    $('target').textContent=w.target||'未启用';
+    $('failures').textContent=w.failures??0;
+    $('router-wifi').textContent=w.router_wifi===true?'已连接':w.router_wifi===false?'未连接':'未检测';
+    $('device').textContent=dev.connected?'WebSocket 已连接':(dev.connected===false?'WebSocket 未连接':'未检测');
+    $('event-time').textContent=e.time||statusText(e.status);
+    renderLogs(d.history||[]);
+    renderAsr(d.transcripts||[]);
+    if(Array.isArray(d.logs)) setBackendLogs(d.logs);
+    if(!volumeDragging && d.volume_percent!=null) setVolumeUi(d.volume_percent);
+    $('updated').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN');
+  }catch{
+    $('updated').textContent='后端不可用';
+    setPill('pill-backend','后端离线','bad');
+    setPill('pill-usb','设备离线','bad');
+    setPill('pill-wifi','推送离线','bad');
+    $('status').textContent=statusText('OFFLINE');
+    setStatusGif('OFFLINE');
+    $('source').textContent='来源：设备';
+    $('text').textContent='后端不可用';
+  }
+}
+function connectLogsWs(){
+  const proto=location.protocol==='https:'?'wss':'ws';
+  const ws=new WebSocket(`${proto}://${location.host}/ws`);
+  ws.addEventListener('open',()=>ws.send(JSON.stringify({type:'hello',role:'dashboard'})));
+  ws.addEventListener('message',ev=>{
+    try{
+      const msg=JSON.parse(ev.data);
+      if(msg.type==='backend_log') prependBackendLog(msg);
+    }catch{}
+  });
+  ws.addEventListener('close',()=>setTimeout(connectLogsWs,2000));
+  ws.addEventListener('error',()=>ws.close());
+}
 renderQuickButtons('quick-status',quickStatus,item=>{$('send-status').value=item.status;$('status-source').value=item.source});
 renderQuickButtons('quick-text',quickText,item=>{$('send-text').value=item.text;$('text-source').value=item.source});
 $('send-status-btn').addEventListener('click',sendStatus);
-$('send-text-btn').addEventListener('click',sendText);
-refresh();setInterval(refresh,1000);
-</script></body></html>
+$('send-text-btn').addEventListener('click',()=>sendText(false));
+$('send-speak-btn').addEventListener('click',()=>sendText(true));
+function setVolumeUi(p){
+  const n=Math.max(0,Math.min(100,Math.round(Number(p)||0)));
+  $('volume-slider').value=String(n);
+  $('volume-label').textContent=n+'%';
+}
+async function saveVolume(p){
+  const data=await postJson('/api/volume',{volume_percent:Number(p)});
+  setVolumeUi(data.volume_percent);
+}
+$('volume-slider').addEventListener('pointerdown',()=>{volumeDragging=true});
+$('volume-slider').addEventListener('pointerup',()=>{volumeDragging=false});
+$('volume-slider').addEventListener('pointercancel',()=>{volumeDragging=false});
+$('volume-slider').addEventListener('input',e=>{
+  setVolumeUi(e.target.value);
+  clearTimeout(volumeSaveTimer);
+  volumeSaveTimer=setTimeout(()=>{
+    saveVolume(e.target.value).catch(err=>{
+      $('text-result').className='send-result bad';
+      $('text-result').textContent=String(err.message||err);
+    });
+  },280);
+});
+connectLogsWs();
+refresh();
+setInterval(refresh,1000);
+</script>
+</body>
+</html>

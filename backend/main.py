@@ -15,15 +15,24 @@ except ImportError:
     pass
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from agent_status import STATUS_DETAILS, TASK_LABELS, TOOL_CATEGORIES, normalize_status
+from log_hub import install_capture, log_hub
+from settings_store import get_volume_percent, set_volume_percent
 from voice_pipeline import start_pipeline, warmup as voice_warmup
 from voice_session import session_store
 from ws_manager import WsHub, ws_endpoint
 
+install_capture()
+
 DASHBOARD_HTML = Path(__file__).with_name("dashboard.html")
+GIF_DIR = Path(__file__).resolve().parent.parent / "third_party" / "emoji-gif"
+GIF_STATUSES = {
+    "IDLE", "THINKING", "CODING", "READING", "TESTING", "WAITING",
+    "DONE", "ERROR", "OFFLINE", "STALE", "UNKNOWN",
+}
 
 
 class Event(BaseModel):
@@ -76,9 +85,14 @@ class StatusEvent(BaseModel):
         return {k: v for k, v in data.items() if k != "text"}
 
 
+class VolumeEvent(BaseModel):
+    volume_percent: int = Field(ge=0, le=100)
+
+
 class TextEvent(BaseModel):
     text: str = Field(default="", max_length=240)
     source: str = Field(default="BOT", max_length=16)
+    speak: bool = False
 
     def normalized(self) -> dict:
         source = self.source.upper()
@@ -122,6 +136,28 @@ def _push_voice_event(status: str, text: str, source: str = "VOICE") -> None:
         print(f"[voice] push failed: {exc}")
 
 
+def _push_voice_append(text: str, source: str = "VOICE", reset: bool = False) -> None:
+    if text and len(text) > 80:
+        text = text[:80]
+    with state.lock:
+        current = dict(state.current_event)
+        current["status"] = "THINKING"
+        current["source"] = source
+        if reset:
+            current["text"] = text or ""
+        elif text:
+            merged = (current.get("text") or "") + text
+            if len(merged) > 240:
+                merged = merged[:237] + "..."
+            current["text"] = merged
+        state.current_event = current
+    if ws_hub.loop is not None:
+        asyncio.run_coroutine_threadsafe(
+            ws_hub.push_append_event({"text": text or "", "source": source, "reset": bool(reset)}),
+            ws_hub.loop,
+        )
+
+
 def _on_transcript(session_id: str, text: str, role: str = "user") -> None:
     with state.lock:
         item = state.add_transcript(session_id, text, role)
@@ -135,21 +171,44 @@ def _on_transcript(session_id: str, text: str, role: str = "user") -> None:
 
 
 ws_hub = WsHub(_push_voice_event, _on_transcript)
+ws_hub.set_push_append(_push_voice_append)
+
+
+def _on_backend_log(item: dict) -> None:
+    if ws_hub.loop is None:
+        return
+    asyncio.run_coroutine_threadsafe(
+        ws_hub._broadcast_dashboard({"type": "backend_log", **item}),
+        ws_hub.loop,
+    )
+
+
+log_hub.set_listener(_on_backend_log)
 
 
 def apply_event(event: Event) -> dict:
     normalized = event.normalized()
     with state.lock:
-        state.record_history(normalized)
+        merged = {**state.current_event, **normalized}
+        if not normalized.get("text"):
+            merged["text"] = state.current_event.get("text", "")
+        state.record_history(merged)
+    device_payload = dict(normalized)
+    if not device_payload.get("text"):
+        device_payload.pop("text", None)
     if ws_hub.loop is not None:
-        asyncio.run_coroutine_threadsafe(ws_hub.push_status_event(normalized), ws_hub.loop)
-    return normalized
+        asyncio.run_coroutine_threadsafe(ws_hub.push_status_event(device_payload), ws_hub.loop)
+    return merged
 
 
 async def _sync_device_state(hub: WsHub) -> None:
     with state.lock:
         event = dict(state.current_event or {})
-    await hub.push_status_event(event or {"status": "IDLE", "source": "BOT"})
+    status_payload = {k: v for k, v in event.items() if k != "text"}
+    await hub.push_status_event(status_payload or {"status": "IDLE", "source": "BOT"})
+    text = event.get("text") or ""
+    if text:
+        await hub.push_text_event({"text": text, "source": event.get("source") or "BOT"})
 
 
 ws_hub.set_on_device_connect(_sync_device_state)
@@ -240,6 +299,21 @@ def dashboard():
     return HTMLResponse(DASHBOARD_HTML.read_text(encoding="utf-8"))
 
 
+@app.get("/gifs/{name}")
+def status_gif(name: str):
+    stem = Path(name).stem.upper()
+    if stem not in GIF_STATUSES:
+        stem = "UNKNOWN"
+    path = GIF_DIR / f"{stem}.gif"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="gif not found")
+    return FileResponse(
+        path,
+        media_type="image/gif",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @app.get("/api/status")
 def api_status():
     with state.lock:
@@ -261,8 +335,25 @@ def api_status():
         "event": current,
         "history": history,
         "transcripts": transcripts,
+        "logs": log_hub.items(),
+        "volume_percent": get_volume_percent(),
         "updated": time.time(),
     }
+
+
+@app.get("/api/volume")
+def api_volume_get():
+    return {"volume_percent": get_volume_percent()}
+
+
+@app.post("/api/volume")
+def api_volume_set(payload: VolumeEvent):
+    return {"ok": True, "volume_percent": set_volume_percent(payload.volume_percent)}
+
+
+@app.get("/api/logs")
+def api_logs():
+    return {"items": log_hub.items()}
 
 
 @app.get("/api/transcripts")
@@ -300,14 +391,19 @@ def event(payload: Event):
 def event_status(payload: StatusEvent):
     try:
         status_fields = payload.normalized()
-        apply_event(Event(**{**status_fields, "text": ""}))
+        with state.lock:
+            current = dict(state.current_event)
+            current.update(status_fields)
+            state.record_history(current)
+        if ws_hub.loop is not None:
+            asyncio.run_coroutine_threadsafe(ws_hub.push_status_event(status_fields), ws_hub.loop)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "queued": status_fields, "debounced": False}
 
 
 @app.post("/event/text")
-def event_text(payload: TextEvent):
+async def event_text(payload: TextEvent):
     try:
         text_fields = payload.normalized()
     except ValueError as exc:
@@ -316,9 +412,11 @@ def event_text(payload: TextEvent):
         current = dict(state.current_event)
         current.update(text_fields)
         state.record_history(current)
-    if ws_hub.loop is not None:
-        asyncio.run_coroutine_threadsafe(ws_hub.push_text_event(text_fields), ws_hub.loop)
-    return {"ok": True, "queued": text_fields}
+    await ws_hub.push_text_event(text_fields)
+    spoken = None
+    if payload.speak:
+        spoken = await ws_hub.speak_text(payload.text)
+    return {"ok": True, "queued": text_fields, "spoken": spoken}
 
 
 @app.post("/voice/upload")

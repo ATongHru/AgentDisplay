@@ -13,7 +13,10 @@
 #include "esp_sntp.h"
 #include "esp_wifi.h"
 #include "esp_websocket_client.h"
+#include "driver/gpio.h"
+#include "driver/usb_serial_jtag.h"
 #include "freertos/FreeRTOS.h"
+#include "soc/usb_serial_jtag_struct.h"
 #include "freertos/event_groups.h"
 #include "lwip/inet.h"
 #include "board_pins.h"
@@ -38,6 +41,11 @@ static size_t s_audio_len;
 static char s_session[16];
 static char s_usb_line[512];
 static size_t s_usb_len;
+static bool s_usb_ready;
+static uint32_t s_usj_sof;
+static uint32_t s_usj_ok_ms;
+
+#define USJ_HOLD_MS 400
 
 static void apply_time(int64_t epoch)
 {
@@ -59,7 +67,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_wifi = false;
         s_ws_on = false;
         xEventGroupClearBits(s_events, WIFI_OK);
-        ui_post_link_state(false, false, false, voice_is_listening(), audio_playback_is_active(), s_rssi);
+        ui_post_link_state(net_usb_ready(), false, false, voice_is_listening(), audio_playback_is_active(), s_rssi);
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
@@ -102,6 +110,12 @@ static void handle_text(const char *text, int len)
             ui_post_event_json(dump, false);
             free(dump);
         }
+        const cJSON *st = cJSON_GetObjectItem(root, "status");
+        const cJSON *src = cJSON_GetObjectItem(root, "source");
+        if (cJSON_IsString(st) && cJSON_IsString(src) && src->valuestring &&
+            strcmp(src->valuestring, "VOICE") == 0) {
+            voice_on_server_status(st->valuestring);
+        }
         const cJSON *tm = cJSON_GetObjectItem(root, "time");
         if (cJSON_IsString(tm) && tm->valuestring) {
             apply_time(atoll(tm->valuestring));
@@ -124,6 +138,11 @@ static void handle_text(const char *text, int len)
         } else {
             voice_on_audio_chunk(NULL, 0, s_audio_end);
         }
+    } else if (strcmp(t, "config") == 0) {
+        const cJSON *vol = cJSON_GetObjectItem(root, "volume_percent");
+        if (cJSON_IsNumber(vol)) {
+            audio_set_volume_percent((int)vol->valuedouble);
+        }
     } else if (strcmp(t, "error") == 0) {
         ESP_LOGW(TAG, "ws error frame");
     }
@@ -143,29 +162,64 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
             s_rssi = ap.rssi;
         }
-        ui_post_link_state(false, s_wifi, true, voice_is_listening(), audio_playback_is_active(), s_rssi);
+        ui_post_link_state(net_usb_ready(), s_wifi, true, voice_is_listening(), audio_playback_is_active(), s_rssi);
         ESP_LOGI(TAG, "websocket connected");
     } else if (id == WEBSOCKET_EVENT_DISCONNECTED) {
         s_ws_on = false;
         xEventGroupClearBits(s_events, WS_OK);
-        ui_post_link_state(false, s_wifi, false, voice_is_listening(), audio_playback_is_active(), s_rssi);
+        ui_post_link_state(net_usb_ready(), s_wifi, false, voice_is_listening(), audio_playback_is_active(), s_rssi);
     } else if (id == WEBSOCKET_EVENT_DATA) {
         if (evt->op_code == 0x01) {
             handle_text(evt->data_ptr, evt->data_len);
-        } else if (evt->op_code == 0x02) {
-            if (s_expect_audio) {
-                voice_on_audio_chunk((const uint8_t *)evt->data_ptr, evt->data_len, s_audio_end);
-                s_expect_audio = false;
+        } else if (evt->op_code == 0x02 || evt->op_code == 0x00) {
+            if (s_expect_audio && evt->data_ptr && evt->data_len > 0) {
+                const bool last_piece =
+                    (evt->payload_len <= 0) ||
+                    (evt->payload_offset + evt->data_len >= evt->payload_len);
+                voice_on_audio_chunk((const uint8_t *)evt->data_ptr, (size_t)evt->data_len,
+                                     s_audio_end && last_piece);
+                if (last_piece) {
+                    s_expect_audio = false;
+                }
             }
         }
     }
 }
 
+static bool usj_host_present(uint32_t now_ms)
+{
+    uint32_t sof = USB_SERIAL_JTAG.fram_num.sof_frame_index;
+    if (sof != s_usj_sof) {
+        s_usj_sof = sof;
+        s_usj_ok_ms = now_ms ? now_ms : 1;
+        return true;
+    }
+    if (usb_serial_jtag_is_connected()) {
+        s_usj_ok_ms = now_ms ? now_ms : 1;
+        return true;
+    }
+    return s_usj_ok_ms != 0 && (now_ms - s_usj_ok_ms) < USJ_HOLD_MS;
+}
+
+static bool ch343_uart_present(void)
+{
+    /* CH343 上电后 TX 空闲为高；未供电时为高阻，板内下拉读到低。 */
+    return gpio_get_level(PIN_UART0_RX) != 0;
+}
+
 static void poll_usb(void)
 {
-    /* Console occupies USB Serial/JTAG; USB JSON backup is unused in this build. */
     (void)s_usb_line;
     (void)s_usb_len;
+    uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    bool ready = usj_host_present(now) || ch343_uart_present();
+    if (ready != s_usb_ready) {
+        s_usb_ready = ready;
+        ESP_LOGI(TAG, "usb %s usj_sof=%u ch343=%d",
+                 ready ? "up" : "down",
+                 (unsigned)USB_SERIAL_JTAG.fram_num.sof_frame_index,
+                 (int)ch343_uart_present());
+    }
 }
 
 static void start_ws(void)
@@ -177,6 +231,7 @@ static void start_ws(void)
         .uri = CONFIG_AGENT_WS_URL,
         .reconnect_timeout_ms = WS_RECONNECT_MS,
         .network_timeout_ms = 10000,
+        .buffer_size = 8192,
     };
     s_ws = esp_websocket_client_init(&cfg);
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event, NULL);
@@ -187,6 +242,14 @@ static void start_ws(void)
 esp_err_t net_init(void)
 {
     s_events = xEventGroupCreate();
+    gpio_config_t uart_rx = {
+        .pin_bit_mask = 1ULL << PIN_UART0_RX,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&uart_rx);
     /* USB Serial/JTAG is the console; skip driver_install to avoid conflict. */
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -236,6 +299,11 @@ void net_loop(void)
 
 bool net_wifi_ready(void) { return s_wifi; }
 bool net_ws_ready(void) { return s_ws_on && s_ws && esp_websocket_client_is_connected(s_ws); }
+bool net_usb_ready(void)
+{
+    poll_usb();
+    return s_usb_ready;
+}
 int net_rssi(void) { return s_rssi; }
 
 bool net_ws_send_audio_upload(const uint8_t *pcm, size_t pcm_len, char *session_id, size_t session_id_len)

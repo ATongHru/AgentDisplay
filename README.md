@@ -23,6 +23,69 @@ flowchart LR
 
 ---
 
+## 依赖
+
+### 固件构建（ESP-IDF）
+
+| 项 | 要求 |
+|----|------|
+| [ESP-IDF](https://docs.espressif.com/projects/esp-idf/) | **5.4.2** |
+| 目标芯片 | ESP32-S3（N16R8） |
+| Python | 3.8+（随 ESP-IDF 提供，供 `idf.py` / `esptool` 使用） |
+
+IDF 组件由 `main/idf_component.yml` 声明，首次 `idf.py build` 时自动下载到 `managed_components/`：
+
+| 组件 | 版本约束 | 当前锁定 |
+|------|----------|----------|
+| `lvgl/lvgl` | ^9.2.2 | 9.2.2 |
+| `espressif/esp_websocket_client` | ^1.4.0 | 1.8.0 |
+
+### PC 脚本工具
+
+用于生成资源、单独烧录表情分区（非固件编译必需，改 GIF / 字库时需要）：
+
+| 脚本 | 依赖 | 安装 |
+|------|------|------|
+| `scripts/gen_frame_player.py` | Python 3 + Pillow | `pip install Pillow` |
+| `scripts/gen_cjk_font.py` | Python 3 + Node.js（`npx`）+ `lv_font_conv`；系统 TTF（如黑体） | 安装 [Node.js](https://nodejs.org/) 后首次运行由 `npx` 拉取 `lv_font_conv` |
+| `scripts/flash_animations.py` | Python 3 + esptool | 优先使用 ESP-IDF 自带；亦可 `pip install esptool` |
+
+### 后端 Python
+
+Python **3.10+** 推荐。于 `backend/` 目录安装：
+
+```bash
+pip install -r requirements.txt
+```
+
+`backend/requirements.txt` 包列表：
+
+| 包 | 用途 |
+|----|------|
+| `fastapi` | Web 框架、WebSocket `/ws` |
+| `uvicorn` | ASGI 服务（`start.bat` 启动） |
+| `httpx` | 调用 OpenAI 兼容 LLM API |
+| `vosk` | 默认离线 ASR |
+| `SpeechRecognition` | 可选引擎 `ASR_ENGINE=google` |
+| `python-dotenv` | 读取 `backend/.env` |
+
+环境变量模板见 `backend/.env.example`，复制为 `backend/.env` 并填写 `LLM_API_KEY`：
+
+| 变量 | 说明 | 默认 |
+|------|------|------|
+| `LLM_BASE_URL` | OpenAI 兼容接口根地址 | （必填，见 `backend/.env.example`） |
+| `LLM_API_KEY` | API 密钥 | （必填） |
+| `LLM_MODEL` | 模型标识 | （必填，见 `backend/.env.example`） |
+| `VOICE_TTS` | 是否启用 TTS 回传 | `0`（关） |
+| `ASR_ENGINE` | 识别引擎 | `vosk` |
+| `VOSK_MODEL_PATH` | Vosk 模型目录 | `backend/models/vosk-model-small-cn-0.22` |
+
+默认 ASR 需自行下载 Vosk 中文模型，见「附录 → Vosk 中文模型」。
+
+可选 ASR：`ASR_ENGINE=google` 使用 `SpeechRecognition` 在线识别；`ASR_ENGINE=faster_whisper` 需额外 `pip install faster-whisper`。
+
+---
+
 ## 硬件
 
 | 项 | 规格 |
@@ -189,13 +252,13 @@ python scripts/gen_frame_player.py
 python scripts/flash_animations.py -p COMx
 ```
 
-依赖 Pillow。只烧 app、不烧 `animations.bin` 则有字无表情。
+脚本依赖见「依赖 → PC 脚本工具」。只烧 app、不烧 `animations.bin` 则有字无表情。
 
 ---
 
 ## 中文字库
 
-开机即用 `font_cjk_16`：《通用规范汉字表》一级 3500 字 + ASCII `0x20-0x7F` + 常用中文标点，16px / 4bpp，源字体 `simhei.ttf`。重新生成：`python scripts/gen_cjk_font.py`（需 npx + `lv_font_conv`）。不要用 `0x4E00-0x9FFF` 整段代替一级字。
+开机即用 `font_cjk_16`：《通用规范汉字表》一级 3500 字 + ASCII `0x20-0x7F` + 常用中文标点，16px / 4bpp，源字体 `simhei.ttf`。重新生成：`python scripts/gen_cjk_font.py`（依赖见「依赖 → PC 脚本工具」）。不要用 `0x4E00-0x9FFF` 整段代替一级字。
 
 ---
 
@@ -210,24 +273,15 @@ python scripts/flash_animations.py -p COMx
 | `hello` / `ack` | 握手 | text | `ack` 含 `server_time` 可校时 |
 | `ping` / `pong` | 双向 | text | 保活 |
 | `status` | PC→ESP | text | `status` / `text` / `source` / `gif` / `time` |
-| `audio_upload` | ESP→PC | text + 下一帧 binary PCM | 16 kHz mono s16le |
-| `session` | PC→ESP | text | `session_id` |
-| `audio_chunk` | PC→ESP | text + binary | TTS 分片，每片 ≤1024；`len=0` 可无 binary |
+| `audio_upload` | ESP→PC | text + binary | 语音上传，见 [VOICE.md](VOICE.md) |
+| `session` | PC→ESP | text | 语音会话 ID |
+| `audio_chunk` / `append` | PC→ESP | text + binary 或 text | TTS 分片 / LLM 流式字幕 |
+| `config` | PC→ESP | text | 如 `volume_percent` |
 | `error` | PC→ESP | text | 错误 |
 
-语音必须「text 元数据 → binary」。`source`：`PI` / `CURSOR` / `VOICE` / `BOT` / `UNKNOWN`。
+`source`：`PI` / `CURSOR` / `VOICE` / `BOT` / `UNKNOWN`。
 
-VAD：连上 WS 后听环境声，峰值触发录音，静音约 1.5 s 或满 10 s 上传，然后继续听。
-
-```text
-ESP → audio_upload + PCM
-PC  → session
-PC  → Vosk ASR → 网页日志（用户，YYYY-MM-DD HH:MM:SS）
-PC  → 2api.store gpt-5.6-luna → 网页日志（助手，带时间）
-PC  → status 更新设备语音行
-```
-
-TTS 默认关（`VOICE_TTS=1` 才开）。LLM 密钥在 `backend/.env`，接口见 [2api.store](https://2api.store)。
+**语音全流程**（VAD 参数、双帧协议、ASR/LLM/TTS 流水线、环境变量）见 **[VOICE.md](VOICE.md)**。
 
 
 ---
@@ -256,7 +310,7 @@ start.bat
 stop.bat
 ```
 
-依赖：`pip install -r backend/requirements.txt`。
+后端依赖与环境变量见「依赖 → 后端 Python」。
 
 ---
 
@@ -320,6 +374,7 @@ PowerShell 下先加载本机 ESP-IDF 环境配置，再 `cd` 到本项目根目
 ```text
 esp32s3-agent-display/
 ├── README.md
+├── VOICE.md                      语音收听→识别→回复全流程
 ├── start.bat / stop.bat          后端启停（打完日志退出）
 ├── _idf_build.bat
 ├── partitions.csv
@@ -347,3 +402,13 @@ esp32s3-agent-display/
 ### GIF 裁切工具
 
 将原始 GIF 按目标分辨率（如 90×90）裁切时，可使用 [SkyloongGIFsHelper](https://github.com/PuddingTower/SkyloongGIFsHelper)。该工具基于 PyQt5 + Pillow，支持按指定宽高比框选裁切区域并批量导出，裁切结果放入 `third_party/emoji-gif/` 后再运行 `scripts/gen_frame_player.py` 生成 `animations.bin`。
+
+### Vosk 中文模型
+
+后端默认 ASR（`ASR_ENGINE=vosk`）需要离线语音模型，仓库不包含该文件（`backend/models/` 已 gitignore）。
+
+1. 从 [Vosk Models](https://alphacephei.com/vosk/models) 下载 **vosk-model-small-cn-0.22**
+2. 解压到 `backend/models/vosk-model-small-cn-0.22/`（解压后该目录下应含 `am/`、`conf/`、`graph/` 等子目录）
+3. 若放在其他路径，在 `backend/.env` 中设置 `VOSK_MODEL_PATH` 指向模型根目录
+
+模型约 40 MB，首次启动后端时会加载；未放置模型时语音识别将报错。

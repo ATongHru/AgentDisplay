@@ -4,23 +4,56 @@ from __future__ import annotations
 
 import asyncio
 import os
-import subprocess
-import tempfile
 import threading
+import time
 from typing import Callable
 
 from asr import transcribe_pcm, warmup as asr_warmup
 from llm import llm_chat, llm_configured
+from settings_store import get_volume_percent, scale_pcm16
 from voice_session import SessionPhase, VoiceSession, session_store
 
 TTS_VOICE = os.getenv("TTS_VOICE", "zh-CN-XiaoxiaoNeural")
-VOICE_TTS = os.getenv("VOICE_TTS", "0").strip() == "1"
+VOICE_TTS = os.getenv("VOICE_TTS", "1").strip() not in {"0", "false", "False", ""}
 
 TranscriptFn = Callable[..., None]
 PushFn = Callable[[str, str, str], None]
+AppendFn = Callable[..., None]
+
+
+class _DeltaCoalescer:
+    def __init__(self, flush_fn: Callable[[str], None], min_chars: int = 6, min_sec: float = 0.12):
+        self._flush_fn = flush_fn
+        self._min_chars = min_chars
+        self._min_sec = min_sec
+        self._buf = ""
+        self._last = 0.0
+        self._lock = threading.Lock()
+
+    def add(self, delta: str) -> None:
+        if not delta:
+            return
+        with self._lock:
+            self._buf += delta
+            now = time.monotonic()
+            if len(self._buf) >= self._min_chars or now - self._last >= self._min_sec:
+                self._emit_locked()
+
+    def flush(self) -> None:
+        with self._lock:
+            self._emit_locked()
+
+    def _emit_locked(self) -> None:
+        if not self._buf:
+            return
+        text = self._buf
+        self._buf = ""
+        self._last = time.monotonic()
+        self._flush_fn(text)
 
 
 def warmup() -> None:
+    print(f"[voice] TTS={'on' if VOICE_TTS else 'off'} voice={TTS_VOICE}")
     asr_warmup()
 
 
@@ -41,34 +74,66 @@ async def tts_to_pcm(text: str) -> bytes:
         return b""
 
     communicate = edge_tts.Communicate(text, TTS_VOICE)
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-        mp3_path = tmp.name
-    try:
-        await communicate.save(mp3_path)
-        pcm_path = mp3_path + ".pcm"
-        cmd = [
-            "ffmpeg", "-y", "-i", mp3_path,
-            "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", pcm_path,
-        ]
-        proc = subprocess.run(cmd, capture_output=True, timeout=120)
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.decode("utf-8", errors="replace") or "ffmpeg failed")
-        with open(pcm_path, "rb") as f:
-            return f.read()
-    finally:
-        for path in (mp3_path, mp3_path + ".pcm"):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+    mp3 = bytearray()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            mp3.extend(chunk["data"])
+    if not mp3:
+        raise RuntimeError("TTS 无音频")
+    pcm = await asyncio.to_thread(_mp3_to_pcm16k_mono, bytes(mp3))
+    volume = get_volume_percent()
+    pcm = scale_pcm16(pcm, volume)
+    print(f"[tts] mp3={len(mp3)} pcm={len(pcm)} volume={volume}%")
+    return pcm
 
 
-def run_pipeline(session_id: str, push_event: PushFn, on_transcript: TranscriptFn | None) -> None:
+def _mp3_to_pcm16k_mono(mp3: bytes) -> bytes:
+    import array
+    import miniaudio
+
+    decoded = miniaudio.decode(
+        mp3,
+        output_format=miniaudio.SampleFormat.SIGNED16,
+        nchannels=1,
+        sample_rate=16000,
+    )
+    samples = decoded.samples
+    if isinstance(samples, array.array) and samples.typecode == "f":
+        pcm = array.array(
+            "h",
+            (max(-32767, min(32767, int(x * 32767))) for x in samples),
+        )
+        raw = pcm.tobytes()
+    elif hasattr(samples, "tobytes"):
+        raw = samples.tobytes()
+    else:
+        raw = bytes(samples)
+    peak = 0
+    view = memoryview(raw).cast("h")
+    for sample in view:
+        abs_s = -sample if sample < 0 else sample
+        if abs_s > peak:
+            peak = abs_s
+    print(f"[tts] pcm={len(raw)} peak={peak} fmt={getattr(samples, 'typecode', type(samples).__name__)}")
+    return raw
+
+
+def run_pipeline(
+    session_id: str,
+    push_event: PushFn,
+    on_transcript: TranscriptFn | None,
+    on_done: Callable[[], None] | None = None,
+    push_append: AppendFn | None = None,
+) -> None:
     async def _run():
         session = session_store.get(session_id)
         if session is None:
             return
         try:
+            print(
+                f"[voice] session {session_id} pcm={len(session.pcm_data)} "
+                f"sr={session.sample_rate} ch={session.channels}"
+            )
             push_event("THINKING", "正在识别", "VOICE")
             asr_text = await asyncio.to_thread(transcribe_session_pcm, session)
             if not asr_text:
@@ -88,11 +153,30 @@ def run_pipeline(session_id: str, push_event: PushFn, on_transcript: TranscriptF
                 print(f"[voice] asr {session_id}: {asr_text}")
                 return
 
-            def on_partial(partial: str) -> None:
-                session.append_llm(partial)
-                push_event("THINKING", partial, "VOICE")
+            last = ""
+            started = False
+
+            def emit_delta(delta: str) -> None:
+                if push_append:
+                    push_append(delta, "VOICE", False)
+
+            coalescer = _DeltaCoalescer(emit_delta)
+
+            def on_partial(full: str) -> None:
+                nonlocal last, started
+                session.append_llm(full)
+                delta = full[len(last):] if full.startswith(last) else full
+                last = full
+                if not delta:
+                    return
+                if not started:
+                    started = True
+                    if push_append:
+                        push_append("", "VOICE", True)
+                coalescer.add(delta)
 
             reply = await llm_chat(asr_text, on_partial)
+            coalescer.flush()
             if not reply:
                 session.set_error("LLM 无回复")
                 push_event("ERROR", "LLM 无回复", "VOICE")
@@ -108,22 +192,36 @@ def run_pipeline(session_id: str, push_event: PushFn, on_transcript: TranscriptF
             session.phase = SessionPhase.TTS
             pcm = await tts_to_pcm(reply)
             session.set_tts_pcm(pcm)
-            push_event("DONE", reply, "VOICE")
             print(f"[voice] session {session_id} ready audio={len(pcm)} bytes")
         except Exception as exc:
+            import traceback
+
             print(f"[voice] session {session_id} failed: {exc}")
+            traceback.print_exc()
             session = session_store.get(session_id)
             if session:
                 session.set_error(str(exc))
-            push_event("ERROR", "处理失败", "VOICE")
+            detail = str(exc).strip().replace("\n", " ")
+            if len(detail) > 80:
+                detail = detail[:77] + "..."
+            push_event("ERROR", f"处理失败：{detail}" if detail else "处理失败", "VOICE")
+        finally:
+            if on_done:
+                on_done()
 
     asyncio.run(_run())
 
 
-def start_pipeline(session_id: str, push_event: PushFn, on_transcript: TranscriptFn | None = None) -> None:
+def start_pipeline(
+    session_id: str,
+    push_event: PushFn,
+    on_transcript: TranscriptFn | None = None,
+    on_done: Callable[[], None] | None = None,
+    push_append: AppendFn | None = None,
+) -> None:
     threading.Thread(
         target=run_pipeline,
-        args=(session_id, push_event, on_transcript),
+        args=(session_id, push_event, on_transcript, on_done, push_append),
         daemon=True,
         name=f"voice-{session_id}",
     ).start()

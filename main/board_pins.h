@@ -16,6 +16,7 @@
 #define PIN_PDM_DATA 16
 
 #define PIN_BOOT     0
+#define PIN_UART0_RX 44 /* U0RXD，CH343 TX */
 
 #define LCD_W 240
 #define LCD_H 240

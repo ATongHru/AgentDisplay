@@ -30,7 +30,6 @@ static void audio_task(void *arg)
     ESP_ERROR_CHECK(audio_init());
     for (;;) {
         audio_task_loop();
-        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -57,17 +56,12 @@ static void app_task(void *arg)
             last_time = now;
             ui_post_time_tick();
         }
-        if (now - last_link >= 1000) {
-            last_link = now;
-            ui_post_link_state(false, net_wifi_ready(), net_ws_ready(), voice_is_listening(),
-                               audio_playback_is_active(), net_rssi());
+        if (last_link == 0 || now - last_link >= 250) {
+            last_link = now ? now : 1;
+            ui_post_link_state(net_usb_ready(), net_wifi_ready(), net_ws_ready(),
+                               voice_is_listening(), audio_playback_is_active(), net_rssi());
         }
 
-        if (!ui_voice_session_active() && !net_ws_ready() && !net_wifi_ready()) {
-            if ((now - ui_last_event_ms()) >= OFFLINE_TIMEOUT_MS && !ui_offline_active()) {
-                ui_post_event_json("{\"status\":\"OFFLINE\",\"source\":\"BOT\"}", false);
-            }
-        }
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
@@ -90,7 +84,7 @@ void app_main(void)
     ESP_ERROR_CHECK(net_init());
     voice_init();
 
-    xTaskCreatePinnedToCore(audio_task, "audio", 4096, NULL, 6, NULL, 0);
+    xTaskCreatePinnedToCore(audio_task, "audio", 8192, NULL, 6, NULL, 0);
     xTaskCreatePinnedToCore(net_task, "net", 8192, NULL, 4, NULL, 0);
     xTaskCreatePinnedToCore(lvgl_task, "lvgl", 8192, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(app_task, "app", 4096, NULL, 3, NULL, 1);

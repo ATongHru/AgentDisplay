@@ -4,3 +4,5 @@ httpx
 SpeechRecognition
 vosk
 python-dotenv
+edge-tts
+miniaudio
