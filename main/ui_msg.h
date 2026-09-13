@@ -12,11 +12,13 @@ typedef enum {
     UI_MSG_BLE_PROV = 6,
     UI_MSG_VOLUME = 7,
     UI_MSG_VOICE_ENABLED = 8,
+    UI_MSG_MIC_LEVEL = 9,
+    UI_MSG_DIAGNOSTIC = 10,
 } ui_msg_type_t;
 
 typedef struct {
     ui_msg_type_t type;
-    char json[512];
+    char json[1024];
     bool from_usb;
     bool usb;
     bool wifi;
@@ -29,6 +31,8 @@ typedef struct {
     int rssi;
     int volume_percent;
     bool voice_enabled;
+    float mic_rms;
+    bool diagnostic_on;
 } ui_msg_t;
 
 void ui_post(const ui_msg_t *msg);
@@ -40,3 +44,5 @@ void ui_post_time_tick(void);
 void ui_post_ble_prov(bool on);
 void ui_post_volume(int percent);
 void ui_post_voice_enabled(bool enabled);
+void ui_post_mic_level(float rms);
+void ui_post_diagnostic_toggle(void);

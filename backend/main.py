@@ -26,6 +26,9 @@ from settings_store import (
     set_volume_percent,
     get_voice_enabled,
     set_voice_enabled,
+    get_tts_voice,
+    set_tts_voice,
+    list_tts_voices,
 )
 from wifi_profiles_store import (
     list_profiles as list_wifi_profiles,
@@ -33,7 +36,12 @@ from wifi_profiles_store import (
     delete_profile as delete_wifi_profile,
     get_profile as get_wifi_profile,
 )
-from llm_config import get_llm_config, set_llm_config, load_llm_config
+from llm_config import (
+    activate_llm_profile,
+    delete_llm_profile,
+    get_llm_config,
+    upsert_llm_profile,
+)
 from voice_pipeline import start_pipeline, warmup as voice_warmup
 from voice_session import session_store
 from ble_prov import ble_prov
@@ -109,6 +117,10 @@ class VoiceToggleEvent(BaseModel):
     voice_enabled: bool
 
 
+class TtsVoiceEvent(BaseModel):
+    tts_voice: str = Field(min_length=3, max_length=96)
+
+
 class WifiProfileEvent(BaseModel):
     id: str | None = None
     name: str = ""
@@ -137,9 +149,16 @@ class DeviceWifiIndexEvent(BaseModel):
 
 
 class LlmConfigEvent(BaseModel):
+    id: str | None = Field(default=None, max_length=32)
+    name: str = Field(default="", max_length=32)
     base_url: str = Field(min_length=1, max_length=256)
     api_key: str = Field(default="", max_length=256)
     model: str = Field(min_length=1, max_length=128)
+    activate: bool = False
+
+
+class LlmIdEvent(BaseModel):
+    id: str = Field(min_length=1, max_length=32)
 
 
 class BleScanRequest(BaseModel):
@@ -163,14 +182,22 @@ class BleProvRequest(BaseModel):
 
 class TextEvent(BaseModel):
     text: str = Field(default="", max_length=240)
-    source: str = Field(default="BOT", max_length=16)
+    source: str = Field(default="VOICE", max_length=16)
+    role: str | None = Field(default=None, max_length=16)
     speak: bool = False
 
     def normalized(self) -> dict:
         source = self.source.upper()
         if source not in {"PI", "CURSOR", "UNKNOWN", "VOICE", "BOT"}:
             raise ValueError("unsupported source")
-        return {"text": self.text, "source": source}
+        # Device captions only render source=VOICE. This endpoint is the bottom
+        # ticker; other sources would silently disappear on the ESP.
+        source = "VOICE"
+        payload = {"text": self.text, "source": source}
+        role = (self.role or "assistant").strip().lower()
+        if role in {"user", "assistant"}:
+            payload["role"] = role
+        return payload
 
 
 def _device_status_fingerprint(payload: dict) -> tuple:
@@ -192,6 +219,7 @@ class AppState:
         self.history = deque(maxlen=50)
         self.transcripts = deque(maxlen=200)
         self.last_device_status_fp: tuple | None = None
+        self.device_display: dict | None = None
 
     def record_history(self, snapshot: dict) -> None:
         self.history.appendleft({**snapshot, "time": datetime.now().strftime("%H:%M:%S")})
@@ -209,27 +237,60 @@ class AppState:
         return item
 
 
+def apply_device_display(status: str, source: str) -> dict:
+    status_key, _ = normalize_status(status)
+    src = (source or "BOT").strip().upper() or "BOT"
+    if src not in {"PI", "CURSOR", "UNKNOWN", "VOICE", "BOT"}:
+        src = "BOT"
+    snapshot = {
+        "status": status_key,
+        "source": src,
+        "gif": status_key,
+        "time": datetime.now().strftime("%H:%M:%S"),
+    }
+    with state.lock:
+        prev = state.device_display or {}
+        if prev.get("status") == snapshot["status"] and prev.get("source") == snapshot["source"]:
+            return dict(prev)
+        state.device_display = snapshot
+    return snapshot
+
+
+def clear_device_display() -> None:
+    with state.lock:
+        state.device_display = None
+
+
 state = AppState()
 
 
-def _push_voice_event(status: str, text: str, source: str = "VOICE") -> None:
+def _push_voice_event(
+    status: str, text: str, source: str = "VOICE", role: str | None = None
+) -> None:
     """Voice captions only. Do not overwrite agent status/source/GIF."""
     if text and len(text) > 240:
         text = text[:237] + "..."
     if ws_hub.loop is None:
         return
-    asyncio.run_coroutine_threadsafe(
-        ws_hub.push_text_event({"text": text or "", "source": source, "status": status}),
-        ws_hub.loop,
-    )
+    payload: dict = {"text": text or "", "source": source, "status": status}
+    if role:
+        payload["role"] = role
+    asyncio.run_coroutine_threadsafe(ws_hub.push_text_event(payload), ws_hub.loop)
 
 
-def _push_voice_append(text: str, source: str = "VOICE", reset: bool = False) -> None:
-    if text and len(text) > 80:
-        text = text[:80]
+def _push_voice_append(
+    text: str, source: str = "VOICE", reset: bool = False, role: str = "assistant"
+) -> None:
     if ws_hub.loop is not None:
         asyncio.run_coroutine_threadsafe(
-            ws_hub.push_append_event({"text": text or "", "source": source, "reset": bool(reset)}),
+            ws_hub.push_append_event(
+                {
+                    "text": text or "",
+                    "source": source,
+                    "reset": bool(reset),
+                    "role": role,
+                }
+            ),
             ws_hub.loop,
         )
 
@@ -248,6 +309,18 @@ def _on_transcript(session_id: str, text: str, role: str = "user") -> None:
 
 ws_hub = WsHub(_push_voice_event, _on_transcript)
 ws_hub.set_push_append(_push_voice_append)
+
+
+def _on_device_display(status: str, source: str) -> dict | None:
+    try:
+        return apply_device_display(status, source)
+    except ValueError:
+        print(f"[display] ignore invalid status={status!r}")
+        return None
+
+
+ws_hub.set_on_device_display(_on_device_display)
+ws_hub.set_on_device_disconnect(clear_device_display)
 
 
 def _on_backend_log(item: dict) -> None:
@@ -443,6 +516,7 @@ def api_status():
         current = dict(state.current_event)
         history = list(state.history)
         transcripts = list(state.transcripts)
+        display = dict(state.device_display) if state.device_display else None
     device = ws_hub.device_snapshot()
     link_status = "CONNECTED" if device.get("connected") else "OFFLINE"
     return {
@@ -456,11 +530,14 @@ def api_status():
             "router_wifi": device.get("connected"),
         },
         "event": current,
+        "display": display,
         "history": history,
         "transcripts": transcripts,
         "logs": log_hub.items(),
         "volume_percent": get_volume_percent(),
         "voice_enabled": get_voice_enabled(),
+        "tts_voice": get_tts_voice(),
+        "tts_voices": list_tts_voices(get_tts_voice()),
         "wifi_profiles": list_wifi_profiles(),
         "llm": get_llm_config(mask_key=True),
         "updated": time.time(),
@@ -489,6 +566,18 @@ async def api_voice_set(payload: VoiceToggleEvent):
     enabled = set_voice_enabled(payload.voice_enabled)
     await ws_hub.push_voice_config(enabled)
     return {"ok": True, "voice_enabled": enabled}
+
+
+@app.get("/api/tts-voice")
+def api_tts_voice_get():
+    voice = get_tts_voice()
+    return {"tts_voice": voice, "voices": list_tts_voices(voice)}
+
+
+@app.post("/api/tts-voice")
+def api_tts_voice_set(payload: TtsVoiceEvent):
+    voice = set_tts_voice(payload.tts_voice)
+    return {"ok": True, "tts_voice": voice, "voices": list_tts_voices(voice)}
 
 
 
@@ -522,10 +611,34 @@ def api_llm_get():
 @app.post("/api/llm")
 def api_llm_set(payload: LlmConfigEvent):
     try:
-        set_llm_config(payload.model_dump())
+        data = upsert_llm_profile(payload.model_dump(), activate=payload.activate)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"写入 llm.json 失败: {exc}") from exc
-    return {"ok": True, "llm": get_llm_config(mask_key=True)}
+    return {"ok": True, "llm": data}
+
+
+@app.post("/api/llm/activate")
+def api_llm_activate(payload: LlmIdEvent):
+    try:
+        data = activate_llm_profile(payload.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"写入 llm.json 失败: {exc}") from exc
+    return {"ok": True, "llm": data}
+
+
+@app.post("/api/llm/delete")
+def api_llm_delete(payload: LlmIdEvent):
+    try:
+        data = delete_llm_profile(payload.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"写入 llm.json 失败: {exc}") from exc
+    return {"ok": True, "llm": data}
 
 
 @app.get("/api/ble/status")

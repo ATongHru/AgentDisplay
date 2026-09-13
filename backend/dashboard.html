@@ -101,6 +101,11 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .voice-toggle{display:flex;align-items:center;gap:10px;margin-top:10px;color:var(--muted);font-size:12px}
 .voice-toggle button{min-width:7.5em}
 .voice-toggle button.off{opacity:.55;filter:grayscale(1)}
+.tts-voice-row{
+  display:flex;align-items:center;gap:10px;margin-top:10px;color:var(--muted);font-size:12px
+}
+.tts-voice-row span{flex:0 0 auto}
+.tts-voice-row select{flex:1;min-height:38px}
 .mic-badge{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:999px;border:1px solid var(--line);background:var(--chip);font-size:14px;color:#38bdf8}
 .mic-badge.off{color:#6b7280;opacity:.45;filter:grayscale(1)}
 .boards{display:grid;grid-template-columns:1fr 1fr;gap:16px;min-height:240px}
@@ -191,8 +196,8 @@ button:disabled{opacity:.5;cursor:not-allowed}
   <div class="top-actions">
     <button type="button" data-modal="ble">BLE 配网</button>
     <button type="button" data-modal="wifi">网络配置记录</button>
-    <button type="button" data-modal="llm">LLM 信息</button>
-    <a href="/chat-history">LLM 历史</a>
+    <button type="button" data-modal="llm">大模型配置</button>
+    <a href="/chat-history">大模型对话历史</a>
   </div>
   <div class="pills">
     <div class="pill" id="pill-backend"><span class="dot"></span><span>后端 ...</span></div>
@@ -253,12 +258,13 @@ button:disabled{opacity:.5;cursor:not-allowed}
       </section>
       <section class="card composer text-card">
         <h2>推送文字（底部文案）</h2>
+        <p class="hint" style="margin:0 0 8px;color:var(--muted);font-size:12px;line-height:1.45">设备只回显 <b>VOICE</b> 来源。CURSOR/BOT 只会改顶部来源标签，底部字幕不会出现。</p>
         <div class="row two">
           <select id="text-source" aria-label="来源">
+            <option value="VOICE" selected>VOICE</option>
             <option value="BOT">BOT</option>
-            <option value="CURSOR" selected>CURSOR</option>
+            <option value="CURSOR">CURSOR</option>
             <option value="PI">PI</option>
-            <option value="VOICE">VOICE</option>
           </select>
           <button id="send-text-btn" class="btn-text" type="button">发送文字</button>
           <button id="send-speak-btn" class="btn-speak" type="button">发送并播报</button>
@@ -274,6 +280,13 @@ button:disabled{opacity:.5;cursor:not-allowed}
           <span>麦克风</span>
           <button id="voice-toggle-btn" type="button">麦克风开</button>
         </div>
+        <div class="tts-voice-row">
+          <span>语音音色</span>
+          <select id="tts-voice" aria-label="语音音色">
+            <option value="zh-CN-XiaoxiaoNeural">晓晓（女 · 微软在线）</option>
+          </select>
+        </div>
+        <p class="hint" style="margin:8px 0 0;color:var(--muted);font-size:12px;line-height:1.45">带「本地」的走本机 Windows 语音，不联网。其余为微软 Edge TTS 在线合成。</p>
         <div class="quick" id="quick-text"></div>
         <div id="text-result" class="send-result"></div>
       </section>
@@ -359,20 +372,31 @@ button:disabled{opacity:.5;cursor:not-allowed}
   </div>
   <div class="modal-backdrop" id="modal-llm" role="dialog" aria-modal="true">
     <div class="modal">
-      <div class="modal-head"><h2>LLM 对接</h2><button type="button" class="modal-close" data-close>关闭</button></div>
-      <h2>LLM 对接（热切换）</h2>
+      <div class="modal-head"><h2>大模型配置</h2><button type="button" class="modal-close" data-close>关闭</button></div>
+      <h2>大模型配置（可存多条）</h2>
     <p style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.5">
-      架构：OpenAI 兼容 Chat Completions（HTTP 流式）。URL / Key / 模型保存在 backend/llm.json（git 忽略），保存后立即生效。
+      OpenAI 兼容 Chat Completions（HTTP 流式）。可保存最多 8 条，启用其中一条后立即生效。
+      打开本窗口时页面轮询不会覆盖你正在编辑的内容。
     </p>
-    <div class="llm-grid">
-      <label>Base URL<input id="llm-base-url" type="text" maxlength="256" placeholder="https://api.example.com 或 .../v1" autocomplete="off"></label>
-      <label>API Key<input id="llm-api-key" type="password" maxlength="256" placeholder="sk-..." autocomplete="off"></label>
-      <label>模型名称<input id="llm-model" type="text" maxlength="128" placeholder="模型名" autocomplete="off"></label>
-    </div>
-    <div class="row three" style="margin-top:10px">
-      <button id="llm-save-btn" class="btn-status" type="button">确认</button>
-      <button id="llm-reload-btn" type="button">重新读取</button>
+    <div class="row three" style="margin-bottom:8px">
+      <button id="llm-reload-btn" type="button">刷新列表</button>
+      <button id="llm-new-btn" type="button">新增</button>
       <span></span>
+    </div>
+    <div id="llm-profiles" class="profile-list"><div class="empty">打开后读取已保存配置</div></div>
+    <div class="wifi-form">
+      <input id="llm-edit-id" type="hidden" value="">
+      <div class="llm-grid">
+        <label>名称<input id="llm-name" type="text" maxlength="32" placeholder="例如 2api / 本地" autocomplete="off"></label>
+        <label>Base URL<input id="llm-base-url" type="text" maxlength="256" placeholder="https://api.example.com 或 .../v1" autocomplete="off"></label>
+        <label>API Key<input id="llm-api-key" type="password" maxlength="256" placeholder="sk-...（留空或星号=不改原密钥）" autocomplete="off"></label>
+        <label>模型名称<input id="llm-model" type="text" maxlength="128" placeholder="模型名" autocomplete="off"></label>
+      </div>
+      <div class="row three" style="margin-top:10px">
+        <button id="llm-save-btn" class="btn-status" type="button">保存</button>
+        <button id="llm-save-use-btn" class="btn-speak" type="button">保存并启用</button>
+        <span></span>
+      </div>
     </div>
     <div id="llm-result" class="send-result" style="margin-top:8px"></div>
     </div>
@@ -411,6 +435,15 @@ function setStatusGif(status){
   img.dataset.status=key;
   img.src=gifUrl(key);
 }
+function applyFace(status, source){
+  const key=String(status||'IDLE').toUpperCase();
+  $('status').textContent=statusText(key);
+  setStatusGif(key);
+  if(source!=null){
+    const src=String(source||'BOT').toUpperCase();
+    $('source').textContent='来源：'+(sourceNames[src]||src||'BOT');
+  }
+}
 const sourceNames={PI:'Pi',CURSOR:'Cursor',UNKNOWN:'未知',BOT:'BOT',VOICE:'Voice'};
 const linkNames={ONLINE:'在线',CONNECTED:'已连接',OFFLINE:'离线',CHECKING:'检查中',UNKNOWN:'未知'};
 const quickStatus=[
@@ -423,15 +456,16 @@ const quickStatus=[
   {label:'错误',status:'ERROR',source:'VOICE'}
 ];
 const quickText=[
-  {label:'正在修改代码',text:'正在修改代码',source:'CURSOR'},
-  {label:'请稍等片刻',text:'请稍等片刻',source:'BOT'},
-  {label:'聆听中',text:'聆听中',source:'VOICE'},
-  {label:'回复中',text:'回复中',source:'VOICE'},
-  {label:'语音问候',text:'你好，有什么可以帮你的？',source:'VOICE'},
-  {label:'清空文字',text:'',source:'BOT'}
+  {label:'正在修改代码',text:'正在修改代码',source:'VOICE',role:'assistant'},
+  {label:'请稍等片刻',text:'请稍等片刻',source:'VOICE',role:'assistant'},
+  {label:'聆听中',text:'聆听中',source:'VOICE',role:'assistant'},
+  {label:'回复中',text:'回复中',source:'VOICE',role:'assistant'},
+  {label:'语音问候',text:'你好，有什么可以帮你的？',source:'VOICE',role:'assistant'},
+  {label:'清空文字',text:'',source:'VOICE'}
 ];
 let backendLogs=[];
 let volumeDragging=false;
+let ttsVoiceSaving=false;
 let volumeSaveTimer=null;
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function statusText(v){return statusNames[v]||v||'未知'}
@@ -505,11 +539,15 @@ async function sendStatus(){
     btn.disabled=false;
   }
 }
+let pendingTextRole='';
 async function sendText(speak=false){
   const btn=$(speak?'send-speak-btn':'send-text-btn');
   const other=$(speak?'send-text-btn':'send-speak-btn');
   const result=$('text-result');
-  const payload={text:$('send-text').value,source:$('text-source').value,speak:!!speak};
+  const payload={text:$('send-text').value,source:'VOICE',speak:!!speak};
+  if(pendingTextRole) payload.role=pendingTextRole;
+  if(!payload.role) payload.role='assistant';
+  $('text-source').value='VOICE';
   btn.disabled=true;
   other.disabled=true;
   result.className='send-result';
@@ -629,10 +667,12 @@ async function refresh(){
     setPill('pill-usb',(dev.connected)?'设备已连接':'设备离线',dev.connected?'ok':'bad');
     setPill('pill-wifi','推送 '+linkText(w.status||'CHECKING'),w.status==='CONNECTED'?'ok':w.status==='CHECKING'?'warn':'bad');
     const offline=!dev.connected;
-    const showStatus=offline?'OFFLINE':e.status;
-    $('status').textContent=statusText(showStatus);
-    setStatusGif(showStatus);
-    $('source').textContent='来源：'+(offline?'设备':(sourceNames[e.source]||e.source||'BOT'));
+    if(offline){
+      applyFace('OFFLINE', null);
+      $('source').textContent='来源：设备';
+    }else{
+      applyFace((d.display&&d.display.status)||e.status, (d.display&&d.display.source)||e.source||'BOT');
+    }
     $('text').textContent=offline?'设备未连接后端':(e.text||'暂无附加信息');
     $('target').textContent=w.target||'未启用';
     $('failures').textContent=w.failures??0;
@@ -644,7 +684,7 @@ async function refresh(){
     if(Array.isArray(d.logs)) setBackendLogs(d.logs);
     if(!volumeDragging && d.volume_percent!=null) setVolumeUi(d.volume_percent);
     if(d.voice_enabled!=null) setVoiceUi(d.voice_enabled);
-    if(d.llm) setLlmUi(d.llm);
+    if(!ttsVoiceSaving && d.tts_voice!=null) setTtsVoiceUi(d.tts_voice, d.tts_voices);
     $('updated').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN');
   }catch{
     $('updated').textContent='后端不可用';
@@ -665,13 +705,21 @@ function connectLogsWs(){
     try{
       const msg=JSON.parse(ev.data);
       if(msg.type==='backend_log') prependBackendLog(msg);
+      else if(msg.type==='display'){
+        const st=String(msg.status||msg.gif||'').toUpperCase();
+        if(st) applyFace(st, msg.source);
+      }
     }catch{}
   });
   ws.addEventListener('close',()=>setTimeout(connectLogsWs,2000));
   ws.addEventListener('error',()=>ws.close());
 }
 renderQuickButtons('quick-status',quickStatus,item=>{$('send-status').value=item.status;$('status-source').value=item.source});
-renderQuickButtons('quick-text',quickText,item=>{$('send-text').value=item.text;$('text-source').value=item.source});
+renderQuickButtons('quick-text',quickText,item=>{
+  $('send-text').value=item.text;
+  $('text-source').value=item.source||'VOICE';
+  pendingTextRole=item.role||(item.text?'assistant':'');
+});
 $('send-status-btn').addEventListener('click',sendStatus);
 $('send-text-btn').addEventListener('click',()=>sendText(false));
 $('send-speak-btn').addEventListener('click',()=>sendText(true));
@@ -693,6 +741,56 @@ function setVoiceUi(enabled){
 async function saveVoiceEnabled(enabled){
   const data=await postJson('/api/voice',{voice_enabled:!!enabled});
   setVoiceUi(data.voice_enabled);
+}
+function setTtsVoiceUi(voice, voices){
+  const sel=$('tts-voice');
+  if(!sel) return;
+  if(Array.isArray(voices) && voices.length){
+    const fp=voices.map(item=>String(item.id||'')).join('|');
+    const cur=voice || sel.value;
+    if(sel.dataset.fp!==fp){
+      const opt=item=>{
+        const id=String(item.id||'');
+        const label=String(item.label||id);
+        const safeId=id.replace(/"/g,'');
+        const safeLabel=label.replace(/[<>&]/g,ch=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[ch]));
+        return `<option value="${safeId}">${safeLabel}</option>`;
+      };
+      const local=voices.filter(item=>item.local);
+      const online=voices.filter(item=>!item.local);
+      let html='';
+      if(local.length) html+=`<optgroup label="本地系统（离线）">${local.map(opt).join('')}</optgroup>`;
+      if(online.length) html+=`<optgroup label="微软在线">${online.map(opt).join('')}</optgroup>`;
+      sel.innerHTML=html||voices.map(opt).join('');
+      sel.dataset.fp=fp;
+    }
+    if(cur){
+      if(!Array.from(sel.options).some(o=>o.value===cur)){
+        const extra=document.createElement('option');
+        extra.value=cur;
+        extra.textContent=cur;
+        sel.appendChild(extra);
+      }
+      sel.value=cur;
+    }
+  }else if(voice){
+    if(!Array.from(sel.options).some(opt=>opt.value===voice)){
+      const opt=document.createElement('option');
+      opt.value=voice;
+      opt.textContent=voice;
+      sel.appendChild(opt);
+    }
+    sel.value=voice;
+  }
+}
+async function saveTtsVoice(voice){
+  ttsVoiceSaving=true;
+  try{
+    const data=await postJson('/api/tts-voice',{tts_voice:String(voice||'')});
+    setTtsVoiceUi(data.tts_voice, data.voices);
+  }finally{
+    ttsVoiceSaving=false;
+  }
 }
 async function saveVolume(p){
   const data=await postJson('/api/volume',{volume_percent:Number(p)});
@@ -724,10 +822,88 @@ $('voice-toggle-btn').addEventListener('click',()=>{
     $('text-result').textContent=String(err.message||err);
   });
 });
+$('tts-voice').addEventListener('change',()=>{
+  saveTtsVoice($('tts-voice').value).catch(err=>{
+    $('text-result').className='send-result bad';
+    $('text-result').textContent=String(err.message||err);
+  });
+});
 
 let wifiProfiles=[];
 let wifiActive=0;
-let llmKeyDirty=false;
+let llmProfiles=[];
+let llmActive='';
+function llmResult(ok, text){
+  const el=$('llm-result');
+  if(!el) return;
+  el.className='send-result '+(ok?'ok':'bad');
+  el.textContent=text;
+}
+function fillLlmForm(p){
+  if(!p) return;
+  $('llm-edit-id').value=p.id||'';
+  $('llm-name').value=p.name||'';
+  $('llm-base-url').value=p.base_url||'';
+  $('llm-model').value=p.model||'';
+  $('llm-api-key').value=p.api_key||'';
+}
+function clearLlmForm(){
+  $('llm-edit-id').value='';
+  $('llm-name').value='';
+  $('llm-base-url').value='';
+  $('llm-model').value='';
+  $('llm-api-key').value='';
+}
+function llmFormPayload(activate){
+  const payload={
+    name:$('llm-name').value.trim(),
+    base_url:$('llm-base-url').value.trim(),
+    api_key:$('llm-api-key').value,
+    model:$('llm-model').value.trim(),
+    activate:!!activate,
+  };
+  const id=$('llm-edit-id').value.trim();
+  if(id) payload.id=id;
+  if(!payload.base_url||!payload.model) throw new Error('Base URL 与模型名称不能为空');
+  return payload;
+}
+function applyLlmStore(data){
+  const store=data&&data.llm?data.llm:data;
+  if(!store) return store;
+  llmProfiles=Array.isArray(store.profiles)?store.profiles:[];
+  llmActive=store.active||'';
+  renderLlmProfiles();
+  return store;
+}
+function renderLlmProfiles(){
+  const box=$('llm-profiles');
+  if(!box) return;
+  if(!llmProfiles.length){ box.innerHTML='<div class="empty">还没有 LLM 配置</div>'; return; }
+  box.innerHTML=llmProfiles.map(p=>{
+    const on=p.id===llmActive;
+    return '<div class="profile-item'+(on?' active':'')+'"><div class="meta"><b style="color:var(--text)">'+esc(p.name||p.model||'未命名')+
+      (on?'<span class="tag">当前</span>':'')+
+      '</b><br>'+esc(p.model||'')+' · '+esc(p.base_url||'')+'</div><div class="actions">'+
+      '<button type="button" data-llm="edit" data-id="'+esc(p.id)+'">编辑</button>'+
+      (on?'':'<button type="button" data-llm="use" data-id="'+esc(p.id)+'">启用</button>')+
+      '<button type="button" data-llm="del" data-id="'+esc(p.id)+'">删除</button></div></div>';
+  }).join('');
+}
+async function reloadLlm(){
+  const data=await fetch('/api/llm',{cache:'no-store'}).then(r=>r.json());
+  const store=applyLlmStore(data);
+  const cur=llmProfiles.find(p=>p.id===llmActive)||llmProfiles[0];
+  if(cur) fillLlmForm(cur); else clearLlmForm();
+  return store;
+}
+async function saveLlm(activate){
+  const payload=llmFormPayload(activate);
+  const data=await postJson('/api/llm',payload);
+  const store=applyLlmStore(data);
+  const cur=llmProfiles.find(p=>p.id===(store.saved_id||payload.id||store.active));
+  if(cur) fillLlmForm(cur);
+  return store;
+}
 function fillWifiForm(p){
   if(!p) return;
   $('wifi-edit-index').value = (p.index===0 || p.index) ? String(p.index) : '';
@@ -781,22 +957,6 @@ function renderWifiProfiles(list, active){
       (on?'':'<button type="button" data-act="use" data-index="'+idx+'">启用</button>')+
       '<button type="button" data-act="del" data-index="'+idx+'">删除</button></div></div>';
   }).join('');
-}
-function setLlmUi(cfg){
-  if(!cfg) return;
-  $('llm-base-url').value=cfg.base_url||'';
-  $('llm-model').value=cfg.model||'';
-  if(!llmKeyDirty) $('llm-api-key').value=cfg.api_key||'';
-}
-async function reloadLlm(){
-  const data=await fetch('/api/llm',{cache:'no-store'}).then(r=>r.json());
-  llmKeyDirty=false; setLlmUi(data); return data;
-}
-async function saveLlm(){
-  const payload={ base_url:$('llm-base-url').value.trim(), api_key:$('llm-api-key').value, model:$('llm-model').value.trim() };
-  if(!payload.base_url||!payload.model) throw new Error('Base URL 与模型名称不能为空');
-  const data=await postJson('/api/llm',payload);
-  llmKeyDirty=false; setLlmUi(data.llm||data); return data;
 }
 
 connectLogsWs();
@@ -853,14 +1013,46 @@ $('wifi-profiles')?.addEventListener('click',ev=>{
     });
   }
 });
-$('llm-api-key')?.addEventListener('input',()=>{llmKeyDirty=true});
 $('llm-save-btn')?.addEventListener('click',()=>{
-  saveLlm().then(()=>{ $('llm-result').className='send-result ok'; $('llm-result').textContent='已保存并生效'; })
-  .catch(err=>{ $('llm-result').className='send-result bad'; $('llm-result').textContent=String(err.message||err); });
+  saveLlm(false).then(()=>llmResult(true,'已保存（未切换当前启用项）'))
+  .catch(err=>llmResult(false,String(err.message||err)));
+});
+$('llm-save-use-btn')?.addEventListener('click',()=>{
+  saveLlm(true).then(()=>llmResult(true,'已保存并启用'))
+  .catch(err=>llmResult(false,String(err.message||err)));
 });
 $('llm-reload-btn')?.addEventListener('click',()=>{
-  reloadLlm().then(()=>{ $('llm-result').className='send-result ok'; $('llm-result').textContent='已重新读取 llm.json'; })
-  .catch(err=>{ $('llm-result').className='send-result bad'; $('llm-result').textContent=String(err.message||err); });
+  reloadLlm().then(()=>llmResult(true,'已重新读取'))
+  .catch(err=>llmResult(false,String(err.message||err)));
+});
+$('llm-new-btn')?.addEventListener('click',()=>{
+  clearLlmForm();
+  llmResult(true,'填写后点保存，会新增一条而不会覆盖已有配置');
+});
+$('llm-profiles')?.addEventListener('click',ev=>{
+  const btn=ev.target.closest('button[data-llm]'); if(!btn) return;
+  const id=btn.getAttribute('data-id')||'';
+  const act=btn.getAttribute('data-llm');
+  const p=llmProfiles.find(x=>x.id===id);
+  if(act==='edit'){
+    fillLlmForm(p);
+    llmResult(true,'正在编辑「'+(p&&p.name||'')+'」，改完点保存');
+  } else if(act==='use'){
+    postJson('/api/llm/activate',{id}).then(data=>{
+      applyLlmStore(data);
+      llmResult(true,'已启用「'+(p&&p.name||id)+'」');
+    }).catch(err=>llmResult(false,String(err.message||err)));
+  } else if(act==='del'){
+    if(!confirm('确认删除这条 LLM 配置？')) return;
+    postJson('/api/llm/delete',{id}).then(data=>{
+      const store=applyLlmStore(data);
+      if($('llm-edit-id').value===id){
+        const cur=llmProfiles.find(x=>x.id===store.active)||llmProfiles[0];
+        if(cur) fillLlmForm(cur); else clearLlmForm();
+      }
+      llmResult(true,'已删除');
+    }).catch(err=>llmResult(false,String(err.message||err)));
+  }
 });
 
 $('ble-host')?.addEventListener('input',()=>{$('ble-host').dataset.touched='1';});
@@ -872,6 +1064,7 @@ function openModal(name){
   const el=$('modal-'+name);
   if(el) el.classList.add('open');
   if(name==='wifi') pullProfilesFromDevice();
+  if(name==='llm') reloadLlm().catch(err=>llmResult(false,String(err.message||err)));
 }
 document.querySelectorAll('[data-modal]').forEach(btn=>{
   btn.addEventListener('click',()=>openModal(btn.getAttribute('data-modal')));

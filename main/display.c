@@ -2,6 +2,7 @@
 
 #include "board_pins.h"
 #include "esp_heap_caps.h"
+#include "mem_utils.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
@@ -81,14 +82,17 @@ esp_err_t display_init(void)
     lv_init();
 
     const size_t partial_bytes = LCD_W * PARTIAL_BUF_LINES * sizeof(lv_color_t);
-    /* Prefer SPIRAM: BT controller needs contiguous internal DRAM. */
-    lv_color_t *buf1 = heap_caps_malloc(partial_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-    lv_color_t *buf2 = heap_caps_malloc(partial_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-    if (!buf1) {
-        buf1 = heap_caps_malloc(partial_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    }
-    if (!buf2) {
-        buf2 = heap_caps_malloc(partial_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    /* Prefer SPIRAM only: BT controller needs contiguous internal DRAM. */
+    lv_color_t *buf1 = psram_malloc(partial_bytes);
+    lv_color_t *buf2 = psram_malloc(partial_bytes);
+    if (!buf1 || !buf2) {
+        ESP_LOGW(TAG, "PSRAM alloc failed, trying internal (may affect BLE)");
+        if (!buf1) {
+            buf1 = dram_malloc(partial_bytes);
+        }
+        if (!buf2) {
+            buf2 = dram_malloc(partial_bytes);
+        }
     }
     if (!buf1 || !buf2) {
         ESP_LOGE(TAG, "LVGL buffer alloc failed");

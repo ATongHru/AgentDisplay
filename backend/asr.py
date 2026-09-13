@@ -96,6 +96,17 @@ def _pcm_to_mono_s16(pcm: bytes, channels: int, bit_depth: int) -> bytes:
     return mono.tobytes()
 
 
+def normalize_asr_text(text: str) -> str:
+    """Vosk CN emits space-separated characters; glue CJK tokens back together."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    if cjk >= 1:
+        return "".join(text.split())
+    return " ".join(text.split())
+
+
 class VoskStreamRecognizer:
     """Feed PCM as it arrives; call finish() on audio_end."""
 
@@ -130,27 +141,27 @@ class VoskStreamRecognizer:
             del self._buf[:VOSK_CHUNK_BYTES]
             if self._rec.AcceptWaveform(chunk):
                 data = json.loads(self._rec.Result())
-                text = str(data.get("text", "")).strip()
+                text = normalize_asr_text(str(data.get("text", "")))
                 if text:
                     self._parts.append(text)
                 self._partial = ""
             else:
                 data = json.loads(self._rec.PartialResult())
-                self._partial = str(data.get("partial", "")).strip()
+                self._partial = normalize_asr_text(str(data.get("partial", "")))
         return self._partial
 
     def finish(self) -> str:
         if self._finished:
-            return " ".join(self._parts).strip()
+            return normalize_asr_text(" ".join(self._parts))
         self._finished = True
         if self._buf:
             self._rec.AcceptWaveform(bytes(self._buf))
             self._buf.clear()
         data = json.loads(self._rec.FinalResult())
-        text = str(data.get("text", "")).strip()
+        text = normalize_asr_text(str(data.get("text", "")))
         if text:
             self._parts.append(text)
-        result = " ".join(self._parts).strip()
+        result = normalize_asr_text(" ".join(self._parts))
         print(f"[asr] vosk stream done bytes={self._bytes} text={result!r}")
         return result
 
@@ -189,7 +200,7 @@ def transcribe_pcm(pcm: bytes, sample_rate: int = 16000, channels: int = 1, bit_
         return ""
     print(f"[asr] start engine={ASR_ENGINE} bytes={len(pcm)} sr={sample_rate} ch={channels} bits={bit_depth}")
     if ASR_ENGINE == "vosk":
-        text = _transcribe_vosk_pcm(pcm, sample_rate, channels, bit_depth)
+        text = normalize_asr_text(_transcribe_vosk_pcm(pcm, sample_rate, channels, bit_depth))
         print(f"[asr] vosk text={text!r}")
         return text
     wav_path = _pcm_to_wav_path(pcm, sample_rate, channels, bit_depth)

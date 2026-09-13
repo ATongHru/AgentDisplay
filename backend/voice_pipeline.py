@@ -12,16 +12,16 @@ from asr import transcribe_pcm, warmup as asr_warmup
 from chat_context import chat_context
 from llm import llm_chat, llm_configured
 from llm_history import append_record
-from settings_store import get_volume_percent
+from settings_store import get_volume_percent, get_tts_voice
+from tts_sapi import is_local_voice, synth_local_pcm
 from voice_session import SessionPhase, VoiceSession, session_store
 
-TTS_VOICE = os.getenv("TTS_VOICE", "zh-CN-XiaoxiaoNeural")
 VOICE_TTS = os.getenv("VOICE_TTS", "1").strip() not in {"0", "false", "False", ""}
 # Same edge-tts engine; faster speech shortens synthesis + transfer.
 TTS_RATE = os.getenv("TTS_RATE", "+20%").strip() or "+20%"
 
 TranscriptFn = Callable[..., None]
-PushFn = Callable[[str, str, str], None]
+PushFn = Callable[..., None]
 AppendFn = Callable[..., None]
 
 
@@ -57,7 +57,10 @@ class _DeltaCoalescer:
 
 
 def warmup() -> None:
-    print(f"[voice] TTS={'on' if VOICE_TTS else 'off'} voice={TTS_VOICE} rate={TTS_RATE}")
+    from tts_sapi import list_local_voices
+
+    print(f"[voice] TTS={'on' if VOICE_TTS else 'off'} voice={get_tts_voice()} rate={TTS_RATE}")
+    list_local_voices()
     asr_warmup()
 
 
@@ -106,24 +109,71 @@ def _split_tts_parts(text: str) -> list[str]:
     return merged or [text]
 
 
-async def tts_to_pcm(text: str) -> bytes:
-    import edge_tts
+def _tts_speakable(text: str) -> bool:
+    for ch in text:
+        if "\u4e00" <= ch <= "\u9fff" or ch.isalnum():
+            return True
+    return False
 
-    if not text.strip():
+
+async def tts_to_pcm(text: str) -> bytes:
+    text = (text or "").strip()
+    if not text or not _tts_speakable(text):
         return b""
 
-    communicate = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE)
-    mp3 = bytearray()
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            mp3.extend(chunk["data"])
-    if not mp3:
-        raise RuntimeError("TTS 无音频")
-    pcm = await asyncio.to_thread(_mp3_to_pcm16k_mono, bytes(mp3))
-    # Volume is applied on-device only (avoid double attenuation with firmware gain).
-    volume = get_volume_percent()
-    print(f"[tts] chars={len(text)} mp3={len(mp3)} pcm={len(pcm)} rate={TTS_RATE} device_volume={volume}%")
-    return pcm
+    preferred = get_tts_voice()
+    if is_local_voice(preferred):
+        try:
+            pcm = await asyncio.to_thread(synth_local_pcm, text, preferred)
+        except Exception as exc:
+            print(f"[tts] {preferred} sapi failed ({exc})")
+            return b""
+        volume = get_volume_percent()
+        print(
+            f"[tts] chars={len(text)} pcm={len(pcm)} "
+            f"voice={preferred} engine=sapi device_volume={volume}%"
+        )
+        return pcm
+
+    import edge_tts
+
+    async def _synth(voice: str, rate: str) -> bytes:
+        communicate = edge_tts.Communicate(text, voice, rate=rate)
+        mp3 = bytearray()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                mp3.extend(chunk["data"])
+        if not mp3:
+            raise RuntimeError("TTS 无音频")
+        pcm = await asyncio.to_thread(_mp3_to_pcm16k_mono, bytes(mp3))
+        volume = get_volume_percent()
+        print(
+            f"[tts] chars={len(text)} mp3={len(mp3)} pcm={len(pcm)} "
+            f"voice={voice} rate={rate} device_volume={volume}%"
+        )
+        return pcm
+
+    attempts = (
+        (preferred, TTS_RATE),
+        (preferred, "+0%"),
+        ("zh-CN-XiaoxiaoNeural", TTS_RATE),
+        ("zh-CN-XiaoxiaoNeural", "+0%"),
+    )
+    seen: set[tuple[str, str]] = set()
+    last_exc: Exception | None = None
+    for voice, rate in attempts:
+        key = (voice, rate)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            return await _synth(voice, rate)
+        except Exception as exc:
+            last_exc = exc
+            print(f"[tts] {voice} rate={rate} failed ({exc})")
+            await asyncio.sleep(0.25)
+    print(f"[tts] skip unsynthable {text[:32]!r} err={last_exc}")
+    return b""
 
 
 async def synthesize_to_session(session: VoiceSession, text: str) -> int:
@@ -204,7 +254,7 @@ def run_pipeline(
             session.set_asr(asr_text)
             if on_transcript:
                 on_transcript(session_id, asr_text, "user")
-            push_event("THINKING", asr_text, "VOICE")
+            push_event("THINKING", asr_text, "VOICE", "user")
 
             if not llm_configured():
                 session.mark_done()
@@ -230,7 +280,7 @@ def run_pipeline(
                             last_cut = i + 1
                 if final:
                     piece = chunk[last_cut:].strip()
-                    if piece:
+                    if _tts_speakable(piece) and len(piece) >= 2:
                         out.append(piece)
                         last_cut = len(chunk)
                 tts_idx += last_cut
@@ -243,7 +293,11 @@ def run_pipeline(
                     if part is None:
                         break
                     t0 = time.monotonic()
-                    pcm = await tts_to_pcm(part)
+                    try:
+                        pcm = await tts_to_pcm(part)
+                    except Exception as exc:
+                        print(f"[tts] skip part {part[:24]!r}: {exc}")
+                        continue
                     dt = time.monotonic() - t0
                     if not pcm:
                         continue
@@ -317,11 +371,16 @@ def run_pipeline(
                 session.append_llm(reply)
                 if on_transcript:
                     on_transcript(session_id, reply, "assistant")
+                if push_append and reply and not started:
+                    # Non-streaming LLM: show the full reply once. Do not reset after
+                    # deltas — that jumped the 2-line caption back to the beginning.
+                    push_append(reply, "VOICE", True, "assistant")
                 tok = int((usage or {}).get("total_tokens") or 0)
                 print(f"[voice] llm {session_id}: tokens={tok} latency_ms={latency_ms} {reply[:80]}")
                 if not VOICE_TTS:
                     session.mark_done()
-                    push_event("IDLE", reply, "VOICE")
+                    if not started:
+                        push_event("IDLE", reply, "VOICE")
                     return
                 for part in take_ready(reply, True):
                     await tts_q.put(part)
@@ -336,6 +395,9 @@ def run_pipeline(
                         await worker
                     except Exception:
                         pass
+                session = session_store.get(session_id)
+                if session is not None and VOICE_TTS:
+                    session.finish_tts()
         except Exception as exc:
             import traceback
 

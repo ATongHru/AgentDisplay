@@ -18,6 +18,7 @@
 #include "driver/gpio.h"
 #include "driver/usb_serial_jtag.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "soc/usb_serial_jtag_struct.h"
 #include "freertos/event_groups.h"
 #include "lwip/inet.h"
@@ -25,6 +26,7 @@
 #include "sdkconfig.h"
 #include "ui.h"
 #include "voice.h"
+#include "mem_utils.h"
 
 static const char *TAG = "net";
 
@@ -33,9 +35,12 @@ static const char *TAG = "net";
 #define SESSION_OK BIT2
 
 static EventGroupHandle_t s_events;
+static SemaphoreHandle_t s_ws_tx;
 static esp_websocket_client_handle_t s_ws;
 static bool s_wifi;
 static bool s_ws_on;
+static uint32_t s_ws_up_ms;
+static uint32_t s_display_sent_ms;
 static int s_rssi = -100;
 static bool s_expect_audio;
 static bool s_audio_end;
@@ -53,6 +58,40 @@ static uint32_t s_usj_sof;
 static uint32_t s_usj_ok_ms;
 
 #define USJ_HOLD_MS 400
+#define DISPLAY_QUIET_MS 400u
+#define DISPLAY_MIN_GAP_MS 120u
+
+static bool ws_send_text(const char *data, int len, int timeout_ms)
+{
+    if (!s_ws || !s_ws_on || !data || len <= 0) {
+        return false;
+    }
+    if (!s_ws_tx || xSemaphoreTake(s_ws_tx, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return false;
+    }
+    int ret = -1;
+    if (s_ws && s_ws_on && esp_websocket_client_is_connected(s_ws)) {
+        ret = esp_websocket_client_send_text(s_ws, data, len, pdMS_TO_TICKS(timeout_ms));
+    }
+    xSemaphoreGive(s_ws_tx);
+    return ret >= 0;
+}
+
+static bool ws_send_bin(const char *data, int len, int timeout_ms)
+{
+    if (!s_ws || !s_ws_on || !data || len <= 0) {
+        return false;
+    }
+    if (!s_ws_tx || xSemaphoreTake(s_ws_tx, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return false;
+    }
+    int ret = -1;
+    if (s_ws && s_ws_on && esp_websocket_client_is_connected(s_ws)) {
+        ret = esp_websocket_client_send_bin(s_ws, data, len, pdMS_TO_TICKS(timeout_ms));
+    }
+    xSemaphoreGive(s_ws_tx);
+    return ret >= 0;
+}
 
 static void apply_time(int64_t epoch)
 {
@@ -177,7 +216,7 @@ static void send_wifi_profiles(void)
     if (!dump) {
         return;
     }
-    esp_websocket_client_send_text(s_ws, dump, strlen(dump), pdMS_TO_TICKS(1000));
+    ws_send_text(dump, (int)strlen(dump), 1000);
     ESP_LOGI(TAG, "sent wifi_profiles count=%u", (unsigned)count);
     free(dump);
 }
@@ -238,7 +277,7 @@ static void send_wifi_profiles_error(const char *detail)
     snprintf(buf, sizeof(buf),
              "{\"type\":\"wifi_profiles\",\"ok\":false,\"error\":\"%s\",\"count\":0,\"active\":0,\"profiles\":[]}",
              detail);
-    esp_websocket_client_send_text(s_ws, buf, strlen(buf), pdMS_TO_TICKS(1000));
+    ws_send_text(buf, (int)strlen(buf), 1000);
 }
 
 static void reply_wifi_profiles(esp_err_t err, bool apply)
@@ -266,7 +305,37 @@ static void send_hello(void)
 {
     char buf[96];
     snprintf(buf, sizeof(buf), "{\"type\":\"hello\",\"role\":\"device\",\"rssi\":%d}", s_rssi);
-    esp_websocket_client_send_text(s_ws, buf, strlen(buf), pdMS_TO_TICKS(1000));
+    ws_send_text(buf, (int)strlen(buf), 1000);
+}
+
+static void send_debug_info(void)
+{
+    if (!s_ws || !s_ws_on) {
+        return;
+    }
+    voice_debug_t vd = {0};
+    voice_fill_debug(&vd);
+    size_t rec_cap = audio_record_capacity();
+    size_t play_cap = audio_play_ring_capacity();
+    size_t rec_used = audio_capture_size();
+    size_t play_used = audio_playback_pending();
+    char buf[640];
+    snprintf(buf, sizeof(buf),
+             "{\"type\":\"debug\",\"dram_free\":%u,\"dram_largest\":%u,"
+             "\"psram_free\":%u,\"psram_largest\":%u,"
+             "\"rec_bytes\":%u,\"rec_cap\":%u,\"play_bytes\":%u,\"play_cap\":%u,"
+             "\"vad_phase\":%d,\"noise_rms\":%.4f,\"noise_peak\":%.4f,"
+             "\"start_rms\":%.4f,\"start_peak\":%.4f,\"last_rms\":%.4f,\"last_peak\":%.4f,"
+             "\"pdm_gain\":%.2f}",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM), (unsigned)rec_used,
+             (unsigned)rec_cap, (unsigned)play_used, (unsigned)play_cap, vd.phase, vd.noise_rms,
+             vd.noise_peak, vd.start_rms_th, vd.start_peak_th, vd.last_rms, vd.last_peak,
+             (double)audio_get_pdm_gain());
+    ws_send_text(buf, (int)strlen(buf), 1000);
+    mem_report(TAG);
 }
 
 static void handle_text(const char *text, int len)
@@ -284,7 +353,7 @@ static void handle_text(const char *text, int len)
         }
     } else if (strcmp(t, "ping") == 0) {
         const char *pong = "{\"type\":\"pong\"}";
-        esp_websocket_client_send_text(s_ws, pong, strlen(pong), pdMS_TO_TICKS(500));
+        ws_send_text(pong, (int)strlen(pong), 100);
     } else if (strcmp(t, "status") == 0 || strcmp(t, "text") == 0 || strcmp(t, "append") == 0) {
         char *dump = cJSON_PrintUnformatted(root);
         if (dump) {
@@ -377,6 +446,8 @@ static void handle_text(const char *text, int len)
         } else {
             reply_wifi_profiles(err, (uint8_t)idx != prev_active);
         }
+    } else if (strcmp(t, "debug") == 0) {
+        send_debug_info();
     } else if (strcmp(t, "error") == 0) {
         ESP_LOGW(TAG, "ws error frame");
     }
@@ -390,6 +461,7 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     esp_websocket_event_data_t *evt = (esp_websocket_event_data_t *)data;
     if (id == WEBSOCKET_EVENT_CONNECTED) {
         s_ws_on = true;
+        s_ws_up_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
         xEventGroupSetBits(s_events, WS_OK);
         send_hello();
         wifi_ap_record_t ap = {0};
@@ -400,7 +472,9 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         ESP_LOGI(TAG, "websocket connected");
     } else if (id == WEBSOCKET_EVENT_DISCONNECTED) {
         s_ws_on = false;
+        s_ws_up_ms = 0;
         xEventGroupClearBits(s_events, WS_OK);
+        voice_on_ws_lost();
         ui_post_link_state(net_usb_ready(), s_wifi, false, voice_is_listening(), audio_playback_is_active(), s_rssi);
     } else if (id == WEBSOCKET_EVENT_DATA) {
         if (evt->op_code == 0x01) {
@@ -531,6 +605,7 @@ static void apply_ip_from_cfg(void)
 esp_err_t net_init(void)
 {
     s_events = xEventGroupCreate();
+    s_ws_tx = xSemaphoreCreateMutex();
     gpio_config_t uart_rx = {
         .pin_bit_mask = 1ULL << PIN_UART0_RX,
         .mode = GPIO_MODE_INPUT,
@@ -658,6 +733,20 @@ void net_loop(void)
         start_ws();
     }
     voice_net_poll();
+    uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    if (net_ws_ready() && s_ws_up_ms != 0 && (now_ms - s_ws_up_ms) >= DISPLAY_QUIET_MS) {
+        char st[24];
+        char src[16];
+        if (ui_take_display_report(st, sizeof(st), src, sizeof(src))) {
+            if ((now_ms - s_display_sent_ms) < DISPLAY_MIN_GAP_MS) {
+                ui_restore_display_report();
+            } else if (!net_ws_send_display(st, src)) {
+                ui_restore_display_report();
+            } else {
+                s_display_sent_ms = now_ms;
+            }
+        }
+    }
     if (s_wifi) {
         wifi_ap_record_t ap = {0};
         if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
@@ -691,6 +780,22 @@ bool net_usb_ready(void)
 }
 int net_rssi(void) { return s_rssi; }
 
+bool net_ws_send_display(const char *status, const char *source)
+{
+    if (!net_ws_ready() || !status || !status[0]) {
+        return false;
+    }
+    const char *src = (source && source[0]) ? source : "BOT";
+    char buf[160];
+    int n = snprintf(buf, sizeof(buf),
+                     "{\"type\":\"display\",\"status\":\"%s\",\"source\":\"%s\",\"gif\":\"%s\"}",
+                     status, src, status);
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        return false;
+    }
+    return ws_send_text(buf, n, 100);
+}
+
 bool net_ws_send_audio_upload(const uint8_t *pcm, size_t pcm_len, char *session_id, size_t session_id_len)
 {
     if (!net_ws_ready() || !pcm || pcm_len == 0) {
@@ -709,9 +814,14 @@ bool net_ws_send_audio_upload(const uint8_t *pcm, size_t pcm_len, char *session_
     }
     xEventGroupClearBits(s_events, SESSION_OK);
     s_session[0] = '\0';
-    esp_websocket_client_send_text(s_ws, txt, (int)strlen(txt), pdMS_TO_TICKS(2000));
+    bool ok = ws_send_text(txt, (int)strlen(txt), 2000);
     free(txt);
-    esp_websocket_client_send_bin(s_ws, (const char *)pcm, (int)pcm_len, pdMS_TO_TICKS(5000));
+    if (!ok) {
+        return false;
+    }
+    if (!ws_send_bin((const char *)pcm, (int)pcm_len, 5000)) {
+        return false;
+    }
     EventBits_t bits = xEventGroupWaitBits(s_events, SESSION_OK, pdTRUE, pdTRUE, pdMS_TO_TICKS(2500));
     if (!(bits & SESSION_OK) || s_session[0] == '\0') {
         return false;
@@ -740,8 +850,11 @@ bool net_ws_send_audio_stream_begin(char *session_id, size_t session_id_len)
     }
     xEventGroupClearBits(s_events, SESSION_OK);
     s_session[0] = '\0';
-    esp_websocket_client_send_text(s_ws, txt, (int)strlen(txt), pdMS_TO_TICKS(2000));
+    bool ok = ws_send_text(txt, (int)strlen(txt), 2000);
     free(txt);
+    if (!ok) {
+        return false;
+    }
     EventBits_t bits = xEventGroupWaitBits(s_events, SESSION_OK, pdTRUE, pdTRUE, pdMS_TO_TICKS(2500));
     if (!(bits & SESSION_OK) || s_session[0] == '\0') {
         return false;
@@ -756,8 +869,7 @@ bool net_ws_send_audio_binary(const uint8_t *pcm, size_t pcm_len)
     if (!net_ws_ready() || !pcm || pcm_len == 0) {
         return false;
     }
-    int ret = esp_websocket_client_send_bin(s_ws, (const char *)pcm, (int)pcm_len, pdMS_TO_TICKS(5000));
-    return ret >= 0;
+    return ws_send_bin((const char *)pcm, (int)pcm_len, 5000);
 }
 
 bool net_ws_send_audio_end(const char *session_id, size_t total_bytes, bool discard)
@@ -779,7 +891,7 @@ bool net_ws_send_audio_end(const char *session_id, size_t total_bytes, bool disc
     if (!txt) {
         return false;
     }
-    int ret = esp_websocket_client_send_text(s_ws, txt, (int)strlen(txt), pdMS_TO_TICKS(2000));
+    bool ok = ws_send_text(txt, (int)strlen(txt), 2000);
     free(txt);
-    return ret >= 0;
+    return ok;
 }

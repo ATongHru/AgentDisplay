@@ -12,6 +12,7 @@ idf_component_register(
         "voice.c"
         "font_loader.c"
         "font_status_icons.c"
+        "mem_utils.c"
     INCLUDE_DIRS "."
     REQUIRES
         driver

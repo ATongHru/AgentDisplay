@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 #include "ui.h"
 #include "voice.h"
+#include "mem_utils.h"
 
 static const char *TAG = "app";
 
@@ -94,6 +95,7 @@ void app_main(void)
     ESP_ERROR_CHECK(btn_boot_init());
     ESP_ERROR_CHECK(net_init());
     voice_init();
+    mem_report("boot");
 
     xTaskCreatePinnedToCore(audio_task, "audio", 8192, NULL, 6, NULL, 0);
     xTaskCreatePinnedToCore(net_task, "net", 8192, NULL, 4, NULL, 0);

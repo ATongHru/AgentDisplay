@@ -15,6 +15,8 @@ AUDIO_BYTES_PER_SAMPLE = 2
 AUDIO_SEND_INTERVAL_SEC = 0.02
 AUDIO_BURST_BYTES = 16384
 VOICE_BUSY_TIMEOUT_SEC = 55.0
+DEVICE_PING_SEC = 2.0
+DEVICE_STALE_SEC = 5.0
 from typing import Any, Callable
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -39,12 +41,14 @@ class DeviceState:
 class WsHub:
     def __init__(
         self,
-        push_status: Callable[[str, str, str], None],
+        push_status: Callable[..., None],
         on_transcript: Callable[[str, str], None] | None = None,
     ):
         self._push_status = push_status
         self._on_transcript = on_transcript
         self._on_device_connect: Callable[[WsHub], Any] | None = None
+        self._on_device_disconnect: Callable[[], None] | None = None
+        self._on_device_display: Callable[[str, str], Any] | None = None
         self._device = DeviceState()
         self._dashboards: set[WebSocket] = set()
         self._lock = asyncio.Lock()
@@ -58,12 +62,19 @@ class WsHub:
         self._push_append: Callable[..., None] | None = None
         self._profiles_future: asyncio.Future | None = None
         self._last_asr_partial_ts = 0.0
+        self._last_device_ping = 0.0
 
     def set_push_append(self, callback: Callable[..., None] | None) -> None:
         self._push_append = callback
 
     def set_on_device_connect(self, callback: Callable[[WsHub], Any]) -> None:
         self._on_device_connect = callback
+
+    def set_on_device_disconnect(self, callback: Callable[[], None] | None) -> None:
+        self._on_device_disconnect = callback
+
+    def set_on_device_display(self, callback: Callable[[str, str], Any] | None) -> None:
+        self._on_device_display = callback
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -72,9 +83,17 @@ class WsHub:
     def loop(self) -> asyncio.AbstractEventLoop | None:
         return self._loop
 
+    def _device_is_live(self) -> bool:
+        if self._device.websocket is None:
+            return False
+        seen = self._device.last_seen
+        if seen <= 0:
+            return False
+        return (time.time() - seen) <= DEVICE_STALE_SEC
+
     @property
     def device_connected(self) -> bool:
-        return self._device.websocket is not None
+        return self._device_is_live()
 
     @property
     def device_last_seen(self) -> float:
@@ -117,8 +136,10 @@ class WsHub:
         await websocket.send_json({"type": "ack", "role": role, "server_time": int(time.time())})
 
     async def disconnect(self, websocket: WebSocket) -> None:
+        dropped_device = False
         async with self._lock:
             if self._device.websocket is websocket:
+                dropped_device = True
                 self._device.websocket = None
                 self._device.waiting_audio = None
                 self._device.stream_session_id = None
@@ -130,6 +151,9 @@ class WsHub:
                     fut.set_exception(RuntimeError("设备已断开"))
                 self._profiles_future = None
             self._dashboards.discard(websocket)
+        if dropped_device and self._on_device_disconnect:
+            self._on_device_disconnect()
+            await self._broadcast_dashboard({"type": "display", "status": "OFFLINE", "source": "BOT", "gif": "OFFLINE"})
 
     async def handle_text(self, websocket: WebSocket, raw: str) -> None:
         try:
@@ -139,10 +163,12 @@ class WsHub:
             return
 
         msg_type = msg.get("type")
+        if websocket is self._device.websocket:
+            self._device.last_seen = time.time()
         if msg_type == "ping":
-            if websocket is self._device.websocket:
-                self._device.last_seen = time.time()
             await self._send_ws_json(websocket, {"type": "pong", "server_time": int(time.time())})
+            return
+        if msg_type == "pong":
             return
 
         if msg_type == "hello":
@@ -173,6 +199,18 @@ class WsHub:
                 return
             self._device.last_seen = time.time()
             await self._finish_audio_stream(websocket, msg)
+            return
+
+        if msg_type == "display":
+            if websocket is not self._device.websocket:
+                return
+            status = str(msg.get("status") or "").strip()
+            source = str(msg.get("source") or "BOT").strip()
+            snapshot = None
+            if self._on_device_display:
+                snapshot = self._on_device_display(status, source)
+            payload = {"type": "display", **(snapshot or {"status": status, "source": source, "gif": status})}
+            await self._broadcast_dashboard(payload)
             return
 
         if msg_type == "status":
@@ -211,7 +249,7 @@ class WsHub:
                 if now - self._last_asr_partial_ts >= 0.2:
                     self._last_asr_partial_ts = now
                     await self.push_append_event(
-                        {"text": partial, "source": "VOICE", "reset": True}
+                        {"text": partial, "source": "VOICE", "reset": True, "role": "user"}
                     )
             return
 
@@ -359,7 +397,9 @@ class WsHub:
             self._push_status_threadsafe("IDLE", detail, "VOICE")
             return
         session.mark_stream_asr(text)
-        self._push_status_threadsafe("THINKING", text or "正在处理…", "VOICE")
+        self._push_status_threadsafe(
+            "THINKING", text or "正在处理…", "VOICE", "user" if text else None
+        )
         start_pipeline(
             session.session_id,
             self._push_status_threadsafe,
@@ -387,6 +427,8 @@ class WsHub:
             }
         )
         print(f"[voice] pushed enabled={value}")
+        if not value:
+            self._abort_listen_stream("voice disabled")
 
     async def request_wifi_profiles(self, timeout: float = 5.0) -> dict[str, Any]:
         return await self.request_wifi_command({"type": "get_wifi_profiles"}, timeout=timeout)
@@ -420,6 +462,20 @@ class WsHub:
             "active": int(msg.get("active") or 0),
             "profiles": cleaned,
         }
+
+    def _abort_listen_stream(self, reason: str) -> None:
+        session_id = self._device.stream_session_id
+        self._device.stream_session_id = None
+        self._device.stream_asr = None
+        if not session_id:
+            return
+        session = session_store.get(session_id)
+        if session is not None:
+            session.mark_done()
+        self._session_device.pop(session_id, None)
+        print(f"[voice] abort listen session={session_id} {reason}")
+        if session_id not in self._speak_sessions:
+            self._clear_busy(reason)
 
     def _mark_busy(self) -> None:
 
@@ -465,19 +521,31 @@ class WsHub:
             return
         self._loop.call_soon_threadsafe(self._on_transcript, session_id, text, role)
 
-    def _push_append_threadsafe(self, text: str, source: str = "VOICE", reset: bool = False) -> None:
+    def _push_append_threadsafe(
+        self,
+        text: str,
+        source: str = "VOICE",
+        reset: bool = False,
+        role: str = "assistant",
+    ) -> None:
         if self._push_append is None:
             return
         if self._loop is None:
-            self._push_append(text, source, reset)
+            self._push_append(text, source, reset, role)
             return
-        self._loop.call_soon_threadsafe(self._push_append, text, source, reset)
+        self._loop.call_soon_threadsafe(self._push_append, text, source, reset, role)
 
-    def _push_status_threadsafe(self, status: str, text: str, source: str = "VOICE") -> None:
+    def _push_status_threadsafe(
+        self,
+        status: str,
+        text: str,
+        source: str = "VOICE",
+        role: str | None = None,
+    ) -> None:
         if self._loop is None:
-            self._push_status(status, text, source)
+            self._push_status(status, text, source, role)
             return
-        self._loop.call_soon_threadsafe(self._push_status, status, text, source)
+        self._loop.call_soon_threadsafe(self._push_status, status, text, source, role)
 
     async def push_status_event(self, payload: dict[str, Any]) -> None:
         # Keep text in the same frame so status/source/text cannot be reordered or dropped.
@@ -500,6 +568,8 @@ class WsHub:
             return {"ok": False, "detail": "empty text"}
         if self._device.websocket is None:
             return {"ok": False, "detail": "device offline"}
+        if self._voice_busy and self._device.stream_session_id and not self._speak_sessions:
+            self._abort_listen_stream("preempt for speak")
         if self._voice_busy:
             print("[tts] drop speak, voice pipeline busy")
             return {"ok": False, "detail": "voice busy"}
@@ -550,8 +620,10 @@ class WsHub:
                 self._speak_sessions.discard(session_id)
                 self._clear_busy("speak done")
                 print(f"[tts] speak done session={session_id}")
-            elif chunk:
+            else:
                 self._clear_busy("voice audio done")
+                # Do not push VOICE IDLE here: the audio_chunk end flag is enough.
+                # A status IDLE during PLAYING used to fade remaining TTS to silence.
 
     def schedule_audio_chunk(self, session_id: str, chunk: bytes, is_end: bool) -> None:
         if self._loop is None:
@@ -561,12 +633,43 @@ class WsHub:
             self._loop,
         )
 
+    async def _ping_device_if_needed(self) -> None:
+        ws = self._device.websocket
+        if ws is None:
+            return
+        now = time.time()
+        if now - self._last_device_ping < DEVICE_PING_SEC:
+            return
+        self._last_device_ping = now
+        try:
+            async with self._device_send_lock:
+                await asyncio.wait_for(ws.send_json({"type": "ping"}), timeout=1.0)
+        except Exception as exc:
+            print(f"[ws] device ping failed: {type(exc).__name__}: {exc}")
+            await self.disconnect(ws)
+
+    async def _drop_stale_device(self) -> None:
+        ws = self._device.websocket
+        if ws is None:
+            return
+        seen = self._device.last_seen
+        if seen <= 0 or (time.time() - seen) <= DEVICE_STALE_SEC:
+            return
+        print("[ws] device stale, mark offline")
+        await self.disconnect(ws)
+        try:
+            await ws.close(code=1001)
+        except Exception:
+            pass
+
     async def _send_ws_json(self, websocket: WebSocket, message: dict[str, Any]) -> None:
         try:
             async with self._device_send_lock:
                 await asyncio.wait_for(websocket.send_json(message), timeout=5)
         except Exception as exc:
             print(f"[ws] send_json failed: {type(exc).__name__}: {exc}")
+            if websocket is self._device.websocket:
+                await self.disconnect(websocket)
 
     async def _send_device(self, message: dict[str, Any]) -> None:
         device = self._device.websocket
@@ -587,6 +690,8 @@ class WsHub:
     async def run_session_pump(self, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
             try:
+                await self._ping_device_if_needed()
+                await self._drop_stale_device()
                 if (
                     self._voice_busy
                     and self._busy_since

@@ -330,14 +330,9 @@ static void start_advertise(void)
     fields.name = (uint8_t *)DEVICE_NAME;
     fields.name_len = (uint8_t)strlen(DEVICE_NAME);
     fields.name_is_complete = 1;
-    int rc = ble_gap_adv_set_fields(&fields);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "adv fields rc=%d", rc);
-        return;
-    }
 
     uint8_t own_addr_type = BLE_OWN_ADDR_PUBLIC;
-    rc = ble_hs_id_infer_auto(0, &own_addr_type);
+    int rc = ble_hs_id_infer_auto(0, &own_addr_type);
     if (rc != 0) {
         ESP_LOGW(TAG, "infer_auto rc=%d; fallback random", rc);
         own_addr_type = BLE_OWN_ADDR_RANDOM;
@@ -349,15 +344,25 @@ static void start_advertise(void)
     adv.disc_mode = BLE_GAP_DISC_MODE_GEN;
     adv.itvl_min = BLE_GAP_ADV_FAST_INTERVAL1_MIN;
     adv.itvl_max = BLE_GAP_ADV_FAST_INTERVAL1_MAX;
-    rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &adv, gap_event, NULL);
-    if (rc == BLE_HS_EALREADY) {
-        return;
+
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        rc = ble_gap_adv_set_fields(&fields);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "adv fields rc=%d try=%d", rc, attempt + 1);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &adv, gap_event, NULL);
+        if (rc == 0 || rc == BLE_HS_EALREADY) {
+            if (rc == 0) {
+                ESP_LOGI(TAG, "advertising as %s (addr_type=%u)", DEVICE_NAME, own_addr_type);
+            }
+            return;
+        }
+        ESP_LOGW(TAG, "adv start rc=%d addr_type=%u try=%d", rc, own_addr_type, attempt + 1);
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
-    if (rc != 0) {
-        ESP_LOGE(TAG, "adv start rc=%d addr_type=%u", rc, own_addr_type);
-        return;
-    }
-    ESP_LOGI(TAG, "advertising as %s (addr_type=%u)", DEVICE_NAME, own_addr_type);
+    ESP_LOGE(TAG, "adv start failed");
 }
 
 static int gap_event(struct ble_gap_event *event, void *arg)
@@ -408,6 +413,7 @@ static void on_sync(void)
 static void on_reset(int reason)
 {
     ESP_LOGW(TAG, "nimble reset reason=%d", reason);
+    s_nimble_ready = false;
 }
 
 static void host_task(void *param)
@@ -439,12 +445,25 @@ static esp_err_t ensure_nimble(void)
     /* BT controller needs contiguous internal DRAM; WiFi buffers eat it. */
     net_pause_for_ble();
     audio_capture_listen_stop();
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(350));
     ESP_LOGI(TAG, "heap before nimble: free=%u internal=%u largest_int=%u",
              (unsigned)esp_get_free_heap_size(),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    esp_err_t err = nimble_port_init();
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        err = nimble_port_init();
+        if (err == ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "nimble already inited");
+            err = ESP_OK;
+            break;
+        }
+        if (err == ESP_OK) {
+            break;
+        }
+        ESP_LOGW(TAG, "nimble_port_init try %d %s", attempt + 1, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nimble_port_init %s", esp_err_to_name(err));
         net_resume_after_ble();
@@ -498,9 +517,16 @@ esp_err_t ble_prov_start(void)
     s_line_len = 0;
     s_deadline_ms = esp_timer_get_time() / 1000 + PROV_TIMEOUT_MS;
     s_active = true;
-    if (s_nimble_ready) {
-        start_advertise();
+    for (int i = 0; i < 40 && !s_nimble_ready; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(25));
     }
+    if (!s_nimble_ready) {
+        ESP_LOGE(TAG, "nimble sync timeout");
+        s_active = false;
+        ui_post_ble_prov(false);
+        return ESP_ERR_TIMEOUT;
+    }
+    start_advertise();
     ESP_LOGI(TAG, "provision window %d min", PROV_TIMEOUT_MS / 60000);
     return ESP_OK;
 }

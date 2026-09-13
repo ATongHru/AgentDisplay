@@ -7,13 +7,15 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "ui_msg.h"
+#include "ui.h"
 
 static const char *TAG = "btn_boot";
 
 #define LONG_PRESS_MS 3000
+#define DIAG_PRESS_MS 5000
 #define BOOT_GRACE_MS 2000
 #define POLL_MS 20
+#define RELEASE_DEBOUNCE_MS 80
 
 static int64_t s_boot_ms;
 static TaskHandle_t s_task;
@@ -54,7 +56,9 @@ static void btn_task(void *arg)
     (void)arg;
     bool pressed = false;
     bool fired = false;
+    bool fired_diag = false;
     int64_t press_start = 0;
+    int64_t release_at = 0;
     int last_level = 1;
     int64_t last_log_ms = 0;
 
@@ -75,26 +79,41 @@ static void btn_task(void *arg)
         }
 
         if (down) {
+            release_at = 0;
             if (!pressed) {
                 pressed = true;
                 fired = false;
+                fired_diag = false;
                 press_start = now;
+                last_log_ms = now;
                 ESP_LOGI(TAG, "BOOT press start");
             } else if (!fired && (now - press_start) >= LONG_PRESS_MS) {
                 fired = true;
                 ESP_LOGI(TAG, "BOOT long-press %lld ms -> BLE", (long long)(now - press_start));
+                ui_post_ble_prov(true);
                 kick_ble_start();
+            } else if (!fired_diag && (now - press_start) >= DIAG_PRESS_MS) {
+                fired_diag = true;
+                ESP_LOGI(TAG, "BOOT hold %lld ms -> diagnostic", (long long)(now - press_start));
+                ui_post_diagnostic_toggle();
             } else if (!fired && (now - last_log_ms) >= 1000) {
                 last_log_ms = now;
                 ESP_LOGI(TAG, "BOOT holding %lld/%d ms", (long long)(now - press_start), LONG_PRESS_MS);
             }
-        } else {
-            if (pressed && !fired) {
-                ESP_LOGI(TAG, "BOOT short press ignored (%lld ms)", (long long)(now - press_start));
+        } else if (pressed) {
+            /* Ignore brief bounce so a 3s hold is not reset at 2.9s. */
+            if (release_at == 0) {
+                release_at = now;
+            } else if ((now - release_at) >= RELEASE_DEBOUNCE_MS) {
+                if (!fired) {
+                    ESP_LOGI(TAG, "BOOT short press ignored (%lld ms)", (long long)(now - press_start));
+                }
+                pressed = false;
+                fired = false;
+                fired_diag = false;
+                press_start = 0;
+                release_at = 0;
             }
-            pressed = false;
-            fired = false;
-            press_start = 0;
         }
 
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
@@ -103,6 +122,7 @@ static void btn_task(void *arg)
 
 esp_err_t btn_boot_init(void)
 {
+    gpio_reset_pin(PIN_BOOT);
     gpio_config_t io = {
         .pin_bit_mask = 1ULL << PIN_BOOT,
         .mode = GPIO_MODE_INPUT,

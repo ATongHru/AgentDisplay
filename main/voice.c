@@ -25,20 +25,22 @@ enum {
 
 /* 能量按放大后归一化（与旧 int16 VAD 同一量纲）。
  * 旧起始约 peak>=1400、rms>=280 → 归一化 0.043 / 0.0085；阈值抬高，减少环境音误触发。 */
-#define VAD_RMS_START_FLOOR 0.008f
-#define VAD_PEAK_START_FLOOR 0.045f
-#define VAD_NOISE_MULT 3.0f
+#define VAD_RMS_START_FLOOR 0.012f
+#define VAD_PEAK_START_FLOOR 0.060f
+#define VAD_NOISE_MULT 3.5f
 #define VAD_RMS_HOLD_FLOOR 0.003f
 #define VAD_NOISE_ALPHA 0.05f
 #define VAD_NOISE_INIT_FRAMES 24
 #define VAD_NOISE_RMS_CAP 0.024f
 #define VAD_NOISE_PEAK_CAP 0.16f
-#define VAD_MIN_MS 300
-#define VAD_SILENCE_MS 400
-#define VAD_MAX_MS 8000
+#define VAD_MIN_MS 500
+#define VAD_SILENCE_MS 800
+#define VAD_MAX_MS 15000
 #define VAD_COOLDOWN_MS 800
 #define WAIT_REPLY_MS 55000
 #define MIN_CLIP_BYTES 6400
+#define PLAY_END_GRACE_MS 800
+#define PLAY_STALL_MS 15000
 
 typedef struct {
     float noise_rms;
@@ -67,6 +69,9 @@ static bool s_stream_failed;
 static char s_last_show[24];
 static vad_state_t s_vad = {.noise_rms = 0.001f, .noise_peak = 0.005f};
 static uint32_t s_last_vad_seq;
+static int64_t s_last_mic_ui_us;
+static int64_t s_play_end_empty_us;
+static int64_t s_play_stall_us;
 
 static int64_t now_us(void) { return esp_timer_get_time(); }
 
@@ -156,20 +161,20 @@ static void resume_listen(void)
     reset_vad_baseline();
     s_cooldown_until_us = now_us() + (int64_t)VAD_COOLDOWN_MS * 1000;
     if (!s_voice_enabled) {
+        s_phase = VOICE_LISTEN;
         audio_capture_listen_stop();
         set_listening(false);
-        s_phase = VOICE_LISTEN;
         return;
     }
-    if (audio_capture_listen_start()) {
+    if (audio_capture_listen_start() == ESP_OK) {
         audio_capture_clear();
-        set_listening(true);
         s_phase = VOICE_LISTEN;
+        set_listening(true);
         return;
     }
 #endif
-    set_listening(false);
     s_phase = VOICE_ERROR;
+    set_listening(false);
 }
 
 static void finish_turn(bool announce)
@@ -178,9 +183,10 @@ static void finish_turn(bool announce)
         audio_playback_stop();
     }
     s_audio_end = false;
-    post_voice_ui();
-    (void)announce;
+    s_play_end_empty_us = 0;
+    s_play_stall_us = 0;
     s_session = false;
+    (void)announce;
     resume_listen();
 }
 
@@ -208,6 +214,9 @@ void voice_on_audio_chunk(const char *session_id, const uint8_t *data, size_t le
     }
 
     if (data && len > 0) {
+        /* New PCM always cancels a premature end/fade so streamed TTS can continue. */
+        s_audio_end = false;
+        audio_playback_cancel_fadeout();
         if (s_phase != VOICE_PLAYING) {
 #if VOICE_HARDWARE_ENABLED
             audio_capture_listen_stop();
@@ -234,7 +243,17 @@ void voice_on_audio_chunk(const char *session_id, const uint8_t *data, size_t le
 
 void voice_on_server_status(const char *status)
 {
-    if (!status || s_phase != VOICE_WAIT_REPLY) {
+    if (!status) {
+        return;
+    }
+    /* PLAYING must follow audio_chunk end, not VOICE IDLE/ERROR text frames.
+     * Agent or pipeline status in the gap between streamed TTS sentences used
+     * to set s_audio_end, fade the ring to silence, and cut the reply short. */
+    if (s_phase == VOICE_PLAYING) {
+        ESP_LOGI(TAG, "ignore server status %s during playback", status);
+        return;
+    }
+    if (s_phase != VOICE_WAIT_REPLY) {
         return;
     }
     if (strcmp(status, "THINKING") == 0 || strcmp(status, "SPEAKING") == 0 ||
@@ -243,7 +262,7 @@ void voice_on_server_status(const char *status)
         return;
     }
     if (strcmp(status, "IDLE") == 0 || strcmp(status, "ERROR") == 0) {
-        ESP_LOGI(TAG, "server status %s, resume listen", status);
+        ESP_LOGI(TAG, "server status %s phase=%d", status, s_phase);
         finish_turn(false);
     }
 }
@@ -271,15 +290,40 @@ void voice_loop(void)
             s_stream_active = false;
             s_vad.in_speech = false;
             audio_capture_listen_stop();
-            set_listening(false);
             s_phase = VOICE_LISTEN;
+            set_listening(false);
         }
         return;
     }
     if (s_phase == VOICE_PLAYING) {
-        /* 服务端发完 + 本地缓冲播完 */
-        if (s_audio_end && audio_playback_pending() == 0 && audio_playback_should_stop()) {
-            finish_turn(false);
+        size_t pending = audio_playback_pending();
+        if (pending > 0) {
+            s_play_end_empty_us = 0;
+            s_play_stall_us = 0;
+        } else if (s_audio_end) {
+            s_play_stall_us = 0;
+            if (s_play_end_empty_us == 0) {
+                s_play_end_empty_us = now_us();
+            }
+            /* Wait out streaming-TTS gaps before fading; a premature end flag
+             * plus immediate fadeout used to mute the rest of the reply. */
+            if (now_us() - s_play_end_empty_us > 400000) {
+                audio_playback_begin_fadeout();
+            }
+            if (now_us() - s_play_end_empty_us > (int64_t)PLAY_END_GRACE_MS * 1000 &&
+                audio_playback_should_stop()) {
+                s_play_end_empty_us = 0;
+                s_play_stall_us = 0;
+                finish_turn(false);
+            }
+        } else {
+            if (s_play_stall_us == 0) {
+                s_play_stall_us = now_us();
+            } else if (now_us() - s_play_stall_us > (int64_t)PLAY_STALL_MS * 1000) {
+                ESP_LOGW(TAG, "playback stall without end flag");
+                s_play_stall_us = 0;
+                finish_turn(false);
+            }
         }
         return;
     }
@@ -309,10 +353,9 @@ void voice_loop(void)
 #if VOICE_HARDWARE_ENABLED
             audio_capture_listen_stop();
 #endif
-            set_listening(false);
             s_wait_start_us = now_us();
             s_phase = VOICE_WAIT_REPLY;
-            post_voice_ui();
+            set_listening(false);
         }
         return;
     }
@@ -320,6 +363,14 @@ void voice_loop(void)
     if (!audio_capture_is_listening()) {
         resume_listen();
         return;
+    }
+
+    if (s_listening && s_voice_enabled &&
+        (s_phase == VOICE_LISTEN || s_phase == VOICE_RECORDING)) {
+        if (now_us() - s_last_mic_ui_us > 100000) {
+            s_last_mic_ui_us = now_us();
+            ui_post_mic_level(audio_capture_rms());
+        }
     }
 
     uint32_t seq = audio_capture_frame_seq();
@@ -371,6 +422,7 @@ void voice_loop(void)
         s_session_id[0] = '\0';
         s_phase = VOICE_RECORDING;
         post_voice_ui();
+        ui_post_mic_level(audio_capture_rms());
         ESP_LOGI(TAG, "VAD start rms=%.4f peak=%.4f th=%.4f/%.4f", rms, peak, start_rms_th(),
                  start_peak_th());
         return;
@@ -504,7 +556,6 @@ void voice_net_poll(void)
 void voice_set_enabled(bool enabled)
 {
     if (s_voice_enabled == enabled) {
-        ui_post_voice_enabled(enabled);
         return;
     }
     s_voice_enabled = enabled;
@@ -514,17 +565,61 @@ void voice_set_enabled(bool enabled)
         if (audio_playback_is_active()) {
             audio_playback_stop();
         }
+        if (s_stream_active) {
+            size_t pcm_len = audio_capture_size();
+            (void)net_ws_send_audio_end(s_session_id, pcm_len, true);
+            ESP_LOGI(TAG, "discard stream on disable session=%s bytes=%u",
+                     s_session_id, (unsigned)pcm_len);
+        }
         s_upload_pending = false;
         s_stream_active = false;
         s_vad.in_speech = false;
         audio_capture_listen_stop();
-        set_listening(false);
         s_phase = VOICE_LISTEN;
+        set_listening(false);
     } else {
         resume_listen();
     }
 }
 
+void voice_on_ws_lost(void)
+{
+#if VOICE_HARDWARE_ENABLED
+    if (audio_playback_is_active()) {
+        audio_playback_stop();
+    }
+    audio_capture_listen_stop();
+#endif
+    s_upload_pending = false;
+    s_upload_done = false;
+    s_stream_active = false;
+    s_stream_failed = false;
+    s_audio_end = false;
+    s_play_end_empty_us = 0;
+    s_play_stall_us = 0;
+    s_vad.in_speech = false;
+    s_session = false;
+    s_session_id[0] = '\0';
+    s_listening = false;
+    s_phase = VOICE_LISTEN;
+    s_last_show[0] = '\0';
+    ui_post_voice_link(false, false, false, "");
+}
+
 bool voice_is_enabled(void) { return s_voice_enabled; }
 bool voice_session_active(void) { return s_session; }
 bool voice_is_listening(void) { return s_listening; }
+
+void voice_fill_debug(voice_debug_t *out)
+{
+    if (!out) {
+        return;
+    }
+    out->phase = s_phase;
+    out->noise_rms = s_vad.noise_rms;
+    out->noise_peak = s_vad.noise_peak;
+    out->start_rms_th = start_rms_th();
+    out->start_peak_th = start_peak_th();
+    out->last_rms = audio_capture_rms();
+    out->last_peak = audio_capture_peak();
+}

@@ -118,7 +118,7 @@ async def llm_chat(
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     messages: list[dict[str, str]] = [{
         "role": "system",
-        "content": "你是米思林智能助手小E，尽量满足用户的需求和提问。用简体中文简短回答，不要用 Markdown，不要返回 emoji。",
+        "content": "你是智能语音助手小E，尽量满足用户的需求和提问。用非常幽默诙谐的简体中文简短回答，不要用 Markdown，不要返回 emoji。",
     }]
     if history:
         for item in history:

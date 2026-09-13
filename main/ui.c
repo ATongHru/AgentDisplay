@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -11,7 +12,10 @@
 #include "anim_size.h"
 #include "board_pins.h"
 #include "display.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "mem_utils.h"
+#include "voice.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -31,10 +35,15 @@ static const lv_font_t *ui_text_font(void)
 #define FACE_X ((LCD_W - FACE_SIZE) / 2)
 #define FACE_Y 71
 #define BAR_Y 9
-#define ECHO_MAX_BYTES 120
+#define ECHO_MAX_BYTES 256
+#define CAPTION_LINES 2
+#define CAPTION_TAIL_WINDOW 256
+#define CAPTION_STREAM_IDLE_MS 500
 #define ICON_SIZE 20
 #define ICON_COLOR 0x94A3B8
 #define CAPTION_TTL_MS 3000
+#define CAPTION_LINE_SPACE 2
+#define CAPTION_MAX_WIDTH 228
 #define MIC_HINT_TTL_MS 1000
 
 static QueueHandle_t s_queue;
@@ -44,6 +53,8 @@ static volatile bool s_frame_dirty_queued;
 static lv_obj_t *source_label;
 static lv_obj_t *status_label;
 static lv_obj_t *voice_label;
+static lv_obj_t *mic_level_bar;
+static lv_obj_t *diag_label;
 static lv_obj_t *serial_icon;
 static lv_obj_t *wifi_icon;
 static lv_obj_t *mic_icon;
@@ -72,8 +83,10 @@ static bool voice_session;
 static bool s_ble_prov;
 static bool caption_mode;
 static bool caption_suppress_append;
+static bool caption_streaming;
 static bool mic_hint_active;
 static uint32_t caption_until_ms;
+static uint32_t last_append_ms;
 static uint32_t mic_hint_until_ms;
 static int wifi_rssi = -100;
 static char last_time_buf[8] = "--:--";
@@ -81,9 +94,27 @@ static char current_status[24] = "IDLE";
 static char current_source[16] = "BOT";
 static char agent_status[24] = "IDLE";
 static char agent_source[16] = "BOT";
-static char current_voice_text[128];
+static char current_voice_text[ECHO_MAX_BYTES + 32];
+static char *s_voice_history;
 static bool voice_hold;
 static char voice_overlay[16];
+static bool diagnostic_mode;
+static uint32_t diagnostic_until_ms;
+static char s_report_status[24];
+static char s_report_source[16];
+static bool s_report_dirty;
+static portMUX_TYPE s_report_mux = portMUX_INITIALIZER_UNLOCKED;
+
+typedef struct {
+    bool listening;
+    bool playing;
+    bool hold;
+    char overlay[16];
+    volatile bool updated;
+} voice_link_pending_t;
+
+static voice_link_pending_t s_vl_pending;
+static portMUX_TYPE s_vl_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static uint32_t now_ms(void)
 {
@@ -149,33 +180,211 @@ static void json_value(const char *json, const char *key, char *out, size_t out_
     }
 }
 
-static void truncate_utf8(char *text, size_t max_bytes)
+static const char *utf8_next_cp(const char *s, uint32_t *cp)
 {
-    size_t len = strlen(text);
-    if (len <= max_bytes) {
-        return;
+    const unsigned char *p = (const unsigned char *)s;
+    if (p[0] < 0x80) {
+        *cp = p[0];
+        return s + 1;
     }
-    size_t i = max_bytes;
-    while (i > 0 && ((unsigned char)text[i] & 0xC0) == 0x80) {
-        --i;
+    if ((p[0] & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
+        *cp = ((uint32_t)(p[0] & 0x1F) << 6) | (uint32_t)(p[1] & 0x3F);
+        return s + 2;
     }
-    text[i] = '\0';
+    if ((p[0] & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
+        *cp = ((uint32_t)(p[0] & 0x0F) << 12) | ((uint32_t)(p[1] & 0x3F) << 6) |
+              (uint32_t)(p[2] & 0x3F);
+        return s + 3;
+    }
+    if ((p[0] & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 &&
+        (p[3] & 0xC0) == 0x80) {
+        *cp = ((uint32_t)(p[0] & 0x07) << 18) | ((uint32_t)(p[1] & 0x3F) << 12) |
+              ((uint32_t)(p[2] & 0x3F) << 6) | (uint32_t)(p[3] & 0x3F);
+        return s + 4;
+    }
+    *cp = p[0];
+    return s + 1;
 }
 
-static void truncate_voice(char *text)
+static lv_coord_t caption_glyph_width(const lv_font_t *font, uint32_t cp)
 {
-    size_t len = strlen(text);
-    int lines = 1;
-    for (size_t i = 0; i < len; ++i) {
-        if (text[i] == '\n') {
-            ++lines;
-            if (lines > 2) {
-                text[i] = '\0';
-                break;
+    lv_coord_t w = lv_font_get_glyph_width(font, cp, 0);
+    if (w > 0) {
+        return w;
+    }
+    w = lv_font_get_glyph_width(font, (uint32_t)' ', 0);
+    if (w > 0) {
+        return w;
+    }
+    return font && font->line_height > 0 ? (font->line_height * 3) / 4 : 12;
+}
+
+static lv_coord_t caption_max_width(void)
+{
+    return CAPTION_MAX_WIDTH;
+}
+
+static lv_coord_t caption_content_width(const char *text)
+{
+    if (!text || text[0] == '\0') {
+        return 0;
+    }
+    const lv_font_t *font = ui_text_font();
+    lv_coord_t line_w = 0;
+    lv_coord_t max_w = 0;
+    const char *p = text;
+    while (*p) {
+        uint32_t cp = 0;
+        const char *next = utf8_next_cp(p, &cp);
+        if (cp == '\n') {
+            if (line_w > max_w) {
+                max_w = line_w;
             }
+            line_w = 0;
+            p = next;
+            continue;
+        }
+        line_w += caption_glyph_width(font, cp);
+        p = next;
+    }
+    if (line_w > max_w) {
+        max_w = line_w;
+    }
+    return max_w;
+}
+
+/* Fold src to the last CAPTION_LINES wrapped rows so the label grows from the tail. */
+static void caption_take_last_two_lines(const char *src, char *dst, size_t dst_len)
+{
+    if (!dst || dst_len == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    if (!src || src[0] == '\0') {
+        return;
+    }
+    const lv_font_t *font = ui_text_font();
+    const lv_coord_t max_w = caption_max_width();
+    char prev[128];
+    char curr[128];
+    size_t curr_len = 0;
+    lv_coord_t x = 0;
+    prev[0] = '\0';
+    curr[0] = '\0';
+
+    const char *p = src;
+    while (*p) {
+        uint32_t cp = 0;
+        const char *next = utf8_next_cp(p, &cp);
+        size_t clen = (size_t)(next - p);
+        if (cp == '\r') {
+            p = next;
+            continue;
+        }
+        if (cp == '\n') {
+            if (curr_len > 0) {
+                memcpy(prev, curr, curr_len + 1);
+                curr[0] = '\0';
+                curr_len = 0;
+                x = 0;
+            }
+            p = next;
+            continue;
+        }
+        lv_coord_t gw = caption_glyph_width(font, cp);
+        if (curr_len > 0 && x + gw > max_w) {
+            memcpy(prev, curr, curr_len + 1);
+            curr[0] = '\0';
+            curr_len = 0;
+            x = 0;
+        }
+        if (clen == 0 || curr_len + clen >= sizeof(curr) - 1) {
+            p = next;
+            continue;
+        }
+        memcpy(curr + curr_len, p, clen);
+        curr_len += clen;
+        curr[curr_len] = '\0';
+        x += gw;
+        p = next;
+    }
+
+    if (prev[0] && curr[0]) {
+        snprintf(dst, dst_len, "%s\n%s", prev, curr);
+    } else if (curr[0]) {
+        snprintf(dst, dst_len, "%s", curr);
+    } else {
+        snprintf(dst, dst_len, "%s", prev);
+    }
+}
+
+static const char *role_prefix(const char *role)
+{
+    (void)role;
+    return "";
+}
+
+static void sync_voice_display(void)
+{
+    const char *src = s_voice_history;
+    if (!src || src[0] == '\0') {
+        current_voice_text[0] = '\0';
+        return;
+    }
+    size_t len = strlen(src);
+    size_t window = CAPTION_TAIL_WINDOW;
+    if (window > sizeof(current_voice_text) - 1) {
+        window = sizeof(current_voice_text) - 1;
+    }
+    const char *start = src;
+    if (len > window) {
+        start = src + len - window;
+        while (start > src && ((unsigned char)*start & 0xC0) == 0x80) {
+            ++start;
         }
     }
-    truncate_utf8(text, ECHO_MAX_BYTES);
+    char tail[sizeof(current_voice_text)];
+    snprintf(tail, sizeof(tail), "%s", start);
+    caption_take_last_two_lines(tail, current_voice_text, sizeof(current_voice_text));
+}
+
+static void history_set(const char *text, const char *role)
+{
+    char line[ECHO_MAX_BYTES + 32];
+    snprintf(line, sizeof(line), "%s%s", role_prefix(role), text ? text : "");
+    if (!s_voice_history) {
+        caption_take_last_two_lines(line, current_voice_text, sizeof(current_voice_text));
+        return;
+    }
+    snprintf(s_voice_history, VOICE_HISTORY_BYTES, "%s", line);
+    sync_voice_display();
+}
+
+static void history_append_role(const char *role, const char *text, bool reset)
+{
+    if (!text) {
+        text = "";
+    }
+    if (!s_voice_history) {
+        char tmp[sizeof(current_voice_text)];
+        if (reset) {
+            snprintf(tmp, sizeof(tmp), "%s%s", role_prefix(role), text);
+        } else {
+            snprintf(tmp, sizeof(tmp), "%s%s", current_voice_text, text);
+        }
+        caption_take_last_two_lines(tmp, current_voice_text, sizeof(current_voice_text));
+        return;
+    }
+    if (reset) {
+        snprintf(s_voice_history, VOICE_HISTORY_BYTES, "%s%s", role_prefix(role), text);
+    } else {
+        size_t used = strlen(s_voice_history);
+        size_t room = VOICE_HISTORY_BYTES - 1 - used;
+        if (room > 0) {
+            strncat(s_voice_history, text, room);
+        }
+    }
+    sync_voice_display();
 }
 
 static lv_color_t status_color(const char *status)
@@ -210,7 +419,8 @@ static void decode_frame_rle(const frame_data_t *frame, uint8_t *dest, size_t de
 
 
 static void render_frame(void);
-static void apply_voice_face_override(void);
+static void sync_voice_link_pending(void);
+static void refresh_face_display(void);
 
 static void put_px(uint8_t *buf, int x, int y, uint16_t color)
 {
@@ -286,7 +496,7 @@ static void apply_ble_prov_ui(bool on)
         if (source_label) {
             lv_label_set_text(source_label, agent_source[0] ? agent_source : "BOT");
         }
-        apply_voice_face_override();
+        refresh_face_display();
     }
 }
 
@@ -303,6 +513,9 @@ static void blit_face_frame(void)
 
 static void render_frame(void)
 {
+    if (s_ble_prov) {
+        return;
+    }
     if (animation_count == 0 || animations[animation_index].count == 0) {
         return;
     }
@@ -311,6 +524,43 @@ static void render_frame(void)
                      (size_t)FACE_SIZE * FACE_SIZE * 2);
     frame_buffer_front = back;
     blit_face_frame();
+}
+
+static lv_coord_t caption_line_height(void)
+{
+    return lv_font_get_line_height(ui_text_font());
+}
+
+static void apply_voice_label_style(void)
+{
+    if (!voice_label) {
+        return;
+    }
+    if (mic_hint_active && !caption_mode) {
+        lv_obj_set_style_text_align(voice_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_line_space(voice_label, 0, 0);
+        lv_obj_set_height(voice_label, caption_line_height());
+    } else {
+        lv_obj_set_style_text_align(voice_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_line_space(voice_label, CAPTION_LINE_SPACE, 0);
+        lv_obj_set_height(voice_label, caption_line_height() * CAPTION_LINES + CAPTION_LINE_SPACE);
+    }
+}
+
+static void fit_voice_label_width(const char *text)
+{
+    if (!voice_label) {
+        return;
+    }
+    lv_coord_t w = caption_content_width(text) + 2;
+    if (w < 8) {
+        w = 8;
+    }
+    if (w > CAPTION_MAX_WIDTH) {
+        w = CAPTION_MAX_WIDTH;
+    }
+    lv_obj_set_width(voice_label, w);
+    lv_obj_align(voice_label, LV_ALIGN_BOTTOM_MID, 0, -8);
 }
 
 static void set_voice_label_text(const char *text)
@@ -324,9 +574,102 @@ static void set_voice_label_text(const char *text)
         voice_text_visible = false;
         return;
     }
+    apply_voice_label_style();
     lv_obj_clear_flag(voice_label, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(voice_label, text);
+    fit_voice_label_width(text);
     voice_text_visible = true;
+}
+
+static float s_mic_rms;
+static volatile bool s_mic_pending;
+static volatile float s_mic_pending_rms;
+
+static bool mic_level_bar_wanted(void)
+{
+    if (!voice_feature_enabled || s_ble_prov || !ws_link) {
+        return false;
+    }
+    /* EAR.gif is the recording overlay; do not also require voice_listening —
+     * link-state messages can briefly clear it and hide a visible bar. */
+    return voice_hold && strcmp(voice_overlay, "EAR") == 0;
+}
+
+static void update_mic_level_ui(float rms)
+{
+    if (!mic_level_bar) {
+        return;
+    }
+    if (rms < 0.0f) {
+        rms = 0.0f;
+    }
+    s_mic_rms = rms;
+    if (!mic_level_bar_wanted()) {
+        lv_obj_add_flag(mic_level_bar, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_clear_flag(mic_level_bar, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(mic_level_bar);
+    /* AGC target ~0.3; map 0.25 RMS to full so speech is obvious. */
+    int width = (int)(s_mic_rms * 80.0f / 0.25f);
+    if (width < 2 && s_mic_rms > 0.002f) {
+        width = 2;
+    } else if (width > 80) {
+        width = 80;
+    }
+    lv_bar_set_value(mic_level_bar, width, LV_ANIM_OFF);
+}
+
+static void sync_mic_level_pending(void)
+{
+    float rms;
+    bool updated;
+    portENTER_CRITICAL(&s_mux);
+    updated = s_mic_pending;
+    rms = s_mic_pending_rms;
+    s_mic_pending = false;
+    portEXIT_CRITICAL(&s_mux);
+    if (updated) {
+        update_mic_level_ui(rms);
+    } else {
+        update_mic_level_ui(s_mic_rms);
+    }
+}
+
+static void build_diagnostic_text(char *out, size_t out_len)
+{
+    voice_debug_t vd = {0};
+    voice_fill_debug(&vd);
+    size_t rec_cap = audio_record_capacity();
+    size_t play_cap = audio_play_ring_capacity();
+    size_t rec_used = audio_capture_size();
+    size_t play_used = audio_playback_pending();
+    unsigned rec_pct = rec_cap ? (unsigned)(rec_used * 100 / rec_cap) : 0;
+    unsigned play_pct = play_cap ? (unsigned)(play_used * 100 / play_cap) : 0;
+    snprintf(out, out_len,
+             "DRAM %u/%u KB\nPSRAM %u KB\nRec %u%% Play %u%%\nVAD rms %.3f/%.3f\nNoise %.3f/%.3f\nGain %.1fx",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024), rec_pct, play_pct, vd.last_rms,
+             vd.start_rms_th, vd.noise_rms, vd.noise_peak, (double)audio_get_pdm_gain());
+}
+
+static void apply_diagnostic_ui(bool on)
+{
+    diagnostic_mode = on;
+    if (!diag_label) {
+        return;
+    }
+    if (!on) {
+        lv_obj_add_flag(diag_label, LV_OBJ_FLAG_HIDDEN);
+        diagnostic_until_ms = 0;
+        return;
+    }
+    char buf[256];
+    build_diagnostic_text(buf, sizeof(buf));
+    lv_label_set_text(diag_label, buf);
+    lv_obj_clear_flag(diag_label, LV_OBJ_FLAG_HIDDEN);
+    diagnostic_until_ms = now_ms() + 12000;
 }
 
 static void set_status_label_text(const char *text, const char *status)
@@ -355,7 +698,37 @@ static void apply_source(const char *raw)
     if (source[0] == '\0' || strcmp(source, "UNKNOWN") == 0) {
         strcpy(source, "BOT");
     }
+    if (strcmp(source, "VOICE") == 0) {
+        if (agent_source[0] && strcmp(agent_source, "VOICE") != 0) {
+            lv_obj_clear_flag(source_label, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(source_label, agent_source);
+        } else {
+            lv_obj_add_flag(source_label, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+    lv_obj_clear_flag(source_label, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(source_label, source);
+}
+
+static void queue_display_report(const char *status_key, const char *source)
+{
+    if (!status_key || !status_key[0]) {
+        return;
+    }
+    const char *src = (source && source[0]) ? source : "BOT";
+    portENTER_CRITICAL(&s_report_mux);
+    if (!s_report_dirty && strcmp(s_report_status, status_key) == 0 &&
+        strcmp(s_report_source, src) == 0) {
+        portEXIT_CRITICAL(&s_report_mux);
+        return;
+    }
+    strncpy(s_report_status, status_key, sizeof(s_report_status) - 1);
+    s_report_status[sizeof(s_report_status) - 1] = '\0';
+    strncpy(s_report_source, src, sizeof(s_report_source) - 1);
+    s_report_source[sizeof(s_report_source) - 1] = '\0';
+    s_report_dirty = true;
+    portEXIT_CRITICAL(&s_report_mux);
 }
 
 static void render_status_pair(const char *status_key, const char *source)
@@ -373,7 +746,12 @@ static void render_status_pair(const char *status_key, const char *source)
     if (source) {
         apply_source(source);
     }
-    set_status_label_text(info->label_cn, info->key);
+    if (info->id == UI_ST_SPEAKING) {
+        lv_label_set_text(status_label, "");
+        lv_obj_add_flag(status_label, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        set_status_label_text(info->label_cn, info->key);
+    }
 }
 
 static lv_opa_t wifi_opacity_for_rssi(int rssi)
@@ -426,7 +804,15 @@ static lv_color_t spk_color_for_volume(int percent, bool playing)
 
 static void bump_caption_ttl(void)
 {
+    caption_streaming = false;
     caption_until_ms = now_ms() + CAPTION_TTL_MS;
+}
+
+static void mark_caption_streaming(void)
+{
+    caption_streaming = true;
+    last_append_ms = now_ms();
+    caption_until_ms = 0;
 }
 
 static void layout_caption(void)
@@ -435,9 +821,9 @@ static void layout_caption(void)
         return;
     }
     if (caption_mode || mic_hint_active) {
-        lv_obj_set_width(voice_label, 228);
-        lv_obj_set_height(voice_label, 40);
-        lv_obj_align(voice_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+        apply_voice_label_style();
+        const char *shown = lv_label_get_text(voice_label);
+        fit_voice_label_width(shown);
         lv_obj_clear_flag(voice_label, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(voice_label, LV_OBJ_FLAG_HIDDEN);
@@ -454,8 +840,7 @@ static void set_caption_text(const char *text)
         layout_caption();
         return;
     }
-    snprintf(current_voice_text, sizeof(current_voice_text), "%s", text);
-    truncate_voice(current_voice_text);
+    history_set(text, NULL);
     caption_suppress_append = false;
     if (!caption_mode) {
         caption_mode = true;
@@ -465,12 +850,31 @@ static void set_caption_text(const char *text)
     bump_caption_ttl();
 }
 
-static void expire_caption_if_needed(void)
+static void arm_caption_ttl(void)
 {
-    if (voice_hold) {
+    if (!caption_mode || current_voice_text[0] == '\0') {
         return;
     }
-    if (!caption_mode || caption_until_ms == 0) {
+    caption_streaming = false;
+    caption_until_ms = now_ms() + CAPTION_TTL_MS;
+}
+
+static void expire_caption_if_needed(void)
+{
+    if (!caption_mode) {
+        return;
+    }
+    /* Keep the subtitle on screen for the whole listen/think/speak turn. */
+    if (voice_hold || voice_playing) {
+        return;
+    }
+    if (caption_streaming) {
+        if ((int32_t)(now_ms() - last_append_ms) >= (int32_t)CAPTION_STREAM_IDLE_MS) {
+            arm_caption_ttl();
+        }
+        return;
+    }
+    if (caption_until_ms == 0) {
         return;
     }
     if ((int32_t)(now_ms() - caption_until_ms) >= 0) {
@@ -484,6 +888,7 @@ static void show_mic_hint(const char *text)
     mic_hint_active = true;
     mic_hint_until_ms = now_ms() + MIC_HINT_TTL_MS;
     if (!caption_mode) {
+        layout_caption();
         set_voice_label_text(text);
     }
 }
@@ -498,6 +903,7 @@ static void expire_mic_hint_if_needed(void)
     }
     mic_hint_active = false;
     if (!caption_mode) {
+        layout_caption();
         set_voice_label_text("");
     }
 }
@@ -509,7 +915,6 @@ static void enter_caption_mode(void)
     }
     caption_mode = true;
     layout_caption();
-    bump_caption_ttl();
 }
 
 static lv_obj_t *make_status_icon(lv_obj_t *parent, const char *symbol)
@@ -624,6 +1029,42 @@ static bool source_is_voice(const char *source)
     return source && strcmp(source, "VOICE") == 0;
 }
 
+static bool voice_caption_is_content(const char *text)
+{
+    if (!text || text[0] == '\0') {
+        return false;
+    }
+    if (strcmp(text, "正在识别") == 0 || strcmp(text, "正在聆听") == 0 ||
+        strcmp(text, "聆听中") == 0 || strcmp(text, "回复中") == 0 ||
+        strcmp(text, "正在思考") == 0 || strncmp(text, "正在回复", strlen("正在回复")) == 0 ||
+        strcmp(text, "正在处理") == 0 || strcmp(text, "正在处理…") == 0) {
+        return false;
+    }
+    for (unsigned i = 0; i < (unsigned)UI_ST_COUNT; ++i) {
+        const char *label = k_ui_status[i].label_cn;
+        if (label && label[0] && strcmp(text, label) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void show_voice_caption(const char *text, const char *role)
+{
+    if (voice_caption_is_content(text)) {
+        history_set(text, role && role[0] ? role : "user");
+        caption_suppress_append = false;
+        if (!caption_mode) {
+            caption_mode = true;
+            layout_caption();
+        }
+        set_voice_label_text(current_voice_text);
+        bump_caption_ttl();
+    } else if (text && text[0]) {
+        set_caption_text(text);
+    }
+}
+
 static void apply_event(const char *raw_status, const char *raw_source, const char *raw_text, bool update_text)
 {
     char status[24];
@@ -639,7 +1080,7 @@ static void apply_event(const char *raw_status, const char *raw_source, const ch
     if (source_is_voice(source)) {
         voice_session = true;
         if (update_text && raw_text && raw_text[0]) {
-            set_caption_text(raw_text);
+            show_voice_caption(raw_text, "assistant");
         }
         ESP_LOGI(TAG, "voice caption only status=%s", status);
         return;
@@ -650,22 +1091,16 @@ static void apply_event(const char *raw_status, const char *raw_source, const ch
     strncpy(agent_source, source, sizeof(agent_source) - 1);
     agent_source[sizeof(agent_source) - 1] = '\0';
 
-    /* Listening / speaking own the face. Stash agent, don't render. */
-    if (voice_hold && strcmp(status, "OFFLINE") != 0) {
-        ESP_LOGI(TAG, "drop agent status=%s source=%s (voice hold %s)", status, source,
-                 voice_overlay);
-        return;
+    if (!voice_hold || strcmp(status, "OFFLINE") == 0) {
+        strncpy(current_source, source, sizeof(current_source) - 1);
+        current_source[sizeof(current_source) - 1] = '\0';
+        voice_session = false;
     }
-
-    strncpy(current_source, source, sizeof(current_source) - 1);
-    current_source[sizeof(current_source) - 1] = '\0';
-    voice_session = false;
-    render_status_pair(status, source);
-    ESP_LOGI(TAG, "apply status=%s source=%s caption=%u anim=%u", status, source,
-             (unsigned)strlen(current_voice_text), (unsigned)animation_index);
+    ESP_LOGI(TAG, "agent stash status=%s source=%s hold=%u overlay=%s", status, source,
+             (unsigned)voice_hold, voice_overlay);
 }
 
-static void handle_text_event(const char *raw_source, const char *raw_text)
+static void handle_text_event(const char *raw_source, const char *raw_text, const char *role)
 {
     last_event_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     offline_active = false;
@@ -690,11 +1125,23 @@ static void handle_text_event(const char *raw_source, const char *raw_text)
         snprintf(source, sizeof(source), "%s", current_source);
     }
 
-    set_caption_text(raw_text);
+    if (!source_is_voice(source)) {
+        return;
+    }
+    if (!raw_text || raw_text[0] == '\0') {
+        if (voice_hold || voice_playing) {
+            ESP_LOGI(TAG, "ignore empty caption during voice");
+            return;
+        }
+        set_caption_text("");
+        ESP_LOGI(TAG, "caption cleared");
+        return;
+    }
+    show_voice_caption(raw_text, role && role[0] ? role : "assistant");
     ESP_LOGI(TAG, "caption source=%s len=%u", source, (unsigned)strlen(current_voice_text));
 }
 
-static void handle_append_event(const char *raw_source, const char *delta, bool reset)
+static void handle_append_event(const char *raw_source, const char *delta, bool reset, const char *role)
 {
     last_event_ms = now_ms();
     offline_active = false;
@@ -706,6 +1153,9 @@ static void handle_append_event(const char *raw_source, const char *delta, bool 
     if (voice_hold && src[0] && !source_is_voice(src)) {
         return;
     }
+    if (src[0] && !source_is_voice(src)) {
+        return;
+    }
     if (src[0]) {
         if (!source_is_voice(src) && strcmp(src, "UNKNOWN") != 0) {
             apply_source(src);
@@ -714,21 +1164,24 @@ static void handle_append_event(const char *raw_source, const char *delta, bool 
     }
     if (reset) {
         caption_suppress_append = false;
+        if (s_voice_history) {
+            s_voice_history[0] = '\0';
+        }
         current_voice_text[0] = '\0';
         enter_caption_mode();
-        bump_caption_ttl();
+        mark_caption_streaming();
     } else if (caption_suppress_append) {
         return;
     } else if (!caption_mode) {
         enter_caption_mode();
     }
+    const char *use_role = role && role[0] ? role : "assistant";
     if (delta && delta[0]) {
-        size_t used = strlen(current_voice_text);
-        size_t room = sizeof(current_voice_text) - 1 - used;
-        if (room > 0) {
-            strncat(current_voice_text, delta, room);
-        }
-        truncate_voice(current_voice_text);
+        history_append_role(use_role, delta, reset);
+        mark_caption_streaming();
+    } else if (reset) {
+        history_append_role(use_role, "", true);
+        mark_caption_streaming();
     }
     if (current_voice_text[0] && caption_mode) {
         set_voice_label_text(current_voice_text);
@@ -745,11 +1198,13 @@ static void handle_event_json(const char *json, bool from_usb)
     char type[16] = {0};
     char status[24] = {0};
     char source[16] = {0};
-    char text[128] = {0};
+    char text[384] = {0};
+    char role[16] = {0};
     json_value(json, "type", type, sizeof(type));
     json_value(json, "status", status, sizeof(status));
     json_value(json, "source", source, sizeof(source));
     json_value(json, "text", text, sizeof(text));
+    json_value(json, "role", role, sizeof(role));
     if (strcmp(type, "append") == 0) {
         bool reset = false;
         const char *rp = strstr(json, "\"reset\"");
@@ -763,28 +1218,70 @@ static void handle_event_json(const char *json, bool from_usb)
                 reset = (*rp == 't' || *rp == '1');
             }
         }
-        handle_append_event(source, text, reset);
+        handle_append_event(source, text, reset, role);
         return;
     }
     if (strcmp(type, "text") == 0 || status[0] == '\0') {
-        handle_text_event(source, text);
+        handle_text_event(source, text, role);
         return;
     }
     apply_event(status, source, text, text[0] != '\0');
 }
 
 
-static void apply_voice_face_override(void)
+static void sync_voice_link_pending(void)
+{
+    voice_link_pending_t snap;
+    portENTER_CRITICAL(&s_vl_mux);
+    if (!s_vl_pending.updated) {
+        portEXIT_CRITICAL(&s_vl_mux);
+        return;
+    }
+    snap = s_vl_pending;
+    s_vl_pending.updated = false;
+    portEXIT_CRITICAL(&s_vl_mux);
+
+    bool was_hold = voice_hold;
+    bool was_playing = voice_playing;
+    voice_listening = snap.listening;
+    voice_playing = snap.playing;
+    voice_hold = snap.hold;
+    snprintf(voice_overlay, sizeof(voice_overlay), "%s", snap.overlay);
+    bool was_busy = was_hold || was_playing;
+    bool busy = voice_hold || voice_playing;
+    if (was_hold && !voice_hold) {
+        voice_session = false;
+        strncpy(current_source, agent_source, sizeof(current_source) - 1);
+        current_source[sizeof(current_source) - 1] = '\0';
+        ESP_LOGI(TAG, "voice hold end -> agent %s %s", agent_status, agent_source);
+    }
+    if (was_busy && !busy) {
+        arm_caption_ttl();
+    }
+}
+
+static void refresh_face_display(void)
 {
     if (s_ble_prov) {
         return;
     }
-    if (voice_hold) {
-        const char *face = voice_overlay[0] ? voice_overlay : "EAR";
-        render_status_pair(face, "VOICE");
-        return;
+    char status_key[24];
+    char source[16];
+    if (!ws_link) {
+        snprintf(status_key, sizeof(status_key), "OFFLINE");
+        snprintf(source, sizeof(source), "%s", agent_source[0] ? agent_source : "BOT");
+    } else if (voice_hold) {
+        snprintf(status_key, sizeof(status_key), "%s", voice_overlay[0] ? voice_overlay : "EAR");
+        snprintf(source, sizeof(source), "%s", agent_source[0] ? agent_source : "BOT");
+    } else {
+        snprintf(status_key, sizeof(status_key), "%s", agent_status[0] ? agent_status : "IDLE");
+        snprintf(source, sizeof(source), "%s", agent_source[0] ? agent_source : "BOT");
     }
-    render_status_pair(agent_status, agent_source[0] ? agent_source : "BOT");
+    normalize_status(status_key);
+    render_status_pair(status_key, source);
+    if (ws_link) {
+        queue_display_report(status_key, source);
+    }
 }
 
 static void process_messages(void)
@@ -797,32 +1294,39 @@ static void process_messages(void)
             portENTER_CRITICAL(&s_mux);
             s_frame_dirty_queued = false;
             portEXIT_CRITICAL(&s_mux);
-            render_frame();
+            if (!s_ble_prov) {
+                render_frame();
+            }
         } else if (msg.type == UI_MSG_LINK_STATE) {
             usb_link = msg.usb;
             wifi_connected = msg.wifi;
+            bool was_ws = ws_link;
             ws_link = msg.ws;
             voice_listening = msg.listening;
             voice_playing = msg.playing;
             wifi_rssi = msg.rssi;
+            if (ws_link && !was_ws) {
+                portENTER_CRITICAL(&s_report_mux);
+                s_report_dirty = true;
+                portEXIT_CRITICAL(&s_report_mux);
+            }
             if (!ws_link) {
-                if (strcmp(current_status, "OFFLINE") != 0) {
-                    apply_event("OFFLINE", "BOT", "", false);
-                }
+                voice_hold = false;
+                voice_overlay[0] = '\0';
+                voice_session = false;
+                voice_playing = false;
             }
             update_status_bar_ui();
-            apply_voice_face_override();
         } else if (msg.type == UI_MSG_VOICE_LINK) {
-            voice_listening = msg.listening;
-            voice_playing = msg.playing;
-            bool was_hold = voice_hold;
-            voice_hold = msg.voice_hold;
-            snprintf(voice_overlay, sizeof(voice_overlay), "%s", msg.overlay[0] ? msg.overlay : "");
+            portENTER_CRITICAL(&s_vl_mux);
+            s_vl_pending.listening = msg.listening;
+            s_vl_pending.playing = msg.playing;
+            s_vl_pending.hold = msg.voice_hold;
+            snprintf(s_vl_pending.overlay, sizeof(s_vl_pending.overlay), "%s",
+                     msg.overlay[0] ? msg.overlay : "");
+            s_vl_pending.updated = true;
+            portEXIT_CRITICAL(&s_vl_mux);
             update_status_bar_ui();
-            apply_voice_face_override();
-            if (was_hold && !voice_hold) {
-                ESP_LOGI(TAG, "voice hold end, restore agent %s %s", agent_status, agent_source);
-            }
         } else if (msg.type == UI_MSG_TIME_TICK) {
             refresh_time_label();
             update_status_bar_ui();
@@ -835,9 +1339,13 @@ static void process_messages(void)
             }
             show_mic_hint(voice_feature_enabled ? "麦克风开" : "麦克风关");
             update_status_bar_ui();
-            apply_voice_face_override();
         } else if (msg.type == UI_MSG_VOLUME) {
             update_status_bar_ui();
+        } else if (msg.type == UI_MSG_MIC_LEVEL) {
+            /* Coalesced in ui_post_mic_level; keep as fallback. */
+            update_mic_level_ui(msg.mic_rms);
+        } else if (msg.type == UI_MSG_DIAGNOSTIC) {
+            apply_diagnostic_ui(msg.diagnostic_on);
         }
     }
 }
@@ -865,18 +1373,42 @@ static void build_ui(void)
     lv_obj_set_style_text_color(status_label, lv_color_hex(0xE2E8F0), 0);
     lv_obj_set_style_text_align(status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_text(status_label, "空闲");
-    lv_obj_align(status_label, LV_ALIGN_TOP_MID, 0, FACE_Y + FACE_SIZE + 6);
+    lv_obj_align(status_label, LV_ALIGN_TOP_MID, 0, FACE_Y + FACE_SIZE + 14);
 
     voice_label = lv_label_create(scr);
-    lv_obj_set_width(voice_label, 236);
-    lv_obj_set_height(voice_label, 34);
+    lv_obj_set_width(voice_label, CAPTION_MAX_WIDTH);
     lv_label_set_long_mode(voice_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_font(voice_label, ui_text_font(), 0);
     lv_obj_set_style_text_color(voice_label, lv_color_hex(0xE2E8F0), 0);
-    lv_obj_set_style_text_align(voice_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_text(voice_label, "");
+    lv_obj_set_style_pad_all(voice_label, 0, 0);
+    lv_obj_set_style_text_line_space(voice_label, CAPTION_LINE_SPACE, 0);
+    lv_obj_clear_flag(voice_label, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(voice_label, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(voice_label, "");
     lv_obj_align(voice_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+
+    mic_level_bar = lv_bar_create(scr);
+    lv_obj_set_size(mic_level_bar, 88, 8);
+    lv_bar_set_range(mic_level_bar, 0, 80);
+    lv_obj_set_style_radius(mic_level_bar, 4, LV_PART_MAIN);
+    lv_obj_set_style_radius(mic_level_bar, 4, LV_PART_INDICATOR);
+    lv_obj_set_style_pad_all(mic_level_bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(mic_level_bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(mic_level_bar, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(mic_level_bar, lv_color_hex(0x334155), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(mic_level_bar, lv_color_hex(0x4ADE80), LV_PART_INDICATOR);
+    lv_obj_align(mic_level_bar, LV_ALIGN_TOP_MID, 0, FACE_Y + FACE_SIZE + 3);
+    lv_obj_add_flag(mic_level_bar, LV_OBJ_FLAG_HIDDEN);
+
+    diag_label = lv_label_create(scr);
+    lv_obj_set_width(diag_label, 220);
+    lv_label_set_long_mode(diag_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(diag_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(diag_label, lv_color_hex(0x4ADE80), 0);
+    lv_obj_set_style_text_align(diag_label, LV_TEXT_ALIGN_LEFT, 0);
+    lv_label_set_text(diag_label, "");
+    lv_obj_align(diag_label, LV_ALIGN_CENTER, 0, 24);
+    lv_obj_add_flag(diag_label, LV_OBJ_FLAG_HIDDEN);
 
     serial_icon = make_status_icon(scr, UI_SYMBOL_USB);
 
@@ -943,6 +1475,14 @@ void ui_post_link_state(bool usb, bool wifi, bool ws, bool listening, bool playi
 
 void ui_post_voice_link(bool listening, bool playing, bool hold, const char *overlay)
 {
+    portENTER_CRITICAL(&s_vl_mux);
+    s_vl_pending.listening = listening;
+    s_vl_pending.playing = playing;
+    s_vl_pending.hold = hold;
+    snprintf(s_vl_pending.overlay, sizeof(s_vl_pending.overlay), "%s", overlay ? overlay : "");
+    s_vl_pending.updated = true;
+    portEXIT_CRITICAL(&s_vl_mux);
+
     ui_msg_t msg = {
         .type = UI_MSG_VOICE_LINK,
         .listening = listening,
@@ -977,6 +1517,12 @@ esp_err_t ui_init(void)
     if (!s_queue) {
         return ESP_ERR_NO_MEM;
     }
+    s_voice_history = psram_malloc(VOICE_HISTORY_BYTES);
+    if (!s_voice_history) {
+        ESP_LOGW(TAG, "voice history PSRAM alloc failed, using 128B caption only");
+    } else {
+        s_voice_history[0] = '\0';
+    }
     fill_rgb565_bg(frame_buffer_a, sizeof(frame_buffer_a));
     fill_rgb565_bg(frame_buffer_b, sizeof(frame_buffer_b));
     build_ui();
@@ -990,11 +1536,25 @@ esp_err_t ui_init(void)
     return ESP_OK;
 }
 
+static void expire_diagnostic_if_needed(void)
+{
+    if (!diagnostic_mode || diagnostic_until_ms == 0) {
+        return;
+    }
+    if ((int32_t)(now_ms() - diagnostic_until_ms) >= 0) {
+        apply_diagnostic_ui(false);
+    }
+}
+
 void ui_loop_once(void)
 {
     process_messages();
+    sync_voice_link_pending();
+    refresh_face_display();
+    sync_mic_level_pending();
     expire_caption_if_needed();
     expire_mic_hint_if_needed();
+    expire_diagnostic_if_needed();
     lv_timer_handler();
     blit_face_frame();
 }
@@ -1020,6 +1580,34 @@ void ui_tick_animation(uint32_t now_ms)
 
 uint32_t ui_last_event_ms(void) { return last_event_ms; }
 bool ui_offline_active(void) { return offline_active; }
+
+bool ui_take_display_report(char *status, size_t status_len, char *source, size_t source_len)
+{
+    if (!status || status_len == 0 || !source || source_len == 0) {
+        return false;
+    }
+    portENTER_CRITICAL(&s_report_mux);
+    if (!s_report_dirty || !s_report_status[0]) {
+        portEXIT_CRITICAL(&s_report_mux);
+        return false;
+    }
+    strncpy(status, s_report_status, status_len - 1);
+    status[status_len - 1] = '\0';
+    strncpy(source, s_report_source, source_len - 1);
+    source[source_len - 1] = '\0';
+    s_report_dirty = false;
+    portEXIT_CRITICAL(&s_report_mux);
+    return true;
+}
+
+void ui_restore_display_report(void)
+{
+    portENTER_CRITICAL(&s_report_mux);
+    if (s_report_status[0]) {
+        s_report_dirty = true;
+    }
+    portEXIT_CRITICAL(&s_report_mux);
+}
 bool ui_voice_session_active(void) { return voice_session || voice_text_visible; }
 void ui_set_ws_link(bool on) { ws_link = on; }
 void ui_set_wifi(bool on, int rssi)
@@ -1034,5 +1622,19 @@ bool ui_get_wifi(void) { return wifi_connected; }
 void ui_post_voice_enabled(bool enabled)
 {
     ui_msg_t msg = {.type = UI_MSG_VOICE_ENABLED, .voice_enabled = enabled};
+    ui_post(&msg);
+}
+
+void ui_post_mic_level(float rms)
+{
+    portENTER_CRITICAL(&s_mux);
+    s_mic_pending_rms = rms;
+    s_mic_pending = true;
+    portEXIT_CRITICAL(&s_mux);
+}
+
+void ui_post_diagnostic_toggle(void)
+{
+    ui_msg_t msg = {.type = UI_MSG_DIAGNOSTIC, .diagnostic_on = true};
     ui_post(&msg);
 }

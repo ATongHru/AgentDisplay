@@ -19,3 +19,4 @@ bool net_ws_send_audio_upload(const uint8_t *pcm, size_t pcm_len, char *session_
 bool net_ws_send_audio_stream_begin(char *session_id, size_t session_id_len);
 bool net_ws_send_audio_binary(const uint8_t *pcm, size_t pcm_len);
 bool net_ws_send_audio_end(const char *session_id, size_t total_bytes, bool discard);
+bool net_ws_send_display(const char *status, const char *source);

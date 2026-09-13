@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "board_pins.h"
+#include "mem_utils.h"
 #include "driver/i2s_pdm.h"
 #include "driver/i2s_std.h"
 #include "esp_heap_caps.h"
@@ -35,6 +36,7 @@ static volatile float s_last_rms;
 static volatile uint32_t s_frame_seq;
 static float s_hp_x1;
 static float s_hp_y1;
+static float s_lp_y1;
 static i2s_pdm_slot_mask_t s_pdm_slot = I2S_PDM_SLOT_LEFT;
 static int s_quiet_reads;
 static bool s_tried_alt_slot;
@@ -47,11 +49,76 @@ static uint8_t s_play_mono[512];
 static int16_t s_play_stereo[512];
 static int s_volume_percent = 100;
 
-#define PDM_AMPLIFY 8
-#define PLAY_GAIN_100 4
+#define PLAY_GAIN_100 1
+#define LP_ALPHA 0.7f
+#define FADE_SAMPLES 160
+#define PRE_ROLL_MS 400
+#define PRE_ROLL_BYTES ((VOICE_SAMPLE_RATE * 2 * PRE_ROLL_MS) / 1000)
+#define PDM_AGC_GAIN_MIN 3.0f
+#define PDM_AGC_GAIN_MAX 10.0f
+#define PDM_AGC_GAIN_INIT 5.0f
+#define PDM_AGC_TARGET_RMS 0.3f
+#define PDM_AGC_ALPHA 0.1f
 #define PDM_READ_TIMEOUT_MS 20
 #define PDM_QUIET_PEAK 40
 #define PDM_QUIET_SWITCH_READS 50
+
+static float s_pdm_gain = PDM_AGC_GAIN_INIT;
+static size_t s_fade_in_pos;
+static bool s_fade_out_req;
+static size_t s_fade_out_pos;
+static uint8_t *s_preroll;
+static size_t s_preroll_cap;
+static size_t s_preroll_w;
+static size_t s_preroll_n;
+
+static void preroll_push(const uint8_t *data, size_t len)
+{
+    if (!s_preroll || s_preroll_cap == 0 || !data || len == 0) {
+        return;
+    }
+    if (len >= s_preroll_cap) {
+        memcpy(s_preroll, data + (len - s_preroll_cap), s_preroll_cap);
+        s_preroll_w = 0;
+        s_preroll_n = s_preroll_cap;
+        return;
+    }
+    size_t first = s_preroll_cap - s_preroll_w;
+    if (first > len) {
+        first = len;
+    }
+    memcpy(s_preroll + s_preroll_w, data, first);
+    s_preroll_w = (s_preroll_w + first) % s_preroll_cap;
+    if (first < len) {
+        memcpy(s_preroll, data + first, len - first);
+        s_preroll_w = len - first;
+    }
+    s_preroll_n += len;
+    if (s_preroll_n > s_preroll_cap) {
+        s_preroll_n = s_preroll_cap;
+    }
+}
+
+static size_t preroll_copy_out(uint8_t *dest, size_t dest_cap)
+{
+    if (!s_preroll || !dest || dest_cap == 0 || s_preroll_n == 0) {
+        return 0;
+    }
+    size_t n = s_preroll_n;
+    if (n > dest_cap) {
+        n = dest_cap;
+    }
+    size_t start = (s_preroll_w + s_preroll_cap - s_preroll_n) % s_preroll_cap;
+    size_t first = s_preroll_cap - start;
+    if (first > n) {
+        first = n;
+    }
+    memcpy(dest, s_preroll + start, first);
+    if (first < n) {
+        memcpy(dest + first, s_preroll, n - first);
+    }
+    return n;
+}
 
 static bool lock(TickType_t ticks)
 {
@@ -86,18 +153,16 @@ esp_err_t audio_init(void)
     }
     s_mutex = xSemaphoreCreateMutex();
     s_record_cap = VOICE_MAX_RECORD_BYTES;
-    s_record = heap_caps_malloc(s_record_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_record) {
-        s_record = malloc(s_record_cap);
-    }
+    s_record = psram_malloc(s_record_cap);
     s_ring_cap = VOICE_PLAY_RING_BYTES;
-    s_ring = heap_caps_malloc(s_ring_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_ring) {
-        s_ring = malloc(s_ring_cap);
-    }
-    if (!s_mutex || !s_record || !s_ring) {
+    s_ring = psram_malloc(s_ring_cap);
+    s_preroll_cap = PRE_ROLL_BYTES;
+    s_preroll = psram_malloc(s_preroll_cap);
+    if (!s_mutex || !s_record || !s_ring || !s_preroll) {
         return ESP_ERR_NO_MEM;
     }
+    s_preroll_w = 0;
+    s_preroll_n = 0;
 
     i2s_chan_config_t rx_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     ESP_ERROR_CHECK(i2s_new_channel(&rx_cfg, NULL, &s_rx));
@@ -136,6 +201,41 @@ esp_err_t audio_init(void)
     ESP_LOGI(TAG, "I2S ready PDM din=GPIO%d clk=GPIO%d tx din=GPIO%d ws=GPIO%d bclk=GPIO%d",
              PIN_PDM_DATA, PIN_PDM_CLK, PIN_I2S_DIN, PIN_I2S_LRC, PIN_I2S_BCLK);
     return ESP_OK;
+}
+
+static float lowpass(float x)
+{
+    s_lp_y1 = LP_ALPHA * s_lp_y1 + (1.0f - LP_ALPHA) * x;
+    return s_lp_y1;
+}
+
+static float playback_fade_factor(void)
+{
+    if (s_fade_in_pos < FADE_SAMPLES) {
+        return (float)s_fade_in_pos++ / (float)FADE_SAMPLES;
+    }
+    if (s_fade_out_req) {
+        if (s_fade_out_pos < FADE_SAMPLES) {
+            return 1.0f - (float)s_fade_out_pos++ / (float)FADE_SAMPLES;
+        }
+        return 0.0f;
+    }
+    return 1.0f;
+}
+
+static void agc_adjust(float rms)
+{
+    if (rms < 0.001f) {
+        return;
+    }
+    float error = PDM_AGC_TARGET_RMS / rms;
+    float gain_delta = PDM_AGC_ALPHA * (error - 1.0f);
+    s_pdm_gain += gain_delta;
+    if (s_pdm_gain < PDM_AGC_GAIN_MIN) {
+        s_pdm_gain = PDM_AGC_GAIN_MIN;
+    } else if (s_pdm_gain > PDM_AGC_GAIN_MAX) {
+        s_pdm_gain = PDM_AGC_GAIN_MAX;
+    }
 }
 
 static void switch_pdm_slot(void)
@@ -182,8 +282,9 @@ static float read_peak(bool append)
         float y = 0.99f * (s_hp_y1 + x - s_hp_x1);
         s_hp_x1 = x;
         s_hp_y1 = y;
+        y = lowpass(y);
 
-        int32_t v = (int32_t)(y * 32768.0f) * PDM_AMPLIFY;
+        int32_t v = (int32_t)(y * 32768.0f * s_pdm_gain);
         if (v > 32767) {
             v = 32767;
         } else if (v < -32768) {
@@ -199,47 +300,54 @@ static float read_peak(bool append)
     }
     s_last_rms = sqrtf(sum_sq / (float)samples);
     s_last_peak = peak_n;
+    agc_adjust(s_last_rms);
     s_frame_seq++;
 
-    if (append && lock(pdMS_TO_TICKS(20))) {
-        size_t copy = bytes_read;
-        if (s_record_size + copy > s_record_cap) {
-            copy = s_record_cap - s_record_size;
-        }
-        if (copy > 0) {
-            memcpy(s_record + s_record_size, sample_buf, copy);
-            s_record_size += copy;
+    if (lock(pdMS_TO_TICKS(20))) {
+        if (append) {
+            size_t copy = bytes_read;
+            if (s_record_size + copy > s_record_cap) {
+                copy = s_record_cap - s_record_size;
+            }
+            if (copy > 0) {
+                memcpy(s_record + s_record_size, sample_buf, copy);
+                s_record_size += copy;
+            }
+        } else {
+            preroll_push((const uint8_t *)sample_buf, bytes_read);
         }
         unlock();
     }
     return peak_n;
 }
 
-bool audio_capture_listen_start(void)
+esp_err_t audio_capture_listen_start(void)
 {
 #if !VOICE_HARDWARE_ENABLED
-    return false;
+    return ESP_ERR_NOT_SUPPORTED;
 #endif
     if (!s_inited) {
-        return false;
+        return ESP_ERR_INVALID_STATE;
     }
     if (!lock(pdMS_TO_TICKS(100))) {
-        return false;
+        return ESP_ERR_TIMEOUT;
     }
     if (!s_listening) {
         s_record_size = 0;
         s_storing = false;
+        s_preroll_w = 0;
+        s_preroll_n = 0;
         esp_err_t err = i2s_channel_enable(s_rx);
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
             ESP_LOGE(TAG, "PDM enable failed: %s", esp_err_to_name(err));
             unlock();
-            return false;
+            return err;
         }
         s_listening = true;
         s_quiet_reads = 0;
     }
     unlock();
-    return true;
+    return ESP_OK;
 }
 
 void audio_capture_listen_stop(void)
@@ -260,7 +368,7 @@ void audio_capture_begin_store(void)
     if (!lock(pdMS_TO_TICKS(100))) {
         return;
     }
-    s_record_size = 0;
+    s_record_size = preroll_copy_out(s_record, s_record_cap);
     s_storing = true;
     unlock();
 }
@@ -291,6 +399,8 @@ void audio_capture_reset_hp(void)
 {
     s_hp_x1 = 0.0f;
     s_hp_y1 = 0.0f;
+    s_lp_y1 = 0.0f;
+    s_pdm_gain = PDM_AGC_GAIN_INIT;
 }
 
 bool audio_capture_is_listening(void) { return s_listening; }
@@ -323,6 +433,9 @@ bool audio_playback_start(void)
     s_logged_pcm = false;
     s_logged_tx = false;
     s_play_start_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    s_fade_in_pos = 0;
+    s_fade_out_req = false;
+    s_fade_out_pos = 0;
     esp_err_t err = i2s_channel_enable(s_tx);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "tx enable %s", esp_err_to_name(err));
@@ -346,13 +459,32 @@ void audio_playback_stop(void)
     }
     s_playing = false;
     s_ring_head = s_ring_tail = 0;
+    s_fade_out_req = false;
+    s_fade_out_pos = 0;
     unlock();
+}
+
+void audio_playback_begin_fadeout(void)
+{
+    if (!s_fade_out_req) {
+        s_fade_out_req = true;
+        s_fade_out_pos = 0;
+    }
+}
+
+void audio_playback_cancel_fadeout(void)
+{
+    s_fade_out_req = false;
+    s_fade_out_pos = 0;
 }
 
 bool audio_playback_write(const uint8_t *data, size_t len)
 {
     if (!s_playing || !data || len == 0) {
         return false;
+    }
+    if (s_fade_out_req) {
+        audio_playback_cancel_fadeout();
     }
     if (!s_logged_pcm && len >= 2) {
         const int16_t *src = (const int16_t *)data;
@@ -426,7 +558,8 @@ void audio_playback_service(void)
     }
     const int16_t *src = (const int16_t *)s_play_mono;
     for (size_t i = 0; i < samples; ++i) {
-        int32_t v = ((int32_t)src[i] * PLAY_GAIN_100 * s_volume_percent) / 100;
+        float fade = playback_fade_factor();
+        int32_t v = (int32_t)(((int32_t)src[i] * PLAY_GAIN_100 * s_volume_percent) / 100 * fade);
         if (v > 32767) {
             v = 32767;
         } else if (v < -32768) {
@@ -466,10 +599,14 @@ void audio_set_volume_percent(int percent)
         percent = 100;
     }
     s_volume_percent = percent;
-    ESP_LOGI(TAG, "volume %d%% (100%% = previous 4x gain)", s_volume_percent);
+    ESP_LOGI(TAG, "volume %d%%", s_volume_percent);
 }
 
 int audio_get_volume_percent(void) { return s_volume_percent; }
+
+size_t audio_record_capacity(void) { return s_record_cap; }
+size_t audio_play_ring_capacity(void) { return s_ring_cap; }
+float audio_get_pdm_gain(void) { return s_pdm_gain; }
 
 bool audio_playback_is_active(void) { return s_playing; }
 
