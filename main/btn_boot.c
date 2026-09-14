@@ -1,5 +1,6 @@
 #include "btn_boot.h"
 
+#include "ap_prov.h"
 #include "ble_prov.h"
 #include "board_pins.h"
 #include "driver/gpio.h"
@@ -35,7 +36,7 @@ static void ble_start_task(void *arg)
 
 static void kick_ble_start(void)
 {
-    if (s_ble_starting || ble_prov_active()) {
+    if (s_ble_starting || ble_prov_active() || ap_prov_active()) {
         ESP_LOGI(TAG, "BLE already active/starting");
         return;
     }

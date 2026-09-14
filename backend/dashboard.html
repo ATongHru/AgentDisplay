@@ -194,10 +194,11 @@ button:disabled{opacity:.5;cursor:not-allowed}
     <span id="updated">正在连接后端...</span>
   </div>
   <div class="top-actions">
-    <button type="button" data-modal="ble">BLE 配网</button>
-    <button type="button" data-modal="wifi">网络配置记录</button>
-    <button type="button" data-modal="llm">大模型配置</button>
-    <a href="/chat-history">大模型对话历史</a>
+    <button type="button" id="lang-toggle" title="Language">EN</button>
+    <button type="button" data-modal="ble" data-i18n="nav.ble">BLE 配网</button>
+    <button type="button" data-modal="wifi" data-i18n="nav.wifi">网络配置记录</button>
+    <button type="button" data-modal="llm" data-i18n="nav.llm">大模型配置</button>
+    <a href="/chat-history" data-i18n="nav.chat">大模型对话历史</a>
   </div>
   <div class="pills">
     <div class="pill" id="pill-backend"><span class="dot"></span><span>后端 ...</span></div>
@@ -208,30 +209,30 @@ button:disabled{opacity:.5;cursor:not-allowed}
 <main class="wrap">
   <section class="workspace">
     <section class="card status-hero">
-      <h2>当前显示</h2>
+      <h2 data-i18n="section.current">当前显示</h2>
       <div class="status-main">
         <div class="status-face">
-          <img id="status-gif" alt="当前状态表情" src="/gifs/IDLE.gif" data-status="IDLE" width="148" height="148">
+          <img id="status-gif" data-i18n-aria="gif.alt" alt="当前状态表情" src="/gifs/IDLE.gif" data-status="IDLE" width="148" height="148">
         </div>
         <div class="status-copy">
           <div id="status" class="status-name">等待中</div>
           <div id="source" class="status-src">来源：BOT</div>
-          <div id="text" class="status-text">等待事件</div>
+          <div id="text" class="status-text" data-i18n="text.wait_event">等待事件</div>
         </div>
       </div>
       <div class="meta">
-        <div class="meta-row"><span>推送目标</span><b id="target">-</b></div>
-        <div class="meta-row"><span>推送失败次数</span><b id="failures">0</b></div>
-        <div class="meta-row"><span>ESP 路由 WiFi</span><b id="router-wifi">-</b></div>
-        <div class="meta-row"><span>设备状态</span><b id="device">-</b></div>
-        <div class="meta-row"><span>最后事件</span><b id="event-time">-</b></div>
+        <div class="meta-row"><span data-i18n="meta.target">推送目标</span><b id="target">-</b></div>
+        <div class="meta-row"><span data-i18n="meta.failures">推送失败次数</span><b id="failures">0</b></div>
+        <div class="meta-row"><span data-i18n="meta.router_wifi">ESP 路由 WiFi</span><b id="router-wifi">-</b></div>
+        <div class="meta-row"><span data-i18n="meta.device">设备状态</span><b id="device">-</b></div>
+        <div class="meta-row"><span data-i18n="meta.last_event">最后事件</span><b id="event-time">-</b></div>
       </div>
     </section>
     <div class="stack">
       <section class="card composer">
-        <h2>推送状态（GIF / 表情）</h2>
+        <h2 data-i18n="section.push_status">推送状态（GIF / 表情）</h2>
         <div class="row three">
-          <select id="send-status" aria-label="状态">
+          <select id="send-status" data-i18n-aria="section.push_status">
             <option value="IDLE">空闲</option>
             <option value="THINKING">思考中</option>
             <option value="CODING" selected>编码中</option>
@@ -245,48 +246,48 @@ button:disabled{opacity:.5;cursor:not-allowed}
             <option value="EAR">收听中</option>
             <option value="SPEAKING">播报中</option>
           </select>
-          <select id="status-source" aria-label="来源">
+          <select id="status-source" data-i18n-aria="source.prefix">
             <option value="BOT">BOT</option>
             <option value="CURSOR" selected>CURSOR</option>
             <option value="PI">PI</option>
             <option value="VOICE">VOICE</option>
           </select>
-          <button id="send-status-btn" class="btn-status" type="button">发送状态</button>
+          <button id="send-status-btn" class="btn-status" type="button" data-i18n="btn.send_status">发送状态</button>
         </div>
         <div class="quick" id="quick-status"></div>
         <div id="status-result" class="send-result"></div>
       </section>
       <section class="card composer text-card">
-        <h2>推送文字（底部文案）</h2>
-        <p class="hint" style="margin:0 0 8px;color:var(--muted);font-size:12px;line-height:1.45">设备只回显 <b>VOICE</b> 来源。CURSOR/BOT 只会改顶部来源标签，底部字幕不会出现。</p>
+        <h2 data-i18n="section.push_text">推送文字（底部文案）</h2>
+        <p class="hint" style="margin:0 0 8px;color:var(--muted);font-size:12px;line-height:1.45" data-i18n="hint.voice_only" data-i18n-html="1">设备只回显 <b>VOICE</b> 来源。CURSOR/BOT 只会改顶部来源标签，底部字幕不会出现。</p>
         <div class="row two">
-          <select id="text-source" aria-label="来源">
+          <select id="text-source" data-i18n-aria="source.prefix">
             <option value="VOICE" selected>VOICE</option>
             <option value="BOT">BOT</option>
             <option value="CURSOR">CURSOR</option>
             <option value="PI">PI</option>
           </select>
-          <button id="send-text-btn" class="btn-text" type="button">发送文字</button>
-          <button id="send-speak-btn" class="btn-speak" type="button">发送并播报</button>
+          <button id="send-text-btn" class="btn-text" type="button" data-i18n="btn.send_text">发送文字</button>
+          <button id="send-speak-btn" class="btn-speak" type="button" data-i18n="btn.send_speak">发送并播报</button>
         </div>
-        <textarea id="send-text" maxlength="240" placeholder="例如：正在修改代码"></textarea>
+        <textarea id="send-text" maxlength="240" data-i18n-placeholder="placeholder.text" placeholder="例如：正在修改代码"></textarea>
         <div class="volume-row">
-          <span>播报音量</span>
-          <input id="volume-slider" type="range" min="0" max="100" step="1" value="33" aria-label="播报音量">
+          <span data-i18n="label.volume">播报音量</span>
+          <input id="volume-slider" type="range" min="0" max="100" step="1" value="33" data-i18n-aria="label.volume">
           <b id="volume-label">33%</b>
         </div>
         <div class="voice-toggle">
           <span class="mic-badge" id="mic-badge" title="voice">🎤</span>
-          <span>麦克风</span>
-          <button id="voice-toggle-btn" type="button">麦克风开</button>
+          <span data-i18n="label.mic">麦克风</span>
+          <button id="voice-toggle-btn" type="button" data-i18n="btn.mic_on">麦克风开</button>
         </div>
         <div class="tts-voice-row">
-          <span>语音音色</span>
-          <select id="tts-voice" aria-label="语音音色">
+          <span data-i18n="label.tts_voice">语音音色</span>
+          <select id="tts-voice" data-i18n-aria="label.tts_voice">
             <option value="zh-CN-XiaoxiaoNeural">晓晓（女 · 微软在线）</option>
           </select>
         </div>
-        <p class="hint" style="margin:8px 0 0;color:var(--muted);font-size:12px;line-height:1.45">带「本地」的走本机 Windows 语音，不联网。其余为微软 Edge TTS 在线合成。</p>
+        <p class="hint" style="margin:8px 0 0;color:var(--muted);font-size:12px;line-height:1.45" data-i18n="hint.tts_voice">带「本地」的走本机 Windows 语音，不联网。其余为微软 Edge TTS 在线合成。</p>
         <div class="quick" id="quick-text"></div>
         <div id="text-result" class="send-result"></div>
       </section>
@@ -296,35 +297,35 @@ button:disabled{opacity:.5;cursor:not-allowed}
   
   <div class="modal-backdrop" id="modal-ble" role="dialog" aria-modal="true">
     <div class="modal">
-      <div class="modal-head"><h2>BLE 配网</h2><button type="button" class="modal-close" data-close>关闭</button></div>
-      <h2>BLE 配网（替代 SerialTest）</h2>
-    <p style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.5">
+      <div class="modal-head"><h2 data-i18n="ble.title">BLE 配网</h2><button type="button" class="modal-close" data-close data-i18n="modal.close">关闭</button></div>
+      <h2 data-i18n="ble.subtitle">BLE 配网（替代 SerialTest）</h2>
+    <p style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.5" data-i18n="ble.hint" data-i18n-html="1">
       先在设备上长按 <b>BOOT 3 秒</b>（不要按 RST），屏幕出现蓝牙标志后再点「扫描」。
       <b>不会弹出</b> Windows 蓝牙配对框（这是 BLE GATT，不是经典蓝牙配对）。
       也不要在「系统设置 → 蓝牙」里找/配对 AgentDisplay；请只用本页扫描。
       本机蓝牙需保持开启；若扫不到请刷新页面（需后端已重启加载 BLE 接口）。
     </p>
     <div class="row three" style="margin-bottom:8px">
-      <button id="ble-scan-btn" type="button">扫描 AgentDisplay</button>
-      <select id="ble-device" aria-label="设备">
-        <option value="">先扫描设备</option>
+      <button id="ble-scan-btn" type="button" data-i18n="ble.scan">扫描 AgentDisplay</button>
+      <select id="ble-device" data-i18n-aria="ble.title">
+        <option value="" data-i18n="ble.device_placeholder">先扫描设备</option>
       </select>
-      <button id="ble-apply-btn" class="btn-status" type="button">写入并 APPLY</button>
+      <button id="ble-apply-btn" class="btn-status" type="button" data-i18n="ble.apply">写入并 APPLY</button>
     </div>
     <div class="row three">
       <input id="ble-ssid" type="text" maxlength="32" placeholder="WiFi SSID" autocomplete="off">
-      <input id="ble-pass" type="password" maxlength="64" placeholder="WiFi 密码" autocomplete="off">
+      <input id="ble-pass" type="password" maxlength="64" data-i18n-placeholder="ble.pass_placeholder" placeholder="WiFi 密码" autocomplete="off">
       <span></span>
     </div>
     <div class="row three" style="margin-top:8px">
-      <input id="ble-host" type="text" maxlength="64" placeholder="后端 IP" autocomplete="off">
-      <input id="ble-port" type="number" min="1" max="65535" value="8000" placeholder="端口">
+      <input id="ble-host" type="text" maxlength="64" data-i18n-placeholder="ble.host_placeholder" placeholder="后端 IP" autocomplete="off">
+      <input id="ble-port" type="number" min="1" max="65535" value="8000" data-i18n-placeholder="ble.port_placeholder" placeholder="端口">
       <span></span>
     </div>
     <div class="row three" style="margin-top:8px">
-      <input id="ble-ip" type="text" maxlength="15" placeholder="设备静态 IP（可选）" autocomplete="off">
-      <input id="ble-mask" type="text" maxlength="15" placeholder="掩码（可选）" autocomplete="off">
-      <input id="ble-gw" type="text" maxlength="15" placeholder="网关（可选）" autocomplete="off">
+      <input id="ble-ip" type="text" maxlength="15" data-i18n-placeholder="ble.ip_placeholder" placeholder="设备静态 IP（可选）" autocomplete="off">
+      <input id="ble-mask" type="text" maxlength="15" data-i18n-placeholder="ble.mask_placeholder" placeholder="掩码（可选）" autocomplete="off">
+      <input id="ble-gw" type="text" maxlength="15" data-i18n-placeholder="ble.gw_placeholder" placeholder="网关（可选）" autocomplete="off">
     </div>
     <div id="ble-result" class="send-result" style="margin-top:8px"></div>
     <div id="ble-log" class="logs" style="max-height:140px;margin-top:8px;font-family:Consolas,monospace;font-size:12px;color:var(--muted)"></div>
@@ -332,37 +333,37 @@ button:disabled{opacity:.5;cursor:not-allowed}
   </div>
   <div class="modal-backdrop" id="modal-wifi" role="dialog" aria-modal="true">
     <div class="modal">
-      <div class="modal-head"><h2>ESP 网络配置</h2><button type="button" class="modal-close" data-close>关闭</button></div>
-      <h2>设备已存网络配置</h2>
-    <p style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.5">
+      <div class="modal-head"><h2 data-i18n="wifi.modal_title">ESP 网络配置</h2><button type="button" class="modal-close" data-close data-i18n="modal.close">关闭</button></div>
+      <h2 data-i18n="wifi.title">设备已存网络配置</h2>
+    <p style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.5" data-i18n="wifi.hint">
       这里编辑的是 ESP NVS 里已经保存的配置（最多 5 条）。保存 / 删除 / 启用都会直接写到设备。
       切换或改当前生效项时设备会重连 WiFi。设备离线时请用「BLE 配网」。
     </p>
     <div class="row three" style="margin-bottom:8px">
-      <button id="profile-pull-btn" class="btn-status" type="button">刷新设备列表</button>
-      <button id="profile-new-btn" type="button">新增</button>
+      <button id="profile-pull-btn" class="btn-status" type="button" data-i18n="wifi.pull">刷新设备列表</button>
+      <button id="profile-new-btn" type="button" data-i18n="wifi.new">新增</button>
       <span></span>
     </div>
-    <div id="wifi-profiles" class="profile-list"><div class="empty">打开后将从设备读取</div></div>
+    <div id="wifi-profiles" class="profile-list"><div class="empty" data-i18n="wifi.empty_open">打开后将从设备读取</div></div>
     <div class="wifi-form">
       <input id="wifi-edit-index" type="hidden" value="">
       <div class="row three">
         <input id="wifi-ssid" type="text" maxlength="32" placeholder="WiFi SSID" autocomplete="off">
-        <input id="wifi-pass" type="password" maxlength="64" placeholder="WiFi 密码" autocomplete="off">
+        <input id="wifi-pass" type="password" maxlength="64" data-i18n-placeholder="ble.pass_placeholder" placeholder="WiFi 密码" autocomplete="off">
         <span></span>
       </div>
       <div class="row three" style="margin-top:8px">
-        <input id="wifi-host" type="text" maxlength="64" placeholder="后端 IP" autocomplete="off">
-        <input id="wifi-port" type="number" min="1" max="65535" value="8000" placeholder="端口">
+        <input id="wifi-host" type="text" maxlength="64" data-i18n-placeholder="ble.host_placeholder" placeholder="后端 IP" autocomplete="off">
+        <input id="wifi-port" type="number" min="1" max="65535" value="8000" data-i18n-placeholder="ble.port_placeholder" placeholder="端口">
         <span></span>
       </div>
       <div class="row three" style="margin-top:8px">
-        <input id="wifi-ip" type="text" maxlength="15" placeholder="设备静态 IP（空=DHCP）" autocomplete="off">
-        <input id="wifi-mask" type="text" maxlength="15" placeholder="掩码（可选）" autocomplete="off">
-        <input id="wifi-gw" type="text" maxlength="15" placeholder="网关（可选）" autocomplete="off">
+        <input id="wifi-ip" type="text" maxlength="15" data-i18n-placeholder="wifi.ip_placeholder" placeholder="设备静态 IP（空=DHCP）" autocomplete="off">
+        <input id="wifi-mask" type="text" maxlength="15" data-i18n-placeholder="ble.mask_placeholder" placeholder="掩码（可选）" autocomplete="off">
+        <input id="wifi-gw" type="text" maxlength="15" data-i18n-placeholder="ble.gw_placeholder" placeholder="网关（可选）" autocomplete="off">
       </div>
       <div class="row three" style="margin-top:8px">
-        <button id="profile-save-btn" class="btn-status" type="button">保存到设备</button>
+        <button id="profile-save-btn" class="btn-status" type="button" data-i18n="wifi.save">保存到设备</button>
         <span></span>
         <span></span>
       </div>
@@ -372,29 +373,29 @@ button:disabled{opacity:.5;cursor:not-allowed}
   </div>
   <div class="modal-backdrop" id="modal-llm" role="dialog" aria-modal="true">
     <div class="modal">
-      <div class="modal-head"><h2>大模型配置</h2><button type="button" class="modal-close" data-close>关闭</button></div>
-      <h2>大模型配置（可存多条）</h2>
-    <p style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.5">
+      <div class="modal-head"><h2 data-i18n="llm.title">大模型配置</h2><button type="button" class="modal-close" data-close data-i18n="modal.close">关闭</button></div>
+      <h2 data-i18n="llm.subtitle">大模型配置（可存多条）</h2>
+    <p style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.5" data-i18n="llm.hint">
       OpenAI 兼容 Chat Completions（HTTP 流式）。可保存最多 8 条，启用其中一条后立即生效。
       打开本窗口时页面轮询不会覆盖你正在编辑的内容。
     </p>
     <div class="row three" style="margin-bottom:8px">
-      <button id="llm-reload-btn" type="button">刷新列表</button>
-      <button id="llm-new-btn" type="button">新增</button>
+      <button id="llm-reload-btn" type="button" data-i18n="llm.reload">刷新列表</button>
+      <button id="llm-new-btn" type="button" data-i18n="llm.new">新增</button>
       <span></span>
     </div>
-    <div id="llm-profiles" class="profile-list"><div class="empty">打开后读取已保存配置</div></div>
+    <div id="llm-profiles" class="profile-list"><div class="empty" data-i18n="llm.empty_open">打开后读取已保存配置</div></div>
     <div class="wifi-form">
       <input id="llm-edit-id" type="hidden" value="">
       <div class="llm-grid">
-        <label>名称<input id="llm-name" type="text" maxlength="32" placeholder="例如 2api / 本地" autocomplete="off"></label>
-        <label>Base URL<input id="llm-base-url" type="text" maxlength="256" placeholder="https://api.example.com 或 .../v1" autocomplete="off"></label>
-        <label>API Key<input id="llm-api-key" type="password" maxlength="256" placeholder="sk-...（留空或星号=不改原密钥）" autocomplete="off"></label>
-        <label>模型名称<input id="llm-model" type="text" maxlength="128" placeholder="模型名" autocomplete="off"></label>
+        <label><span data-i18n="llm.name">名称</span><input id="llm-name" type="text" maxlength="32" data-i18n-placeholder="llm.name_ph" placeholder="例如 2api / 本地" autocomplete="off"></label>
+        <label><span data-i18n="llm.base_url">Base URL</span><input id="llm-base-url" type="text" maxlength="256" data-i18n-placeholder="llm.base_ph" placeholder="https://api.example.com 或 .../v1" autocomplete="off"></label>
+        <label><span data-i18n="llm.api_key">API Key</span><input id="llm-api-key" type="password" maxlength="256" data-i18n-placeholder="llm.key_ph" placeholder="sk-...（留空或星号=不改原密钥）" autocomplete="off"></label>
+        <label><span data-i18n="llm.model">模型名称</span><input id="llm-model" type="text" maxlength="128" data-i18n-placeholder="llm.model_ph" placeholder="模型名" autocomplete="off"></label>
       </div>
       <div class="row three" style="margin-top:10px">
-        <button id="llm-save-btn" class="btn-status" type="button">保存</button>
-        <button id="llm-save-use-btn" class="btn-speak" type="button">保存并启用</button>
+        <button id="llm-save-btn" class="btn-status" type="button" data-i18n="llm.save">保存</button>
+        <button id="llm-save-use-btn" class="btn-speak" type="button" data-i18n="llm.save_use">保存并启用</button>
         <span></span>
       </div>
     </div>
@@ -404,24 +405,29 @@ button:disabled{opacity:.5;cursor:not-allowed}
 
 <section class="boards">
     <section class="card board">
-      <div class="log-title"><h2>状态历史</h2><span id="log-count" class="log-count">0 条</span></div>
-      <div id="logs" class="logs"><div class="empty">暂无事件记录</div></div>
+      <div class="log-title"><h2 data-i18n="log.status_history">状态历史</h2><span id="log-count" class="log-count">0 条</span></div>
+      <div id="logs" class="logs"><div class="empty" data-i18n="log.empty_events">暂无事件记录</div></div>
     </section>
     <section class="card board">
-      <div class="log-title"><h2>语音识别</h2><span id="asr-count" class="log-count">0 条</span></div>
-      <div id="asr-logs" class="logs"><div class="empty">等待设备收听并上传语音</div></div>
+      <div class="log-title"><h2 data-i18n="log.speech">语音识别</h2><span id="asr-count" class="log-count">0 条</span></div>
+      <div id="asr-logs" class="logs"><div class="empty" data-i18n="log.empty_asr">等待设备收听并上传语音</div></div>
     </section>
   </section>
   <section class="blog-row">
     <section class="card board">
-      <div class="log-title"><h2>后端日志</h2><span id="blog-count" class="log-count">0 条</span></div>
-      <div id="blog" class="logs"><div class="empty">等待 Python 后端输出</div></div>
+      <div class="log-title"><h2 data-i18n="log.backend">后端日志</h2><span id="blog-count" class="log-count">0 条</span></div>
+      <div id="blog" class="logs"><div class="empty" data-i18n="log.empty_backend">等待 Python 后端输出</div></div>
     </section>
   </section>
 </main>
+<script src="/dashboard_i18n.js"></script>
 <script>
 const $=id=>document.getElementById(id);
-const statusNames={IDLE:'空闲',THINKING:'思考中',CODING:'编码中',READING:'读取中',TESTING:'测试中',WAITING:'等待中',DONE:'已完成',ERROR:'错误',OFFLINE:'离线',STALE:'已过期',UNKNOWN:'未知',TOOL:'使用工具',EAR:'收听中',SPEAKING:'播报中'};
+const t=(key,vars)=>DashI18n.t(key,vars);
+const statusText=v=>DashI18n.statusText(v);
+const linkText=v=>DashI18n.linkText(v);
+const sourceNames={PI:'Pi',CURSOR:'Cursor',UNKNOWN:null,BOT:'BOT',VOICE:'Voice'};
+function sourceText(s){const u=String(s||'').toUpperCase();return sourceNames[u]||(u==='UNKNOWN'?t('unknown'):u||t('unknown'));}
 const gifNames={IDLE:1,THINKING:1,CODING:1,READING:1,TESTING:1,WAITING:1,DONE:1,ERROR:1,OFFLINE:1,STALE:1,UNKNOWN:1,TOOL:1,EAR:1,SPEAKING:1};
 function gifUrl(status){
   const key=String(status||'IDLE').toUpperCase();
@@ -441,53 +447,31 @@ function applyFace(status, source){
   setStatusGif(key);
   if(source!=null){
     const src=String(source||'BOT').toUpperCase();
-    $('source').textContent='来源：'+(sourceNames[src]||src||'BOT');
+    $('source').textContent=t('source.prefix')+sourceText(src||'BOT');
   }
 }
-const sourceNames={PI:'Pi',CURSOR:'Cursor',UNKNOWN:'未知',BOT:'BOT',VOICE:'Voice'};
-const linkNames={ONLINE:'在线',CONNECTED:'已连接',OFFLINE:'离线',CHECKING:'检查中',UNKNOWN:'未知'};
-const quickStatus=[
-  {label:'空闲',status:'IDLE',source:'BOT'},
-  {label:'思考中',status:'THINKING',source:'CURSOR'},
-  {label:'编码中',status:'CODING',source:'CURSOR'},
-  {label:'测试中',status:'TESTING',source:'CURSOR'},
-  {label:'等待中',status:'WAITING',source:'BOT'},
-  {label:'已完成',status:'DONE',source:'BOT'},
-  {label:'错误',status:'ERROR',source:'VOICE'}
-];
-const quickText=[
-  {label:'正在修改代码',text:'正在修改代码',source:'VOICE',role:'assistant'},
-  {label:'请稍等片刻',text:'请稍等片刻',source:'VOICE',role:'assistant'},
-  {label:'聆听中',text:'聆听中',source:'VOICE',role:'assistant'},
-  {label:'回复中',text:'回复中',source:'VOICE',role:'assistant'},
-  {label:'语音问候',text:'你好，有什么可以帮你的？',source:'VOICE',role:'assistant'},
-  {label:'清空文字',text:'',source:'VOICE'}
-];
 let backendLogs=[];
 let volumeDragging=false;
 let ttsVoiceSaving=false;
 let volumeSaveTimer=null;
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function statusText(v){return statusNames[v]||v||'未知'}
-function linkText(v){return linkNames[v]||v||'未知'}
 function setPill(id,label,kind){
   const el=$(id);
   el.className='pill '+(kind||'');
   el.innerHTML=`<span class="dot"></span><span>${esc(label)}</span>`;
 }
 function renderLogs(items){
-  $('log-count').textContent=`${items.length} 条`;
-  $('logs').innerHTML=items.length?items.map(e=>`<div class="log"><time>${esc(e.time||'-')}</time><span class="src">${esc(sourceNames[e.source]||e.source||'未知')}</span><span class="st">${esc(statusText(e.status))}</span><span class="msg">${esc(e.text||'（无附加信息）')}</span></div>`).join(''):'<div class="empty">暂无事件记录</div>';
+  $('log-count').textContent=t('log.items',{n:items.length});
+  $('logs').innerHTML=items.length?items.map(e=>`<div class="log"><time>${esc(e.time||'-')}</time><span class="src">${esc(sourceText(e.source))}</span><span class="st">${esc(statusText(e.status))}</span><span class="msg">${esc(e.text||t('log.no_extra_paren'))}</span></div>`).join(''):`<div class="empty">${esc(t('log.empty_events'))}</div>`;
 }
 function renderAsr(items){
-  const roleNames={user:'用户',assistant:'助手'};
-  $('asr-count').textContent=`${items.length} 条`;
-  $('asr-logs').innerHTML=items.length?items.map(e=>`<div class="asr-log ${esc(e.role||'user')}"><time>${esc(e.time||'-')}</time><span class="role">${esc(roleNames[e.role]||'用户')}</span><span class="msg">${esc(e.text||'（未识别到语音）')}</span></div>`).join(''):'<div class="empty">等待设备收听并上传语音</div>';
+  $('asr-count').textContent=t('log.items',{n:items.length});
+  $('asr-logs').innerHTML=items.length?items.map(e=>`<div class="asr-log ${esc(e.role||'user')}"><time>${esc(e.time||'-')}</time><span class="role">${esc(t('role.'+(e.role||'user')))}</span><span class="msg">${esc(e.text||t('log.no_speech'))}</span></div>`).join(''):`<div class="empty">${esc(t('log.empty_asr'))}</div>`;
 }
 function sameLog(a,b){return a&&b&&a.time===b.time&&a.text===b.text&&a.level===b.level}
 function drawBackendLogs(){
-  $('blog-count').textContent=`${backendLogs.length} 条`;
-  $('blog').innerHTML=backendLogs.length?backendLogs.map(e=>`<div class="blog ${esc(e.level||'info')}"><time>${esc(e.time||'-')}</time><span class="lv">${esc((e.level||'info').toUpperCase())}</span><span class="msg">${esc(e.text||'')}</span></div>`).join(''):'<div class="empty">等待 Python 后端输出</div>';
+  $('blog-count').textContent=t('log.items',{n:backendLogs.length});
+  $('blog').innerHTML=backendLogs.length?backendLogs.map(e=>`<div class="blog ${esc(e.level||'info')}"><time>${esc(e.time||'-')}</time><span class="lv">${esc((e.level||'info').toUpperCase())}</span><span class="msg">${esc(e.text||'')}</span></div>`).join(''):`<div class="empty">${esc(t('log.empty_backend'))}</div>`;
 }
 function setBackendLogs(items){
   backendLogs=Array.isArray(items)?items:[];
@@ -499,13 +483,11 @@ function prependBackendLog(item){
   backendLogs=[item,...backendLogs].slice(0,300);
   drawBackendLogs();
 }
-function renderQuickButtons(containerId,items,onPick){
-  $(containerId).innerHTML=items.map((item,i)=>`<button type="button" data-i="${i}">${esc(item.label)}</button>`).join('');
-  $(containerId).addEventListener('click',e=>{
-    const btn=e.target.closest('button[data-i]');
-    if(!btn)return;
-    onPick(items[Number(btn.dataset.i)]);
-  });
+function bindQuickButtons(){
+  const qs=DashI18n.quickStatus();
+  $('quick-status').innerHTML=qs.map((item,i)=>`<button type="button" data-qs="${i}">${esc(item.label)}</button>`).join('');
+  const qt=DashI18n.quickText();
+  $('quick-text').innerHTML=qt.map((item,i)=>`<button type="button" data-qt="${i}">${esc(item.label)}</button>`).join('');
 }
 async function postJson(url,payload){
   const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json; charset=utf-8'},body:JSON.stringify(payload)});
@@ -526,11 +508,11 @@ async function sendStatus(){
   const payload={status:$('send-status').value,source:$('status-source').value};
   btn.disabled=true;
   result.className='send-result';
-  result.textContent='发送状态中...';
+  result.textContent=t('send.status_sending');
   try{
     const data=await postJson('/event/status',payload);
     result.className='send-result ok';
-    result.textContent=data.debounced?'已忽略（与上次相同）':'状态已发送';
+    result.textContent=data.debounced?t('send.status_debounced'):t('send.status_ok');
     refresh();
   }catch(err){
     result.className='send-result bad';
@@ -551,16 +533,16 @@ async function sendText(speak=false){
   btn.disabled=true;
   other.disabled=true;
   result.className='send-result';
-  result.textContent=speak?'合成语音并发送中...':'发送文字中...';
+  result.textContent=speak?t('send.speak_sending'):t('send.text_sending');
   try{
     const data=await postJson('/event/text',payload);
     result.className='send-result ok';
     if(speak){
       const spoken=data.spoken||{};
-      result.textContent=spoken.ok?'文字已发送并开始播报':('文字已发送，播报失败：'+(spoken.detail||'未知错误'));
+      result.textContent=spoken.ok?t('send.speak_ok'):t('send.speak_fail',{detail:spoken.detail||t('unknown')});
       if(!spoken.ok) result.className='send-result bad';
     }else{
-      result.textContent=payload.text?'文字已发送（底部文案）':'已清空底部文案';
+      result.textContent=payload.text?t('send.text_ok'):t('send.text_cleared');
     }
     refresh();
   }catch(err){
@@ -584,13 +566,13 @@ async function bleRefreshStatus(){
     const box=$('ble-log');
     if(box && Array.isArray(st.logs)){
       box.innerHTML=st.logs.slice(0,12).map(x=>{
-        const t=new Date((x.ts||0)*1000).toLocaleTimeString('zh-CN');
-        return `<div>[${t}] ${x.level}: ${String(x.msg||'')}</div>`;
-      }).join('') || '<div class="empty">暂无 BLE 日志</div>';
+        const ts=new Date((x.ts||0)*1000).toLocaleTimeString(DashI18n.locale());
+        return `<div>[${ts}] ${x.level}: ${String(x.msg||'')}</div>`;
+      }).join('') || `<div class="empty">${esc(t('ble.no_logs'))}</div>`;
     }
     if(st.bleak_ok===false){
       const r=$('ble-result');
-      if(r){r.className='send-result bad';r.textContent='后端缺少 bleak，请 pip install bleak';}
+      if(r){r.className='send-result bad';r.textContent=t('ble.no_bleak');}
     }
     return st;
   }catch(e){
@@ -601,15 +583,15 @@ async function bleScan(){
   const btn=$('ble-scan-btn');
   const result=$('ble-result');
   const sel=$('ble-device');
-  btn.disabled=true; result.className='send-result'; result.textContent='扫描中（约6秒）…';
+  btn.disabled=true; result.className='send-result'; result.textContent=t('ble.scanning');
   try{
     const data=await postJson('/api/ble/scan',{timeout:6});
     const devices=data.devices||[];
     sel.innerHTML='';
     if(!devices.length){
-      sel.innerHTML='<option value="">未找到 AgentDisplay</option>';
+      sel.innerHTML=`<option value="">${esc(t('ble.not_found_option'))}</option>`;
       result.className='send-result bad';
-      result.textContent='未找到设备，请确认已长按 BOOT 进入配网';
+      result.textContent=t('ble.not_found');
     }else{
       for(const d of devices){
         const opt=document.createElement('option');
@@ -618,7 +600,7 @@ async function bleScan(){
         sel.appendChild(opt);
       }
       result.className='send-result ok';
-      result.textContent=`找到 ${devices.length} 台，可填写 WiFi 后点击写入`;
+      result.textContent=t('ble.found',{n:devices.length});
     }
     await bleRefreshStatus();
   }catch(err){
@@ -641,14 +623,14 @@ async function bleApply(){
   };
   if(!payload.ssid||!payload.host){
     result.className='send-result bad';
-    result.textContent='请填写 SSID 与后端 IP';
+    result.textContent=t('ble.need_ssid_host');
     return;
   }
-  btn.disabled=true; result.className='send-result'; result.textContent='连接并写入中…';
+  btn.disabled=true; result.className='send-result'; result.textContent=t('ble.applying');
   try{
     const data=await postJson('/api/ble/provision',payload);
     result.className='send-result ok';
-    result.textContent=`配网成功：${data.ssid} -> ${data.host}（${data.apply||'OK'}）`;
+    result.textContent=t('ble.ok',{ssid:data.ssid,host:data.host,apply:data.apply||'OK'});
     await bleRefreshStatus();
   }catch(err){
     result.className='send-result bad';
@@ -663,21 +645,21 @@ async function refresh(){
     const w=d.wifi||{};
     const e=d.event||{};
     const dev=w.device||{};
-    setPill('pill-backend','后端 '+linkText(d.backend),d.backend==='ONLINE'?'ok':'bad');
-    setPill('pill-usb',(dev.connected)?'设备已连接':'设备离线',dev.connected?'ok':'bad');
-    setPill('pill-wifi','推送 '+linkText(w.status||'CHECKING'),w.status==='CONNECTED'?'ok':w.status==='CHECKING'?'warn':'bad');
+    setPill('pill-backend',t('pill.backend')+' '+linkText(d.backend),d.backend==='ONLINE'?'ok':'bad');
+    setPill('pill-usb',dev.connected?t('pill.device_connected'):t('pill.device_offline'),dev.connected?'ok':'bad');
+    setPill('pill-wifi',t('pill.push')+' '+linkText(w.status||'CHECKING'),w.status==='CONNECTED'?'ok':w.status==='CHECKING'?'warn':'bad');
     const offline=!dev.connected;
     if(offline){
       applyFace('OFFLINE', null);
-      $('source').textContent='来源：设备';
+      $('source').textContent=t('source.prefix')+t('source.device');
     }else{
       applyFace((d.display&&d.display.status)||e.status, (d.display&&d.display.source)||e.source||'BOT');
     }
-    $('text').textContent=offline?'设备未连接后端':(e.text||'暂无附加信息');
-    $('target').textContent=w.target||'未启用';
+    $('text').textContent=offline?t('text.device_offline'):(e.text||t('text.no_extra'));
+    $('target').textContent=w.target||t('meta.not_enabled');
     $('failures').textContent=w.failures??0;
-    $('router-wifi').textContent=w.router_wifi===true?'已连接':w.router_wifi===false?'未连接':'未检测';
-    $('device').textContent=dev.connected?'WebSocket 已连接':(dev.connected===false?'WebSocket 未连接':'未检测');
+    $('router-wifi').textContent=w.router_wifi===true?t('meta.connected'):w.router_wifi===false?t('meta.disconnected'):t('meta.not_detected');
+    $('device').textContent=dev.connected?t('meta.ws_connected'):(dev.connected===false?t('meta.ws_disconnected'):t('meta.not_detected'));
     $('event-time').textContent=e.time||statusText(e.status);
     renderLogs(d.history||[]);
     renderAsr(d.transcripts||[]);
@@ -685,16 +667,16 @@ async function refresh(){
     if(!volumeDragging && d.volume_percent!=null) setVolumeUi(d.volume_percent);
     if(d.voice_enabled!=null) setVoiceUi(d.voice_enabled);
     if(!ttsVoiceSaving && d.tts_voice!=null) setTtsVoiceUi(d.tts_voice, d.tts_voices);
-    $('updated').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN');
+    $('updated').textContent=t('updated.at',{time:new Date().toLocaleTimeString(DashI18n.locale())});
   }catch{
-    $('updated').textContent='后端不可用';
-    setPill('pill-backend','后端离线','bad');
-    setPill('pill-usb','设备离线','bad');
-    setPill('pill-wifi','推送离线','bad');
+    $('updated').textContent=t('updated.backend_down');
+    setPill('pill-backend',t('pill.backend')+' '+linkText('OFFLINE'),'bad');
+    setPill('pill-usb',t('pill.device_offline'),'bad');
+    setPill('pill-wifi',t('pill.push')+' '+linkText('OFFLINE'),'bad');
     $('status').textContent=statusText('OFFLINE');
     setStatusGif('OFFLINE');
-    $('source').textContent='来源：设备';
-    $('text').textContent='后端不可用';
+    $('source').textContent=t('source.prefix')+t('source.device');
+    $('text').textContent=t('updated.backend_down');
   }
 }
 function connectLogsWs(){
@@ -714,12 +696,25 @@ function connectLogsWs(){
   ws.addEventListener('close',()=>setTimeout(connectLogsWs,2000));
   ws.addEventListener('error',()=>ws.close());
 }
-renderQuickButtons('quick-status',quickStatus,item=>{$('send-status').value=item.status;$('status-source').value=item.source});
-renderQuickButtons('quick-text',quickText,item=>{
+bindQuickButtons();
+$('quick-status').addEventListener('click',e=>{
+  const btn=e.target.closest('button[data-qs]');
+  if(!btn)return;
+  const item=DashI18n.quickStatus()[Number(btn.dataset.qs)];
+  if(!item)return;
+  $('send-status').value=item.status;
+  $('status-source').value=item.source;
+});
+$('quick-text').addEventListener('click',e=>{
+  const btn=e.target.closest('button[data-qt]');
+  if(!btn)return;
+  const item=DashI18n.quickText()[Number(btn.dataset.qt)];
+  if(!item)return;
   $('send-text').value=item.text;
   $('text-source').value=item.source||'VOICE';
   pendingTextRole=item.role||(item.text?'assistant':'');
 });
+$('lang-toggle')?.addEventListener('click',()=>DashI18n.toggleLang());
 $('send-status-btn').addEventListener('click',sendStatus);
 $('send-text-btn').addEventListener('click',()=>sendText(false));
 $('send-speak-btn').addEventListener('click',()=>sendText(true));
@@ -734,7 +729,7 @@ function setVoiceUi(enabled){
   const btn=$('voice-toggle-btn');
   const mic=$('mic-badge');
   if(!btn||!mic) return;
-  btn.textContent=voiceEnabled?'麦克风开':'麦克风关';
+  btn.textContent=voiceEnabled?t('btn.mic_on'):t('btn.mic_off');
   btn.classList.toggle('off', !voiceEnabled);
   mic.classList.toggle('off', !voiceEnabled);
 }
@@ -759,8 +754,8 @@ function setTtsVoiceUi(voice, voices){
       const local=voices.filter(item=>item.local);
       const online=voices.filter(item=>!item.local);
       let html='';
-      if(local.length) html+=`<optgroup label="本地系统（离线）">${local.map(opt).join('')}</optgroup>`;
-      if(online.length) html+=`<optgroup label="微软在线">${online.map(opt).join('')}</optgroup>`;
+      if(local.length) html+=`<optgroup label="${esc(t('tts.local_group'))}">${local.map(opt).join('')}</optgroup>`;
+      if(online.length) html+=`<optgroup label="${esc(t('tts.online_group'))}">${online.map(opt).join('')}</optgroup>`;
       sel.innerHTML=html||voices.map(opt).join('');
       sel.dataset.fp=fp;
     }
@@ -864,7 +859,7 @@ function llmFormPayload(activate){
   };
   const id=$('llm-edit-id').value.trim();
   if(id) payload.id=id;
-  if(!payload.base_url||!payload.model) throw new Error('Base URL 与模型名称不能为空');
+  if(!payload.base_url||!payload.model) throw new Error(t('llm.err_required'));
   return payload;
 }
 function applyLlmStore(data){
@@ -878,15 +873,15 @@ function applyLlmStore(data){
 function renderLlmProfiles(){
   const box=$('llm-profiles');
   if(!box) return;
-  if(!llmProfiles.length){ box.innerHTML='<div class="empty">还没有 LLM 配置</div>'; return; }
+  if(!llmProfiles.length){ box.innerHTML=`<div class="empty">${esc(t('llm.empty'))}</div>`; return; }
   box.innerHTML=llmProfiles.map(p=>{
     const on=p.id===llmActive;
-    return '<div class="profile-item'+(on?' active':'')+'"><div class="meta"><b style="color:var(--text)">'+esc(p.name||p.model||'未命名')+
-      (on?'<span class="tag">当前</span>':'')+
+    return '<div class="profile-item'+(on?' active':'')+'"><div class="meta"><b style="color:var(--text)">'+esc(p.name||p.model||t('wifi.unnamed'))+
+      (on?'<span class="tag">'+esc(t('wifi.current'))+'</span>':'')+
       '</b><br>'+esc(p.model||'')+' · '+esc(p.base_url||'')+'</div><div class="actions">'+
-      '<button type="button" data-llm="edit" data-id="'+esc(p.id)+'">编辑</button>'+
-      (on?'':'<button type="button" data-llm="use" data-id="'+esc(p.id)+'">启用</button>')+
-      '<button type="button" data-llm="del" data-id="'+esc(p.id)+'">删除</button></div></div>';
+      '<button type="button" data-llm="edit" data-id="'+esc(p.id)+'">'+esc(t('wifi.edit'))+'</button>'+
+      (on?'':'<button type="button" data-llm="use" data-id="'+esc(p.id)+'">'+esc(t('wifi.use'))+'</button>')+
+      '<button type="button" data-llm="del" data-id="'+esc(p.id)+'">'+esc(t('wifi.del'))+'</button></div></div>';
   }).join('');
 }
 async function reloadLlm(){
@@ -937,7 +932,7 @@ function wifiFormPayload(){
     gateway:$('wifi-gw').value.trim(),
   };
   if(raw!=='') payload.index=Number(raw);
-  if(!payload.ssid||!payload.host) throw new Error('SSID 与后端 IP 不能为空');
+  if(!payload.ssid||!payload.host) throw new Error(t('wifi.err_ssid_host'));
   return payload;
 }
 function renderWifiProfiles(list, active){
@@ -945,20 +940,21 @@ function renderWifiProfiles(list, active){
   if(active!=null) wifiActive=Number(active)||0;
   const box=$('wifi-profiles');
   if(!box) return;
-  if(!wifiProfiles.length){ box.innerHTML='<div class="empty">设备上还没有网络配置</div>'; return; }
+  if(!wifiProfiles.length){ box.innerHTML=`<div class="empty">${esc(t('wifi.empty_device'))}</div>`; return; }
   box.innerHTML=wifiProfiles.map(p=>{
     const idx=Number(p.index);
     const on=idx===wifiActive;
-    const tip=p.ip?(' · IP '+p.ip):' · DHCP';
+    const tip=p.ip?t('wifi.ip_prefix')+p.ip:t('wifi.dhcp');
     return '<div class="profile-item'+(on?' active':'')+'"><div class="meta"><b style="color:var(--text)">#'+idx+' '+(p.ssid||'')+
-      (on?'<span class="tag">当前</span>':'')+
-      '</b><br>'+(p.host||'')+':'+p.port+tip+'</div><div class="actions">'+
-      '<button type="button" data-act="edit" data-index="'+idx+'">编辑</button>'+
-      (on?'':'<button type="button" data-act="use" data-index="'+idx+'">启用</button>')+
-      '<button type="button" data-act="del" data-index="'+idx+'">删除</button></div></div>';
+      (on?'<span class="tag">'+esc(t('wifi.current'))+'</span>':'')+
+      '</b><br>'+(p.host||'')+':'+p.port+esc(tip)+'</div><div class="actions">'+
+      '<button type="button" data-act="edit" data-index="'+idx+'">'+esc(t('wifi.edit'))+'</button>'+
+      (on?'':'<button type="button" data-act="use" data-index="'+idx+'">'+esc(t('wifi.use'))+'</button>')+
+      '<button type="button" data-act="del" data-index="'+idx+'">'+esc(t('wifi.del'))+'</button></div></div>';
   }).join('');
 }
 
+$('updated').textContent=t('updated.connecting');
 connectLogsWs();
 refresh();
 
@@ -975,7 +971,7 @@ $('profile-save-btn')?.addEventListener('click',()=>{
     renderWifiProfiles(data.profiles||[], data.active);
     if(result){
       result.className='send-result ok';
-      result.textContent=editing?'已保存到设备':'已新增到设备';
+      result.textContent=editing?t('wifi.saved'):t('wifi.added');
     }
   }).catch(err=>{
     if(result){ result.className='send-result bad'; result.textContent=String(err.message||err); }
@@ -984,7 +980,7 @@ $('profile-save-btn')?.addEventListener('click',()=>{
 $('profile-new-btn')?.addEventListener('click',()=>{
   clearWifiForm();
   $('profile-result').className='send-result';
-  $('profile-result').textContent='填写后点「保存到设备」新增一条（最多 5 条）';
+  $('profile-result').textContent=t('wifi.new_hint');
 });
 $('wifi-profiles')?.addEventListener('click',ev=>{
   const btn=ev.target.closest('button[data-act]'); if(!btn) return;
@@ -994,40 +990,40 @@ $('wifi-profiles')?.addEventListener('click',ev=>{
   const result=$('profile-result');
   if(act==='edit'){
     fillWifiForm(p);
-    if(result){ result.className='send-result ok'; result.textContent='正在编辑 #'+idx+'，改完点保存到设备'; }
+    if(result){ result.className='send-result ok'; result.textContent=t('wifi.editing',{idx}); }
   } else if(act==='use'){
     postJson('/api/device/wifi-profiles/activate',{index:idx}).then(data=>{
       renderWifiProfiles(data.profiles||[], data.active);
-      if(result){ result.className='send-result ok'; result.textContent='已切换为 #'+idx+'，设备正在重连'; }
+      if(result){ result.className='send-result ok'; result.textContent=t('wifi.activated',{idx}); }
     }).catch(err=>{
       if(result){ result.className='send-result bad'; result.textContent=String(err.message||err); }
     });
   } else if(act==='del'){
-    if(!confirm('确认从设备删除这条网络配置？')) return;
+    if(!confirm(t('wifi.confirm_delete'))) return;
     postJson('/api/device/wifi-profiles/delete',{index:idx}).then(data=>{
       renderWifiProfiles(data.profiles||[], data.active);
       if($('wifi-edit-index').value===String(idx)) clearWifiForm();
-      if(result){ result.className='send-result ok'; result.textContent='已从设备删除'; }
+      if(result){ result.className='send-result ok'; result.textContent=t('wifi.deleted'); }
     }).catch(err=>{
       if(result){ result.className='send-result bad'; result.textContent=String(err.message||err); }
     });
   }
 });
 $('llm-save-btn')?.addEventListener('click',()=>{
-  saveLlm(false).then(()=>llmResult(true,'已保存（未切换当前启用项）'))
+  saveLlm(false).then(()=>llmResult(true,t('llm.saved')))
   .catch(err=>llmResult(false,String(err.message||err)));
 });
 $('llm-save-use-btn')?.addEventListener('click',()=>{
-  saveLlm(true).then(()=>llmResult(true,'已保存并启用'))
+  saveLlm(true).then(()=>llmResult(true,t('llm.saved_use')))
   .catch(err=>llmResult(false,String(err.message||err)));
 });
 $('llm-reload-btn')?.addEventListener('click',()=>{
-  reloadLlm().then(()=>llmResult(true,'已重新读取'))
+  reloadLlm().then(()=>llmResult(true,t('llm.reloaded')))
   .catch(err=>llmResult(false,String(err.message||err)));
 });
 $('llm-new-btn')?.addEventListener('click',()=>{
   clearLlmForm();
-  llmResult(true,'填写后点保存，会新增一条而不会覆盖已有配置');
+  llmResult(true,t('llm.new_hint'));
 });
 $('llm-profiles')?.addEventListener('click',ev=>{
   const btn=ev.target.closest('button[data-llm]'); if(!btn) return;
@@ -1036,21 +1032,21 @@ $('llm-profiles')?.addEventListener('click',ev=>{
   const p=llmProfiles.find(x=>x.id===id);
   if(act==='edit'){
     fillLlmForm(p);
-    llmResult(true,'正在编辑「'+(p&&p.name||'')+'」，改完点保存');
+    llmResult(true,t('llm.editing',{name:(p&&p.name)||''}));
   } else if(act==='use'){
     postJson('/api/llm/activate',{id}).then(data=>{
       applyLlmStore(data);
-      llmResult(true,'已启用「'+(p&&p.name||id)+'」');
+      llmResult(true,t('llm.activated',{name:(p&&p.name)||id}));
     }).catch(err=>llmResult(false,String(err.message||err)));
   } else if(act==='del'){
-    if(!confirm('确认删除这条 LLM 配置？')) return;
+    if(!confirm(t('llm.confirm_delete'))) return;
     postJson('/api/llm/delete',{id}).then(data=>{
       const store=applyLlmStore(data);
       if($('llm-edit-id').value===id){
         const cur=llmProfiles.find(x=>x.id===store.active)||llmProfiles[0];
         if(cur) fillLlmForm(cur); else clearLlmForm();
       }
-      llmResult(true,'已删除');
+      llmResult(true,t('llm.deleted'));
     }).catch(err=>llmResult(false,String(err.message||err)));
   }
 });
@@ -1086,7 +1082,7 @@ async function pullProfilesFromDevice(){
   const result=$('profile-result');
   const btn=$('profile-pull-btn');
   if(btn) btn.disabled=true;
-  if(result){ result.className='send-result'; result.textContent='正在读取设备已存配置…'; }
+  if(result){ result.className='send-result'; result.textContent=t('wifi.pulling'); }
   try{
     const data=await postJson('/api/device/wifi-profiles',{});
     const list=data.profiles||[];
@@ -1100,7 +1096,7 @@ async function pullProfilesFromDevice(){
     }
     if(result){
       result.className='send-result ok';
-      result.textContent=`设备上有 ${list.length} 条，当前生效 #${Number(data.active||0)}`;
+      result.textContent=t('wifi.pull_ok',{n:list.length,active:Number(data.active||0)});
     }
   }catch(err){
     if(result){ result.className='send-result bad'; result.textContent=String(err.message||err); }
@@ -1132,6 +1128,14 @@ refresh = async function(){
 };
 
 setInterval(refresh,1000);
+
+DashI18n.onLangChange(()=>{
+  bindQuickButtons();
+  renderWifiProfiles(wifiProfiles, wifiActive);
+  renderLlmProfiles();
+  setVoiceUi(voiceEnabled);
+  refresh();
+});
 </script>
 </body>
 </html>

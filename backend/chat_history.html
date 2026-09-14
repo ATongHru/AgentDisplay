@@ -1,5 +1,6 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大模型对话历史</title><style>:root{--bg:#080b10;--panel:#121820;--line:#2a3646;--text:#edf3fa;--muted:#8090a3;--ok:#3dcc86;--warn:#e6b23c;--accent:#7c96ff;--teal:#3ee0c5;--chip:#1c2734;--radius:12px}*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font:14px/1.5 Segoe UI,Microsoft YaHei,system-ui,sans-serif}body{padding:0 0 32px}.topbar{position:sticky;top:0;z-index:10;background:rgba(13,18,25,.92);backdrop-filter:blur(10px);border-bottom:1px solid var(--line);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;gap:12px}.brand{display:flex;flex-direction:column;gap:2px}.brand h1{margin:0;font-size:18px;font-weight:650}.brand span{color:var(--muted);font-size:12px}.topbar a{color:var(--accent);text-decoration:none;font-size:13px}.wrap{max-width:1100px;margin:18px auto 0;padding:0 20px;display:grid;gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px}.filters{display:grid;grid-template-columns:2fr 1fr 1fr 1fr auto auto;gap:8px;align-items:end}label{display:grid;gap:4px;color:var(--muted);font-size:12px}input,select,button{font:inherit}input,select{background:#0d141d;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:8px 10px;width:100%}button{border:0;border-radius:8px;padding:8px 14px;font-weight:650;cursor:pointer;min-height:38px;background:var(--accent);color:#0b1017}button.secondary{background:var(--chip);color:var(--text);border:1px solid var(--line)}.stats{display:flex;flex-wrap:wrap;gap:10px;color:var(--muted);font-size:13px}.stats b{color:var(--text)}.list{display:grid;gap:10px}.item{border:1px solid var(--line);border-radius:10px;padding:12px;background:#0f151d;display:grid;gap:8px}.item-head{display:flex;flex-wrap:wrap;gap:8px 14px;color:var(--muted);font-size:12px}.item-head .src{color:var(--teal);font-weight:650}.item-head .tok{color:var(--warn)}.bubble{display:grid;gap:4px}.bubble .role{font-size:12px;color:var(--muted)}.bubble.user .role{color:var(--accent)}.bubble.assistant .role{color:var(--ok)}.bubble .txt{white-space:pre-wrap;overflow-wrap:anywhere}.pager{display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap;margin-top:14px}.pager span{color:var(--muted);font-size:13px}.empty{color:var(--muted);padding:24px;text-align:center}.err{color:#ff8a93}@media (max-width:900px){.filters{grid-template-columns:1fr 1fr}}</style></head><body><header class="topbar"><div class="brand"><h1>大模型对话历史</h1><span>落盘于项目 log/llm_chat.jsonl，支持分页与关键词查询</span></div><a href="/">&larr; 返回控制台</a></header><main class="wrap"><section class="card"><div class="filters"><label>关键词<input id="q" type="search" placeholder="用户 / 助手 / 模型 / session"></label><label>来源<select id="source"><option value="">全部</option><option value="VOICE">VOICE</option><option value="BOT">BOT</option><option value="CURSOR">CURSOR</option></select></label><label>起始日期<input id="date_from" type="date"></label><label>结束日期<input id="date_to" type="date"></label><button id="search-btn" type="button">查询</button><button id="reset-btn" class="secondary" type="button">重置</button></div></section><section class="card"><div class="stats"><span>共 <b id="total">0</b> 条</span><span>筛选结果 token 合计 <b id="tokens">0</b></span><span>第 <b id="page">1</b> / <b id="pages">1</b> 页</span></div></section><section class="card"><div id="list" class="list"><div class="empty">加载中...</div></div><div class="pager"><button id="prev-btn" class="secondary" type="button">上一页</button><span id="pager-label">-</span><button id="next-btn" class="secondary" type="button">下一页</button></div></section></main><script>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大模型对话历史</title><style>:root{--bg:#080b10;--panel:#121820;--line:#2a3646;--text:#edf3fa;--muted:#8090a3;--ok:#3dcc86;--warn:#e6b23c;--accent:#7c96ff;--teal:#3ee0c5;--chip:#1c2734;--radius:12px}*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font:14px/1.5 Segoe UI,Microsoft YaHei,system-ui,sans-serif}body{padding:0 0 32px}.topbar{position:sticky;top:0;z-index:10;background:rgba(13,18,25,.92);backdrop-filter:blur(10px);border-bottom:1px solid var(--line);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;gap:12px}.brand{display:flex;flex-direction:column;gap:2px}.brand h1{margin:0;font-size:18px;font-weight:650}.brand span{color:var(--muted);font-size:12px}.topbar-actions{display:flex;align-items:center;gap:10px}.topbar button,.topbar a{color:var(--accent);text-decoration:none;font-size:13px;padding:6px 12px;border:1px solid var(--line);border-radius:999px;background:var(--chip);font-weight:550;cursor:pointer}.wrap{max-width:1100px;margin:18px auto 0;padding:0 20px;display:grid;gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px}.filters{display:grid;grid-template-columns:2fr 1fr 1fr 1fr auto auto;gap:8px;align-items:end}label{display:grid;gap:4px;color:var(--muted);font-size:12px}input,select,button{font:inherit}input,select{background:#0d141d;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:8px 10px;width:100%}button{border:0;border-radius:8px;padding:8px 14px;font-weight:650;cursor:pointer;min-height:38px;background:var(--accent);color:#0b1017}button.secondary{background:var(--chip);color:var(--text);border:1px solid var(--line)}.stats{display:flex;flex-wrap:wrap;gap:10px;color:var(--muted);font-size:13px}.stats b{color:var(--text)}.list{display:grid;gap:10px}.item{border:1px solid var(--line);border-radius:10px;padding:12px;background:#0f151d;display:grid;gap:8px}.item-head{display:flex;flex-wrap:wrap;gap:8px 14px;color:var(--muted);font-size:12px}.item-head .src{color:var(--teal);font-weight:650}.item-head .tok{color:var(--warn)}.bubble{display:grid;gap:4px}.bubble .role{font-size:12px;color:var(--muted)}.bubble.user .role{color:var(--accent)}.bubble.assistant .role{color:var(--ok)}.bubble .txt{white-space:pre-wrap;overflow-wrap:anywhere}.pager{display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap;margin-top:14px}.pager span{color:var(--muted);font-size:13px}.empty{color:var(--muted);padding:24px;text-align:center}.err{color:#ff8a93}@media (max-width:900px){.filters{grid-template-columns:1fr 1fr}}</style></head><body><header class="topbar"><div class="brand"><h1 data-i18n="chat.title">大模型对话历史</h1><span data-i18n="chat.subtitle">落盘于项目 log/llm_chat.jsonl，支持分页与关键词查询</span></div><div class="topbar-actions"><button type="button" id="lang-toggle">EN</button><a href="/" data-i18n="chat.back">&larr; 返回控制台</a></div></header><main class="wrap"><section class="card"><div class="filters"><label><span data-i18n="chat.keyword">关键词</span><input id="q" type="search" data-i18n-placeholder="chat.keyword_ph" placeholder="用户 / 助手 / 模型 / session"></label><label><span data-i18n="chat.source">来源</span><select id="source"><option value="" data-i18n="chat.all">全部</option><option value="VOICE">VOICE</option><option value="BOT">BOT</option><option value="CURSOR">CURSOR</option></select></label><label><span data-i18n="chat.date_from">起始日期</span><input id="date_from" type="date"></label><label><span data-i18n="chat.date_to">结束日期</span><input id="date_to" type="date"></label><button id="search-btn" type="button" data-i18n="chat.search">查询</button><button id="reset-btn" class="secondary" type="button" data-i18n="chat.reset">重置</button></div></section><section class="card"><div class="stats"><span id="stat-total"></span><span id="stat-tokens"></span><span id="stat-page"></span></div></section><section class="card"><div id="list" class="list"><div class="empty" data-i18n="chat.loading">加载中...</div></div><div class="pager"><button id="prev-btn" class="secondary" type="button" data-i18n="chat.prev">上一页</button><span id="pager-label">-</span><button id="next-btn" class="secondary" type="button" data-i18n="chat.next">下一页</button></div></section></main><script src="/dashboard_i18n.js"></script><script>
 function el(id){return document.getElementById(id);}
+var t=function(key,vars){return DashI18n.t(key,vars);};
 var state={page:1,page_size:20,total:0,pages:1};
 function esc(s){
   return String(s||'').replace(/[&<>"']/g,function(c){
@@ -34,8 +35,8 @@ function renderItem(it){
   h+='<span>'+esc(it.session_id||'')+'</span>';
   if(it.error) h+='<span class="err">'+esc(it.error)+'</span>';
   h+='</div>';
-  h+='<div class="bubble user"><div class="role">用户</div><div class="txt">'+esc(it.user||'(空)')+'</div></div>';
-  h+='<div class="bubble assistant"><div class="role">助手</div><div class="txt">'+esc(it.assistant||'(空)')+'</div></div>';
+  h+='<div class="bubble user"><div class="role">'+esc(t('role.user'))+'</div><div class="txt">'+esc(it.user||t('chat.empty_paren'))+'</div></div>';
+  h+='<div class="bubble assistant"><div class="role">'+esc(t('role.assistant'))+'</div><div class="txt">'+esc(it.assistant||t('chat.empty_paren'))+'</div></div>';
   h+='</article>';
   return h;
 }
@@ -43,28 +44,27 @@ function render(data){
   state.page=data.page;
   state.pages=data.pages;
   state.total=data.total;
-  el('total').textContent=data.total;
-  el('tokens').textContent=data.total_tokens||0;
-  el('page').textContent=data.page;
-  el('pages').textContent=data.pages;
+  el('stat-total').textContent=t('chat.total',{n:data.total});
+  el('stat-tokens').textContent=t('chat.tokens_sum',{n:data.total_tokens||0});
+  el('stat-page').textContent=t('chat.page_of',{page:data.page,pages:data.pages});
   el('pager-label').textContent=data.page+' / '+data.pages;
   el('prev-btn').disabled=data.page<=1;
   el('next-btn').disabled=data.page>=data.pages;
   var items=data.items||[];
   if(!items.length){
-    el('list').innerHTML='<div class="empty">没有匹配的记录</div>';
+    el('list').innerHTML='<div class="empty">'+esc(t('chat.no_records'))+'</div>';
     return;
   }
   el('list').innerHTML=items.map(renderItem).join('');
 }
 async function load(){
-  el('list').innerHTML='<div class="empty">加载中...</div>';
+  el('list').innerHTML='<div class="empty">'+esc(t('chat.loading'))+'</div>';
   try{
     var res=await fetch('/api/chat-history?'+params().toString(),{cache:'no-store'});
     if(!res.ok) throw new Error('HTTP '+res.status);
     render(await res.json());
   }catch(err){
-    el('list').innerHTML='<div class="empty err">加载失败：'+esc(err.message||err)+'</div>';
+    el('list').innerHTML='<div class="empty err">'+esc(t('chat.load_fail',{detail:err.message||err}))+'</div>';
   }
 }
 el('search-btn').onclick=function(){state.page=1; load();};
@@ -79,5 +79,8 @@ el('reset-btn').onclick=function(){
 el('prev-btn').onclick=function(){if(state.page>1){state.page--; load();}};
 el('next-btn').onclick=function(){if(state.page<state.pages){state.page++; load();}};
 el('q').addEventListener('keydown',function(e){if(e.key==='Enter'){state.page=1; load();}});
+el('lang-toggle').onclick=function(){DashI18n.toggleLang();};
+DashI18n.onLangChange(function(){DashI18n.applyStatic(); load();});
+document.title=t('chat.title');
 load();
 </script></body></html>

@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "audio.h"
+#include "ap_prov.h"
 #include "ble_prov.h"
 #include "board_pins.h"
 #include "esp_log.h"
@@ -272,7 +273,7 @@ void voice_loop(void)
 #if !VOICE_HARDWARE_ENABLED
     return;
 #endif
-    if (ble_prov_active()) {
+    if (ble_prov_active() || ap_prov_active()) {
         return;
     }
     if (!s_voice_enabled) {

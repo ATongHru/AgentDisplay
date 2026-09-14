@@ -1,5 +1,5 @@
 {
-  "volume_percent": 39,
+  "volume_percent": 33,
   "voice_enabled": true,
-  "tts_voice": "sapi:TTS_MS_ZH-CN_HUIHUI_11.0"
+  "tts_voice": "zh-CN-XiaoxiaoNeural"
 }

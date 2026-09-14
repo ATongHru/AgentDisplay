@@ -6,6 +6,9 @@ idf_component_register(
         "anim_loader.c"
         "net_ws.c"
         "ble_prov.c"
+        "ap_prov.c"
+        "prov_cfg.c"
+        "serial_cli.c"
         "btn_boot.c"
         "agent_cfg.c"
         "audio.c"
@@ -18,6 +21,7 @@ idf_component_register(
         driver
         esp_lcd
         esp_wifi
+        esp_http_server
         esp_event
         esp_netif
         esp_timer

@@ -468,6 +468,14 @@ def dashboard():
     return HTMLResponse(DASHBOARD_HTML.read_text(encoding="utf-8"))
 
 
+@app.get("/dashboard_i18n.js")
+def dashboard_i18n_js():
+    path = Path(__file__).with_name("dashboard_i18n.js")
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="dashboard_i18n.js missing")
+    return HTMLResponse(path.read_text(encoding="utf-8"), media_type="application/javascript")
+
+
 @app.get("/chat-history", response_class=HTMLResponse)
 def chat_history_page():
     if not CHAT_HISTORY_HTML.is_file():

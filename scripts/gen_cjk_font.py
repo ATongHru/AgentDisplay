@@ -19,6 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CHARS_FILE = ROOT / "third_party" / "fonts" / "tyz_7000_chars.txt"
+EXTRA_SYMBOLS_FILE = ROOT / "third_party" / "fonts" / "extra_symbols.txt"
 OUT_BIN = ROOT / "firmware" / "data" / "font_cjk_16.bin"
 OUT_H = ROOT / "main" / "font_cjk_16.h"
 OUT_SIZE_H = ROOT / "main" / "font_size.h"
@@ -30,7 +31,20 @@ FONT_CANDIDATES = [
     Path("C:/Windows/Fonts/simsun.ttc"),
 ]
 
-EXTRA_SYMBOLS = "。，、：；？！「」『』（）【】《》…—·￥"
+
+def load_extra_symbols() -> str:
+    text = EXTRA_SYMBOLS_FILE.read_text(encoding="utf-8")
+    chars = []
+    seen = set()
+    for line in text.splitlines():
+        line = line.split("#", 1)[0]
+        for ch in line:
+            if ch.isspace():
+                continue
+            if ch not in seen:
+                seen.add(ch)
+                chars.append(ch)
+    return "".join(chars)
 
 
 def load_tyz_chars() -> str:
@@ -61,7 +75,8 @@ def main() -> int:
         return 1
 
     tyz_chars = load_tyz_chars()
-    extra = "".join(dict.fromkeys(ch for ch in EXTRA_SYMBOLS if ch not in tyz_chars))
+    extra_all = load_extra_symbols()
+    extra = "".join(dict.fromkeys(ch for ch in extra_all if ch not in tyz_chars))
     symbols = extra + tyz_chars
 
     npx = shutil.which("npx") or shutil.which("npx.cmd")
@@ -93,7 +108,10 @@ def main() -> int:
         str(OUT_BIN),
     ]
     print(f"font={font_path}")
-    print(f"size={args.size} bpp={args.bpp} tyz={len(tyz_chars)} extra={len(extra)} ascii=0x20-0x7F")
+    print(
+        f"size={args.size} bpp={args.bpp} tyz={len(tyz_chars)} "
+        f"extra={len(extra)} (from {EXTRA_SYMBOLS_FILE.name}) ascii=0x20-0x7F"
+    )
     print("running lv_font_conv (bin) ...")
     subprocess.run(cmd, check=True)
 

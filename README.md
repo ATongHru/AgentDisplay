@@ -1,5 +1,7 @@
 # ESP32-S3 Agent Display
 
+**中文** | [English](README.en.md) · [开发环境搭建](docs/开发环境搭建.md) · [Dev Setup (EN)](docs/dev-setup.en.md)
+
 ESP32-S3 N16R8 桌面状态屏：WebSocket 状态下行、离线 RGB565 RLE 表情、PDM 开机自动收听、PC 后端 ASR + LLM，网页日志带时间戳。
 
 | 项 | 规格 |
@@ -8,13 +10,20 @@ ESP32-S3 N16R8 桌面状态屏：WebSocket 状态下行、离线 RGB565 RLE 表�
 | 通信 | WebSocket（`espressif/esp_websocket_client`） |
 | 后端 | FastAPI + uvicorn，默认 `:8000` |
 
+### 实景预览
+
+| 硬件原型 | Web 控制台 |
+|:--:|:--:|
+| ![硬件原型：ESP32-S3 + ST7789 + 扬声器](docs/images/hardware-prototype.jpg) | ![Web 控制台 Dashboard](docs/images/dashboard.png) |
+| ST7789 圆屏显示 Cursor Agent 状态（编码中） | 后端 Dashboard：状态推送、语音、BLE/AP 配网、LLM 配置 |
+
 ### 设计红线
 
 1. **音频绑 Core 0**，优先级高于 LVGL；I2S 供数不及时会爆音、卡麦。
 2. **任何非 `lvgl` 任务不得直接调用 LVGL API**；一律经 FreeRTOS 队列投递。
 3. **表情用离线 RLE + Core 1 SPI 直绘**，设备端不启用 `lv_gif`。
 4. **PDM DATA 用 GPIO16**，不要用 GPIO48（板载 WS2812）或 GPIO3（strapping）。
-5. **LLM 密钥只放 `backend/.env`**，WiFi 凭据走 menuconfig / NVS，勿提交仓库。
+5. **LLM 密钥存本机 `backend/llm.json`（Dashboard 可改）或初始写在 `backend/.env`**，二者均已 gitignore，勿提交仓库。
 
 ```mermaid
 flowchart LR
@@ -58,11 +67,13 @@ flowchart LR
   - [4.4 网络与 WebSocket](#44-网络与-websocket)
   - [4.5 语音交互](#45-语音交互)
   - [4.6 BLE 配网](#46-ble-配网)
+  - [4.7 热点配网（AP）](#47-热点配网ap)
 - [五、后端服务](#五后端服务)
   - [5.1 架构与模块](#51-架构与模块)
   - [5.2 WebSocket 协议](#52-websocket-协议)
   - [5.3 语音处理流水线](#53-语音处理流水线)
-  - [5.4 Agent Hook 集成](#54-agent-hook-集成)
+  - [5.4 LLM 配置与对接](#54-llm-配置与对接)
+  - [5.5 Agent Hook 集成](#55-agent-hook-集成)
 - [六、构建与部署](#六构建与部署)
   - [6.1 依赖清单](#61-依赖清单)
   - [6.2 构建与烧录](#62-构建与烧录)
@@ -84,7 +95,7 @@ flowchart LR
 | 麦克风 | PDM，I2S0 RX | 16 kHz / mono / 16 bit |
 | 功放 | I2S1 TX，Philips | 16 kHz / 16 bit，播放侧写 stereo |
 | 控制台 | USB Serial/JTAG | GPIO19 / GPIO20 |
-| 按键 | BOOT（GPIO0） | 长按 BLE 配网 / 超长按诊断 |
+| 按键 | BOOT（GPIO0） | 长按 BLE 配网 / 超长按诊断；WiFi 失败时自动热点配网 |
 
 音频格式：16 kHz 单声道 s16le；单段最长 15 s（VAD）/ 缓冲 20 s；播放 ring **512 KB**（PSRAM）。
 
@@ -210,7 +221,7 @@ menuconfig「Agent Display」：WiFi SSID/密码、静态 IP、`AGENT_WS_URL` �
 ┌─────────────────────────────────────────────────────────────┐
 │  PC 后端 (FastAPI)  ←── WebSocket /ws ──→  net_ws.c         │
 ├─────────────────────────────────────────────────────────────┤
-│  应用层   voice.c (VAD)  │  ui.c (LVGL)  │  ble_prov.c     │
+│  应用层   voice.c (VAD)  │  ui.c (LVGL)  │  ble_prov / ap_prov │
 ├─────────────────────────────────────────────────────────────┤
 │  服务层   audio.c  │  anim_loader.c  │  font_loader.c       │
 ├─────────────────────────────────────────────────────────────┤
@@ -230,7 +241,8 @@ menuconfig「Agent Display」：WiFi SSID/密码、静态 IP、`AGENT_WS_URL` �
 | 网络 | `net_ws.c` | WiFi、WebSocket、语音上传/下行 |
 | 音频 | `audio.c` | PDM 采集、AGC、I2S 播放 ring |
 | 语音 | `voice.c` | VAD 状态机、边录边传、UI 叠加 |
-| 配网 | `ble_prov.c` / `agent_cfg.c` | NimBLE NUS、NVS 持久化 |
+| 配网 | `ble_prov.c` / `ap_prov.c` / `prov_cfg.c` / `agent_cfg.c` | BLE NUS、Soft AP 网页、共享 NVS |
+| 串口 CLI | `serial_cli.c` | `ap` / `ap_stop` / `ble_stop` 调试命令 |
 | 按键 | `btn_boot.c` | BOOT 长按检测 |
 | 内存 | `mem_utils.c` | `psram_malloc` / `dram_malloc`、诊断报告 |
 
@@ -246,9 +258,10 @@ menuconfig「Agent Display」：WiFi SSID/密码、静态 IP、`AGENT_WS_URL` �
 6. `agent_cfg_load` — 读 NVS / Kconfig
 7. `btn_boot_init` — 创建 `btn_boot` 任务
 8. `net_init` — WiFi 栈（尚未建 `net_task` 循环）
-9. `voice_init` — 分配 PSRAM 缓冲
-10. `mem_report("boot")`
-11. 创建四个常驻任务（见 [§3.2](#32-应用任务一览)）
+9. `serial_cli_init` — 串口命令行（`ap` 等）
+10. `voice_init` — 分配 PSRAM 缓冲
+11. `mem_report("boot")`
+12. 创建常驻任务：`main.c` 建 `audio` / `net` / `lvgl` / `app`；`btn_boot_init` 建 `btn_boot`；`serial_cli_init` 建 `cli`（见 [§3.2](#32-应用任务一览)）
 
 此后 `app_main` 返回，main 任务进入空闲；业务逻辑由各 FreeRTOS 任务承担。
 
@@ -292,7 +305,7 @@ ESP32-S3 为 **双核**（`CONFIG_FREERTOS_UNICORE` 未启用）。应用任务�
 | 核心 | 定位 | 常驻负载 | 设计理由 |
 |------|------|----------|----------|
 | **Core 0** | 实时 I/O + 网络 | `audio_task`、`net_task`、WiFi、lwIP、（配网时）NimBLE Host | I2S DMA 与 WiFi 协议栈对抖动敏感；音频与网络同核减少跨核同步 |
-| **Core 1** | 显示 + 应用逻辑 | `lvgl_task`、`app_task`、`btn_boot` | LVGL `lv_timer_handler`、RLE 解码、SPI `draw_bitmap` 集中在一核，避免与 I2S 争用 |
+| **Core 1** | 显示 + 应用逻辑 | `lvgl_task`、`app_task`、`btn_boot`、`cli` | LVGL `lv_timer_handler`、RLE 解码、SPI `draw_bitmap` 集中在一核，避免与 I2S 争用 |
 
 ```text
 Core 0                          Core 1
@@ -307,7 +320,7 @@ net_task    (pri 4)               └ RLE 解码 + SPI 直绘 90×90
 WiFi / lwIP (IDF)               app_task  (pri 3)
 NimBLE Host (按需)                ├ voice_loop() VAD
                                   ├ ui_tick_animation()
-                                  ├ ble_prov_loop()
+                                  ├ ble_prov_loop() / ap_prov_loop()
                                   └ link_state 周期投递
                                 btn_boot  (pri 6)
                                   └ GPIO0 长按轮询
@@ -322,8 +335,9 @@ NimBLE Host (按需)                ├ voice_loop() VAD
 | `audio` | **0** | **6** | 8192 | `audio_task_loop` + `vTaskDelay(5ms)` | I2S0 PDM 读入、AGC、录音缓冲写入；I2S1 播放出队；**播放期停麦** |
 | `net` | **0** | **4** | 8192 | `net_loop` + `vTaskDelay(20ms)` | WiFi 连接/重连、`esp_websocket_client`、JSON 事件解析、`voice_net_poll` 流式上传 |
 | `lvgl` | **1** | **4** | 8192 | `ui_loop_once` + `vTaskDelay(5ms)` | 排空 UI 队列、调用 LVGL、`refresh_face_display`、表情帧 SPI 直绘 |
-| `app` | **1** | **3** | 8192 | `vTaskDelay(5ms)` | `voice_loop` VAD 状态机；动画 tick；`ble_prov_loop`；1 s 时钟、250 ms 链路状态投递 UI |
+| `app` | **1** | **3** | 8192 | `vTaskDelay(5ms)` | `voice_loop` VAD 状态机；动画 tick；`ble_prov_loop` / `ap_prov_loop`；1 s 时钟、250 ms 链路状态投递 UI |
 | `btn_boot` | **1** | **6** | 4096 | `vTaskDelay(20ms)` 轮询 | BOOT 按住 ≥3 s → BLE；≥5 s → 诊断覆盖层 |
+| `cli` | **1** | **2** | 4096 | `getchar` 阻塞 | 串口命令：`ap` / `ap_stop` / `ble_stop` / `help` |
 
 **临时任务**（非常驻）：
 
@@ -345,6 +359,7 @@ FreeRTOS 优先级：**数值越大越优先**（ESP-IDF 默认可用范围通�
   4  net_task   ─────────  Core 0  WebSocket / WiFi
   4  lvgl_task  ─────────  Core 1  显示刷新
   3  app_task   ─────────  Core 1  VAD 决策（可容忍数 ms 抖动）
+  2  cli        ─────────  Core 1  串口调试（最低，不影响实时路径）
 ```
 
 **为何音频 = 6、LVGL = 4？**  
@@ -457,7 +472,15 @@ python scripts/flash_animations.py -p COMx
 
 ### 4.3 中文字库
 
-独立分区 `cjk_font`（`0x400000`，2 MB）：通用字表 7000 字 + ASCII + 标点，16px / 4bpp，`simhei.ttf` 源。
+独立分区 `cjk_font`（`0x400000`，2 MB），16px / 4bpp，`simhei.ttf` 源。字模组成：
+
+| 来源 | 文件 / 范围 | 说明 |
+|------|-------------|------|
+| 通用字表 | `third_party/fonts/tyz_7000_chars.txt` | 《现代汉语通用字表》7000 字 |
+| 额外标点 | `third_party/fonts/extra_symbols.txt` | 弯引号 `“”‘’`、书名号、破折号等 LLM 常用符号（不在 7000 字内） |
+| ASCII | `0x20-0x7F` | 含直引号 `"`、数字、字母等 |
+
+增补标点请改 `extra_symbols.txt` 后重新生成；**不建议**为标点问题扩到 GBK 全字库（2 MB 分区放不下 16px/4bpp 体量）。
 
 ```bash
 python scripts/gen_cjk_font.py
@@ -552,7 +575,7 @@ PLAYING ──(播完)──► LISTEN（冷却 800 ms）
 - `resume_listen()` 须**先**切 `s_phase=LISTEN` 再 `post_voice_ui()`，否则 UI 误留 `SPEAKING`
 - 末片无 `end`：播放环空后 **300 ms** 兜底恢复
 
-语音 WebSocket 帧格式、后端流水线、环境变量见 [§5.2](#52-websocket-协议)、[§5.3](#53-语音处理流水线)。
+语音 WebSocket 帧格式、后端流水线、LLM 密钥配置见 [§5.2](#52-websocket-协议)、[§5.3](#53-语音处理流水线)、[§5.4](#54-llm-配置与对接)。
 
 #### 语音相关源码
 
@@ -567,7 +590,9 @@ PLAYING ──(播完)──► LISTEN（冷却 800 ms）
 
 ### 4.6 BLE 配网
 
-ESP32-S3 **仅 BLE**（NimBLE + Nordic UART Service）。Windows 系统蓝牙设置**不会**弹出配对框——用本仓库网页或 SerialTest（LE）。
+设备支持两种配网入口：**BLE（§4.6）** 与 **热点网页（§4.7）**。二者写入同一套 `agent_cfg` NVS（WiFi + 后端 URL + 可选静态 IP），字段语义一致；**BLE 与 AP 互斥**，不可同时进行。
+
+ESP32-S3 **仅 BLE**（NimBLE + Nordic UART Service）。Windows 系统蓝牙设置**不会**弹出配对框——用本仓库 Dashboard 或 SerialTest（LE）。
 
 #### 触发方式
 
@@ -613,6 +638,129 @@ APPLY
 
 实现：`backend/ble_prov.py`、`backend/dashboard.html`。
 
+### 4.7 热点配网（AP）
+
+启动后若 **30 秒内** WiFi 与后端 WebSocket 均未就绪，设备自动开启 **开放热点** 并内置配网网页；也可通过串口手动触发。配置保存后与 BLE `APPLY` 相同：写入 NVS、关闭热点、以 STA 模式重连。
+
+与 BLE 不同，热点配网**无需** `wifi_deinit`，内存占用更小，适合「连不上 WiFi」时的兜底场景。
+
+#### 触发方式
+
+| 方式 | 说明 |
+|------|------|
+| **自动** | 上电后 30 s 内未连上 WiFi+WS → 自动开热点 |
+| **串口** | 监视器或串口工具发送 `ap`（见下方 CLI） |
+| **手动停止** | 串口发送 `ap_stop`，或等待 10 分钟超时 |
+
+屏幕显示 **「热点配网」**，来源标签为 `AP`。
+
+#### 热点与网页
+
+| 项 | 值 |
+|----|-----|
+| SSID | `AgentDisplay-XXXX`（`XXXX` 为 MAC 后两字节，如 `AgentDisplay-9344`） |
+| 密码 | **无**（开放网络） |
+| 设备 IP | `192.168.4.1` |
+| 配网页 | [http://192.168.4.1/](http://192.168.4.1/) |
+
+手机/电脑连接热点后，浏览器打开上述地址（部分系统会自动弹出 captive portal）。
+
+#### 网页表单字段
+
+与 BLE 协议字段一一对应，保存后由 `prov_cfg.c` 统一处理：
+
+| 字段 | 说明 |
+|------|------|
+| WiFi 名称 / 密码 | 目标路由器 SSID 与密码 |
+| 后端 IP / 端口 | 拼为 `ws://<host>:<port>/ws` |
+| 设备静态 IP / 掩码 / 网关 | 可选；留空则 DHCP |
+
+点击 **「保存并连接」** 后：
+
+1. 设备先返回 `{"ok":true}`，网页弹出 **「配置保存成功」** 提示
+2. 约 **3.5 s** 后设备保存 NVS、关闭热点、切换 STA 并重连 WiFi/WS
+3. 用户应 **切回原 WiFi**，等待设备上线
+
+#### 设备 HTTP API（热点模式下）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/` | 配网 HTML 页面 |
+| `GET` | `/api/config` | 读取当前内存中的配置（JSON） |
+| `POST` | `/api/config` | 提交配置（JSON body），成功返回 `{"ok":true}` 并延迟应用 |
+
+`GET /api/config` 响应示例：
+
+```json
+{
+  "ok": true,
+  "ssid": "MyWiFi",
+  "password": "12345678",
+  "host": "192.168.10.167",
+  "port": 8000,
+  "ip": "",
+  "netmask": "",
+  "gateway": "",
+  "profile_count": 1,
+  "active": 0
+}
+```
+
+`POST /api/config` 请求体：
+
+```json
+{
+  "ssid": "MyWiFi",
+  "password": "12345678",
+  "host": "192.168.10.167",
+  "port": 8000,
+  "ip": "",
+  "netmask": "",
+  "gateway": ""
+}
+```
+
+成功响应：`{"ok":true}`（约 3.5 s 后应用并关闭热点）。
+
+#### 串口 CLI（调试）
+
+控制台（USB Serial/JTAG / CH343，默认 **COMx @ 115200**）启动后约 2 s 出现提示：
+
+```text
+>>> CLI: ap | ap_stop | ble_stop | help
+```
+
+| 命令 | 作用 |
+|------|------|
+| `ap` | 立即进入热点配网 |
+| `ap_stop` | 关闭热点，恢复 STA 尝试 |
+| `ble_stop` | 退出 BLE 配网窗口 |
+| `help` | 列出命令 |
+
+内置终端示例（PowerShell / Git Bash，项目根目录）：
+
+```bash
+scripts/idf_build.bat -p COMx monitor
+# 出现 CLI 提示后输入：
+ap
+```
+
+> 串口只能被一个程序占用：若已打开 `monitor`，不要再另开串口工具发命令。
+
+#### 多 Profile 与轮询
+
+NVS 最多保存 **5 条** profile（WiFi 与 `ws_url` 绑定在同一条）。启动后若当前 profile 连不上，会轮询切换其他已保存配置；全部失败后进入热点配网。
+
+#### 实现文件
+
+| 文件 | 职责 |
+|------|------|
+| `main/ap_prov.c` | Soft AP、`esp_http_server`、内嵌配网页 |
+| `main/prov_cfg.c` | BLE / AP 共享的解析、NVS 保存、`net_apply_config` |
+| `main/net_ws.c` | 30 s 超时触发、`net_force_ap_prov()` |
+| `main/serial_cli.c` | 串口 `ap` 等命令 |
+| `main/ui.c` | 热点配网 UI（「热点配网」+ `AP` 来源） |
+
 ---
 
 ## 五、后端服务
@@ -642,40 +790,385 @@ stop.bat
 
 ### 5.2 WebSocket 协议
 
-端点：`ws://<pc-ip>:8000/ws`
+端点：`ws://<pc-ip>:8000/ws`。连接后首帧须为 JSON text；二进制帧仅紧跟 `audio_upload`（整段）或 `audio_chunk` 头。
 
-#### 通用帧
+**约定**
 
-| type | 方向 | 说明 |
-|------|------|------|
-| `hello` / `ack` | 握手 | `ack.server_time` 可校时 |
-| `ping` / `pong` | 双向 | 保活 |
-| `status` | PC→ESP | `status` / `text` / `source` / `gif` / `time` |
-| `config` | PC→ESP | 如 `volume_percent` |
-| `error` | PC→ESP | 错误详情 |
-
-#### 语音相关帧
-
-**ESP → PC 流式上传（主路径）**
-
-1. text `audio_upload`：`stream=true`, `audio_len=0`
-2. 服务端回 `session` + `volume_percent`
-3. 多帧 binary PCM（4096 B/块）
-4. text `audio_end`
-
-**ESP → PC 整段上传（回退）**：text `audio_upload`（含 `audio_len`）+ 单帧 binary。
-
-**PC → ESP**
-
-| type | 说明 |
-|------|------|
-| `session` | `session_id`（12 位 hex）、`volume_percent` |
-| `status` | Agent / 语音状态；`source=VOICE` 时更新字幕逻辑 |
-| `append` | 流式 ASR/LLM；`role=user|assistant`，`reset` 控制段落 |
-| `audio_chunk` + binary | TTS 分片；`end=true` 表结束 |
-| `debug` | 请求设备运行时诊断 JSON |
+| 项 | 值 |
+|----|-----|
+| 音频格式 | 16 kHz / mono / s16le |
+| 流式上传块 | 4096 B（`VOICE_UPLOAD_CHUNK`） |
+| 等待 `session` | 设备侧最长 **2.5 s**（`net_ws.c`） |
+| TTS 泵送突发上限 | **16384 B**（`AUDIO_BURST_BYTES`） |
+| 设备保活 | 服务端每 **2 s** 发 `ping`；**5 s** 无上行则判离线 |
 
 `volume_percent` 仅设备端增益生效；后端 TTS **不二次缩放 PCM**。
+
+---
+
+#### 5.2.1 连接与保活
+
+**ESP → PC：`hello`**（`WEBSOCKET_EVENT_CONNECTED` 后自动发送）
+
+```json
+{"type":"hello","role":"device","rssi":-58}
+```
+
+**PC → ESP：`ack`**（连接后立即下发；含可选校时）
+
+```json
+{"type":"ack","role":"device","server_time":1735689600}
+```
+
+**双向：`ping` / `pong`**
+
+```json
+{"type":"ping"}
+```
+
+```json
+{"type":"pong","server_time":1735689600}
+```
+
+设备收到 `ping` 回 `{"type":"pong"}`（无 `server_time`）；服务端 `ping` 可带 `server_time`。
+
+---
+
+#### 5.2.2 Agent 状态下行
+
+**PC → ESP：`status`**（Hook / Dashboard 推送；`gif` 与 `status` 同键）
+
+```json
+{
+  "type": "status",
+  "status": "THINKING",
+  "source": "CURSOR",
+  "text": "正在分析代码…",
+  "gif": "THINKING",
+  "time": "14:32:05",
+  "status_detail": "tool_running",
+  "tool_category": "read",
+  "task_label": "explore"
+}
+```
+
+`text` 可省略；`time` 可为字符串或 Unix 秒数，用于校时。`status_detail` / `tool_category` / `task_label` 为可选扩展字段。
+
+**PC → ESP：`text`**（仅更新字幕，不改中部 GIF）
+
+```json
+{
+  "type": "text",
+  "text": "你好，有什么可以帮你？",
+  "source": "BOT"
+}
+```
+
+**PC → ESP：`append`**（流式 ASR / LLM 字幕增量）
+
+```json
+{
+  "type": "append",
+  "text": "你好",
+  "source": "VOICE",
+  "role": "assistant",
+  "reset": true
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `role` | `user`（ASR）或 `assistant`（LLM） |
+| `reset` | `true` 时开始新段落（覆盖当前行） |
+
+**ESP → PC：`display`**（设备周期性上报当前屏上状态，供 Dashboard 同步）
+
+```json
+{
+  "type": "display",
+  "status": "CODING",
+  "source": "CURSOR",
+  "gif": "CODING"
+}
+```
+
+节流：`WS 连接后 400 ms` 内不上报；同类状态最小间隔 **120 ms**。
+
+---
+
+#### 5.2.3 语音上传（ESP → PC）
+
+**流式（主路径）**
+
+① text 开流：
+
+```json
+{
+  "type": "audio_upload",
+  "stream": true,
+  "sample_rate": 16000,
+  "channels": 1,
+  "bit_depth": 16,
+  "audio_len": 0
+}
+```
+
+② PC 回 `session`（见 §5.2.4）
+
+③ 多帧 **binary** PCM（每块优先 4096 B）
+
+④ text 结束：
+
+```json
+{
+  "type": "audio_end",
+  "session_id": "a1b2c3d4e5f6",
+  "total_bytes": 48000
+}
+```
+
+过短片段取消（已开流）：
+
+```json
+{
+  "type": "audio_end",
+  "session_id": "a1b2c3d4e5f6",
+  "total_bytes": 3200,
+  "discard": true
+}
+```
+
+**整段上传（回退）**
+
+帧 1 text：
+
+```json
+{
+  "type": "audio_upload",
+  "sample_rate": 16000,
+  "channels": 1,
+  "bit_depth": 16,
+  "audio_len": 48000
+}
+```
+
+帧 2 **binary**：长度须等于 `audio_len`。
+
+流式判定：`stream == true` **或** `audio_len == 0`。
+
+---
+
+#### 5.2.4 语音下行（PC → ESP）
+
+**`session`**（`audio_upload` 后立即回复）
+
+```json
+{
+  "type": "session",
+  "session_id": "a1b2c3d4e5f6",
+  "volume_percent": 33
+}
+```
+
+`session_id` 为 12 位 hex。默认音量见 `backend/settings.json`（**33%**）。
+
+**`status`（语音收尾）**
+
+```json
+{
+  "type": "status",
+  "status": "IDLE",
+  "text": "",
+  "source": "VOICE"
+}
+```
+
+设备在 `WAIT_REPLY` / `PLAYING` 收到 `source=VOICE` 且 `status` 为 `IDLE`/`ERROR` 时结束本轮。
+
+**TTS：`audio_chunk` + binary**
+
+text 头：
+
+```json
+{
+  "type": "audio_chunk",
+  "session_id": "a1b2c3d4e5f6",
+  "len": 4096,
+  "end": false
+}
+```
+
+紧跟 binary PCM（`len` 字节）。仅结束标记：
+
+```json
+{
+  "type": "audio_chunk",
+  "session_id": "a1b2c3d4e5f6",
+  "len": 0,
+  "end": true
+}
+```
+
+**`config`**（连接时 / Dashboard 改音量或开关时推送）
+
+```json
+{
+  "type": "config",
+  "volume_percent": 90,
+  "voice_enabled": true
+}
+```
+
+`voice_enabled=false` 时后端拒绝新 `audio_upload` 并中止进行中的听流。
+
+---
+
+#### 5.2.5 设备配置（WiFi Profile，经 WS）
+
+最多 **5** 条 profile；Dashboard `POST /api/device/wifi-profiles/*` 透传下列帧。
+
+**PC → ESP：查询**
+
+```json
+{"type":"get_wifi_profiles"}
+```
+
+**ESP → PC：列表**
+
+```json
+{
+  "type": "wifi_profiles",
+  "ok": true,
+  "count": 2,
+  "active": 0,
+  "profiles": [
+    {
+      "index": 0,
+      "ssid": "MyWiFi",
+      "password": "secret",
+      "host": "192.168.1.100",
+      "port": 8000,
+      "ip": "192.168.1.50",
+      "netmask": "255.255.255.0",
+      "gateway": "192.168.1.1"
+    }
+  ]
+}
+```
+
+失败示例：
+
+```json
+{
+  "type": "wifi_profiles",
+  "ok": false,
+  "error": "最多保存 5 条",
+  "count": 0,
+  "active": 0,
+  "profiles": []
+}
+```
+
+**PC → ESP：保存**（`index` 省略或 `-1` 为追加；命中 `active` 槽位则自动 `net_apply_config`）
+
+```json
+{
+  "type": "wifi_profile_save",
+  "index": 0,
+  "ssid": "MyWiFi",
+  "password": "secret",
+  "host": "192.168.1.100",
+  "port": 8000,
+  "ip": "",
+  "netmask": "",
+  "gateway": ""
+}
+```
+
+**PC → ESP：删除 / 切换**
+
+```json
+{"type":"wifi_profile_delete","index":1}
+```
+
+```json
+{"type":"wifi_profile_activate","index":0}
+```
+
+成功后设备再发一条 `wifi_profiles` 全量列表。
+
+---
+
+#### 5.2.6 诊断与错误
+
+**PC → ESP：请求诊断**
+
+```json
+{"type":"debug"}
+```
+
+**ESP → PC：诊断回复**
+
+```json
+{
+  "type": "debug",
+  "dram_free": 180224,
+  "dram_largest": 98304,
+  "psram_free": 6123456,
+  "psram_largest": 4194304,
+  "rec_bytes": 12288,
+  "rec_cap": 640000,
+  "play_bytes": 0,
+  "play_cap": 524288,
+  "vad_phase": 0,
+  "noise_rms": 0.0042,
+  "noise_peak": 0.0310,
+  "start_rms": 0.0147,
+  "start_peak": 0.1085,
+  "last_rms": 0.0021,
+  "last_peak": 0.0180,
+  "pdm_gain": 5.0
+}
+```
+
+**PC → ESP：`error`**
+
+```json
+{"type":"error","detail":"voice pipeline busy"}
+```
+
+```json
+{"type":"error","detail":"audio_len mismatch: expected 48000, got 40960"}
+```
+
+```json
+{"type":"error","detail":"voice chat disabled"}
+```
+
+---
+
+#### 5.2.7 Dashboard 专用（`role` ≠ `device`）
+
+连接后 `ack` 同 §5.2.1。另接收设备转发的 `display`、`status`、`text`，以及：
+
+```json
+{
+  "type": "transcript",
+  "time": "2026-03-14 10:30:00",
+  "text": "今天天气怎么样",
+  "session_id": "a1b2c3d4e5f6",
+  "role": "user"
+}
+```
+
+```json
+{
+  "type": "backend_log",
+  "time": "10:30:01",
+  "level": "info",
+  "text": "[voice] stream end session=…"
+}
+```
 
 ### 5.3 语音处理流水线
 
@@ -692,13 +1185,15 @@ audio_upload(stream) → VoiceSession + VoskStreamRecognizer
 |------|------|
 | 过短 PCM | < 6400 B → `IDLE`「没听清，请再说一次」 |
 | 忙控制 | `_voice_busy`；超时 `VOICE_BUSY_TIMEOUT_SEC=55` |
+| TTS 泵送 | 每突发最多 **16384 B**，间隔 `AUDIO_SEND_INTERVAL_SEC=0.02` |
 | 多轮 | `CHAT_CONTEXT_MAX_TURNS=8`，空闲 `CHAT_CONTEXT_IDLE_SEC=300` 清空 |
+| Profile 轮询 | 多 profile 且未连上时，每 **15 s** 切换一条（`PROFILE_ROTATE_MS`） |
 
 #### 环境变量（`backend/.env`）
 
 | 变量 | 说明 | 默认 |
 |------|------|------|
-| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | LLM 接口 | 见 `.env.example` |
+| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | LLM 初始种子（首次生成 `llm.json`） | 见 [§5.4](#54-llm-配置与对接) |
 | `VOICE_TTS` | TTS 开关 | `0` |
 | `TTS_VOICE` / `TTS_RATE` | edge-tts 参数 | `zh-CN-XiaoxiaoNeural` / `+20%` |
 | `ASR_ENGINE` | 识别引擎 | `vosk` |
@@ -717,7 +1212,125 @@ audio_upload(stream) → VoiceSession + VoskStreamRecognizer
 
 可选 HTTP：`POST /voice/upload`、`GET /voice/audio/{id}`、`POST /api/volume`。
 
-### 5.4 Agent Hook 集成
+### 5.4 LLM 配置与对接
+
+设备语音对话（ASR 识别完成后）会调用 **OpenAI 兼容的 Chat Completions** 接口（HTTP 流式，`stream: true`）。配置分两层：
+
+| 文件 | 作用 | 是否入库 |
+|------|------|----------|
+| `backend/.env` | 首次启动时的**种子值**；无 `llm.json` 时据此生成「默认」profile | 否（gitignore） |
+| `backend/llm.json` | **运行时实际生效**的配置；Dashboard 保存即写此文件，热更新无需重启 | 否（gitignore） |
+
+日常推荐在 Dashboard 顶栏点 **「大模型配置」** 管理；也可先写 `.env` 再启动后端自动生成 `llm.json`。
+
+#### 5.4.1 字段说明
+
+每条 profile 含四个字段（与 Dashboard 表单一致）：
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| **名称** | 否 | 备注，如 `千问`、`2api 中转`；留空则用模型名 |
+| **Base URL** | 是 | API 根地址，见 [URL 拼接规则](#542-base-url-拼接规则) |
+| **API Key** | 是 | Bearer 令牌（`Authorization: Bearer <key>`） |
+| **模型名称** | 是 | 服务商侧的 model id，如 `gpt-4o`、`qwen3.8-max` |
+
+最多保存 **8** 条 profile，其中一条为 **当前启用**；语音流水线始终读启用项。
+
+#### 5.4.2 Base URL 拼接规则
+
+后端按 `llm.py` 中 `chat_completions_url()` 自动补全路径：
+
+| 你填写的 Base URL | 实际 POST 地址 |
+|-------------------|----------------|
+| `https://2api.store` | `https://2api.store/v1/chat/completions` |
+| `https://api.openai.com/v1` | `https://api.openai.com/v1/chat/completions` |
+| `https://dashscope.aliyuncs.com/compatible-mode/v1` | `…/compatible-mode/v1/chat/completions` |
+| 已含 `/chat/completions` 的完整 URL | 原样使用 |
+
+填写时**不要**手动加 `/chat/completions`，只填服务商文档给出的 API 根或 `/v1` 前缀即可。
+
+#### 5.4.3 配置方式
+
+**方式 A：`.env` 种子（适合首次部署）**
+
+```bash
+cd backend
+cp .env.example .env
+# 编辑 .env，至少填写 LLM_API_KEY
+```
+
+```ini
+LLM_BASE_URL=https://2api.store
+LLM_API_KEY=sk-xxxxxxxx
+LLM_MODEL=gpt-5.6-luna
+```
+
+启动 `start.bat` 后，若不存在 `llm.json`，会自动从 `.env` 生成一条名为「默认」的 profile 并写入 `llm.json`。
+
+**方式 B：Dashboard 网页（适合日常修改 / 多模型切换）**
+
+1. 浏览器打开 `http://<pc-ip>:8000`
+2. 顶栏 → **大模型配置**
+3. 点 **新增** 或已有条目旁的 **编辑**
+4. 填写 Base URL、API Key、模型名称
+5. 点 **保存并启用** — 立即生效，**无需重启后端**
+6. 仅保存不切换：点 **保存**；切换已有条目：点 **启用**
+
+**API Key 编辑注意**：列表与表单中 Key 为脱敏显示（前 4 + 后 4）。编辑已有条目时，**留空或只输入 `****` 表示保留原密钥**；要更换密钥需输入完整新 Key。
+
+**方式 C：直接编辑 `llm.json`（高级）**
+
+```json
+{
+  "active": "3b1ddf919139",
+  "profiles": [
+    {
+      "id": "default",
+      "name": "默认",
+      "base_url": "https://2api.store",
+      "api_key": "sk-xxxxxxxx",
+      "model": "gpt-5.6-luna"
+    },
+    {
+      "id": "3b1ddf919139",
+      "name": "千问",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "api_key": "sk-xxxxxxxx",
+      "model": "qwen3.8-max"
+    }
+  ]
+}
+```
+
+保存后下次 API 调用自动加载；也可在 Dashboard 点 **刷新列表** 同步到表单。
+
+#### 5.4.4 常见服务商示例
+
+| 场景 | Base URL | 模型名示例 | Key 获取 |
+|------|----------|------------|----------|
+| 2api 等中转站 | `https://2api.store` | 控制台所列模型 id | 中转站控制台 |
+| OpenAI 官方 | `https://api.openai.com/v1` | `gpt-4o` | platform.openai.com |
+| 阿里云百炼（千问兼容） | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus`、`qwen3.8-max` | 百炼控制台 API-Key |
+| DeepSeek | `https://api.deepseek.com` | `deepseek-chat` | platform.deepseek.com |
+| 本地 Ollama | `http://127.0.0.1:11434/v1` | `llama3` 等本地模型名 | 通常可填占位 `ollama` |
+| LM Studio | `http://127.0.0.1:1234/v1` | 本地加载的模型 id | 通常可填占位 |
+
+接口须支持 **流式** Chat Completions；若返回 400 且与 `stream_options` 相关，后端会自动重试不带 usage 的流式请求。
+
+#### 5.4.5 验证与排错
+
+| 现象 | 处理 |
+|------|------|
+| 语音识别后无回复 / 日志 `LLM_API_KEY is empty` | 在 Dashboard **保存并启用** 一条带有效 Key 的 profile |
+| HTTP 401 / 403 | 检查 Key 是否过期、Base URL 是否与服务商一致 |
+| HTTP 404 | Base URL 多写了 `/chat/completions`，改回根或 `/v1` |
+| 模型不存在 | 核对模型 id 与控制台可用列表 |
+| 想确认当前生效项 | Dashboard **大模型配置** 中带「当前」标签的条目；或看后端启动日志 `[llm] loaded … active=…` |
+| 查看历史请求 | Dashboard → **大模型对话历史**；落盘 `log/llm_chat.jsonl` |
+
+REST：`GET /api/llm` 返回当前配置（Key 脱敏）；`POST /api/llm` 新增/更新；`POST /api/llm/activate` 切换启用；`POST /api/llm/delete` 删除（至少保留 1 条）。
+
+### 5.5 Agent Hook 集成
 
 Hook 装在**用户目录**，对所有仓库生效；**不要**在本仓库再放 `.cursor/hooks.json`。
 
@@ -740,7 +1353,7 @@ Cursor：写入 `event_queue.jsonl`，后端每 100 ms 清空；`source=CURSOR`�
 | WAITING | 等待中 | WAITING.gif | `agent_settled` | `stop` / AskQuestion |
 | DONE | 已完成 | DONE.gif | `agent_end` | `afterAgentResponse` |
 | ERROR | 错误 | ERROR.gif | 失败 `tool_result` | `postToolUseFailure` |
-| OFFLINE | 离线 | OFFLINE.gif | `session_shutdown` | `sessionEnd` |
+| OFFLINE | 离线（仅断网） | OFFLINE.gif | `session_shutdown`（设备忽略） | —（`sessionEnd` → IDLE） |
 | STALE | 已过期 | STALE.gif | 30 s 无事件 | — |
 | TOOL | 使用工具 | TOOL.gif | 工具调用 | `preToolUse` |
 | EAR / SPEAKING | 收听/播报 | EAR / SPEAKING.gif | — | 语音 `voice_overlay` |
@@ -784,7 +1397,7 @@ cd backend && pip install -r requirements.txt
 | `edge-tts` / `miniaudio` | TTS |
 | `bleak` | 网页 BLE 配网 |
 
-复制 `backend/.env.example` → `backend/.env`，填写 `LLM_API_KEY` 等。
+复制 `backend/.env.example` → `backend/.env`，填写 `LLM_API_KEY` 等；也可启动后在 Dashboard **大模型配置** 中填写（见 [§5.4](#54-llm-配置与对接)）。
 
 ### 6.2 构建与烧录
 
@@ -800,22 +1413,38 @@ idf.py -p COMx monitor
 
 字库与表情分区可单独更新，不必每次全量 flash。
 
+#### 预编译固件下载（免编译）
+
+不想本地编译时，可直接下载三个分区镜像（**v1.0**，ESP-IDF 5.4.2）：
+
+| 文件 | 分区偏移 | 直链 |
+|------|----------|------|
+| `esp32s3_agent_display.bin` | `0x10000` | [Releases](https://github.com/ATongHru/AgentDisplay/releases/download/v1.0/esp32s3_agent_display.bin) |
+| `font_cjk_16.bin` | `0x400000` | [Releases](https://github.com/ATongHru/AgentDisplay/releases/download/v1.0/font_cjk_16.bin) |
+| `animations.bin` | `0x600000` | [Releases](https://github.com/ATongHru/AgentDisplay/releases/download/v1.0/animations.bin) |
+
+仓库内路径：`firmware/releases/v1.0/`（主程序）+ `firmware/data/`（字库、表情）。烧录步骤与 SHA256 见 [firmware/releases/v1.0/README.md](firmware/releases/v1.0/README.md)。
+
 ### 6.3 仓库结构
 
 ```text
 esp32s3-agent-display/
-├── README.md
+├── README.md                  中文文档
+├── README.en.md               English documentation
 ├── start.bat / stop.bat
 ├── partitions.csv
 ├── sdkconfig.defaults
 ├── docs/
-│   └── 开发环境搭建.md
+│   ├── 开发环境搭建.md
+│   └── dev-setup.en.md
 ├── backend/                 FastAPI + Dashboard + ASR/LLM + BLE
 ├── main/                    固件源码
 ├── scripts/                 构建、动画、字库、烧录
 ├── third_party/emoji-gif/   状态 GIF 源
-├── third_party/fonts/       通用字表
-└── firmware/data/           animations.bin / font_cjk_16.bin
+├── third_party/fonts/       通用字表 + extra_symbols.txt
+└── firmware/
+    ├── data/                animations.bin / font_cjk_16.bin
+    └── releases/v1.0/       预编译主程序 esp32s3_agent_display.bin
 ```
 
 ---
@@ -837,3 +1466,11 @@ esp32s3-agent-display/
 3. 或设置 `VOSK_MODEL_PATH`
 
 模型约 40 MB；`backend/models/` 已 gitignore。
+
+---
+
+## 许可证
+
+本项目**自有源码**采用 [MIT License](LICENSE)，版权归 `11428` 所有。
+
+第三方依赖与资源（ESP-IDF、LVGL、Noto Emoji、Vosk、`edge-tts`、字库生成用 SimHei 等）的许可说明见 [NOTICE](NOTICE)。再分发固件或后端时，请一并保留 `LICENSE` 与 `NOTICE`，并遵守 CC BY 4.0 对表情资源的署名要求。

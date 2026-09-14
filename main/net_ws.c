@@ -6,6 +6,8 @@
 #include <sys/time.h>
 
 #include "agent_cfg.h"
+#include "ap_prov.h"
+#include "ble_prov.h"
 #include "cJSON.h"
 #include "audio.h"
 #include "esp_event.h"
@@ -51,8 +53,12 @@ static char s_usb_line[512];
 static size_t s_usb_len;
 static bool s_usb_ready;
 static bool s_ble_paused;
+static bool s_ap_paused;
 static uint32_t s_profile_try_ms;
+static uint32_t s_boot_ms;
+static bool s_ap_fallback_done;
 #define PROFILE_ROTATE_MS 15000u
+#define AP_FALLBACK_MS 30000u
 static esp_netif_t *s_sta;
 static uint32_t s_usj_sof;
 static uint32_t s_usj_ok_ms;
@@ -108,7 +114,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        if (!s_ble_paused) {
+        if (!s_ble_paused && !s_ap_paused) {
             esp_wifi_connect();
         }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -116,7 +122,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_ws_on = false;
         xEventGroupClearBits(s_events, WIFI_OK);
         ui_post_link_state(net_usb_ready(), false, false, voice_is_listening(), audio_playback_is_active(), s_rssi);
-        if (!s_ble_paused) {
+        if (!s_ble_paused && !s_ap_paused) {
             esp_wifi_connect();
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
@@ -632,8 +638,45 @@ esp_err_t net_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_start());
+    s_boot_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    s_ap_fallback_done = false;
     ESP_LOGI(TAG, "wifi start ssid=%s ws=%s", acfg->ssid, acfg->ws_url);
     return ESP_OK;
+}
+
+void net_pause_sta_for_ap(void)
+{
+    stop_ws();
+    s_wifi = false;
+    s_ap_paused = true;
+    if (s_events) {
+        xEventGroupClearBits(s_events, WIFI_OK | WS_OK | SESSION_OK);
+    }
+    esp_wifi_disconnect();
+    esp_err_t err = esp_wifi_stop();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT) {
+        ESP_LOGW(TAG, "wifi_stop for AP %s", esp_err_to_name(err));
+    }
+}
+
+void net_resume_sta_after_ap(void)
+{
+    s_ap_paused = false;
+    apply_ip_from_cfg();
+    const agent_cfg_t *acfg = agent_cfg_get();
+    wifi_config_t wifi_config = {0};
+    strncpy((char *)wifi_config.sta.ssid, acfg->ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password, acfg->pass, sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "resume STA set_config %s", esp_err_to_name(err));
+        return;
+    }
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    err = esp_wifi_start();
+    ESP_LOGI(TAG, "resume STA after AP: %s", esp_err_to_name(err));
 }
 
 
@@ -726,7 +769,7 @@ esp_err_t net_apply_config(void)
 void net_loop(void)
 {
     poll_usb();
-    if (s_ble_paused) {
+    if (s_ble_paused || s_ap_paused || ap_prov_active()) {
         return;
     }
     if (s_wifi && !s_ws) {
@@ -769,6 +812,30 @@ void net_loop(void)
             s_profile_try_ms = now;
         }
     }
+
+    if (!net_ws_ready() && !s_ap_fallback_done && !ble_prov_active() && !ap_prov_active()) {
+        uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        if ((now - s_boot_ms) >= AP_FALLBACK_MS) {
+            s_ap_fallback_done = true;
+            ESP_LOGW(TAG, "no WiFi/WS after %us, starting AP provisioning", (unsigned)(AP_FALLBACK_MS / 1000));
+            (void)ap_prov_start();
+        }
+    }
+}
+
+esp_err_t net_force_ap_prov(void)
+{
+    if (ble_prov_active()) {
+        ESP_LOGW(TAG, "force AP blocked: BLE active");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (ap_prov_active()) {
+        ESP_LOGI(TAG, "AP prov already active");
+        return ESP_OK;
+    }
+    s_ap_fallback_done = true;
+    ESP_LOGW(TAG, "force AP provisioning");
+    return ap_prov_start();
 }
 
 bool net_wifi_ready(void) { return s_wifi; }

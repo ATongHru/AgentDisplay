@@ -10,6 +10,7 @@ typedef enum {
     UI_MSG_VOICE_LINK = 4,
     UI_MSG_TIME_TICK = 5,
     UI_MSG_BLE_PROV = 6,
+    UI_MSG_AP_PROV = 11,
     UI_MSG_VOLUME = 7,
     UI_MSG_VOICE_ENABLED = 8,
     UI_MSG_MIC_LEVEL = 9,
@@ -28,6 +29,7 @@ typedef struct {
     bool voice_hold;
     char overlay[16];
     bool ble_prov;
+    bool ap_prov;
     int rssi;
     int volume_percent;
     bool voice_enabled;
@@ -42,6 +44,7 @@ void ui_post_link_state(bool usb, bool wifi, bool ws, bool listening, bool playi
 void ui_post_voice_link(bool listening, bool playing, bool hold, const char *overlay);
 void ui_post_time_tick(void);
 void ui_post_ble_prov(bool on);
+void ui_post_ap_prov(bool on);
 void ui_post_volume(int percent);
 void ui_post_voice_enabled(bool enabled);
 void ui_post_mic_level(float rms);

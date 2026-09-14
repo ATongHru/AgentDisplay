@@ -14,7 +14,9 @@
 #include "host/ble_hs.h"
 #include "host/ble_uuid.h"
 #include "host/util/util.h"
+#include "ap_prov.h"
 #include "net_ws.h"
+#include "prov_cfg.h"
 #include "ui_msg.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -126,14 +128,9 @@ static void handle_line(const char *line_in)
     ESP_LOGI(TAG, "cmd: %s", line);
 
     if (strcmp(line, "APPLY") == 0) {
-        esp_err_t err = agent_cfg_save();
+        esp_err_t err = prov_cfg_apply_saved();
         if (err != ESP_OK) {
-            notify_text("ERR save");
-            return;
-        }
-        err = net_apply_config();
-        if (err != ESP_OK) {
-            notify_text("ERR apply");
+            notify_text(err == ESP_ERR_INVALID_STATE ? "ERR apply" : "ERR save");
             return;
         }
         notify_text("OK apply");
@@ -502,6 +499,10 @@ esp_err_t ble_prov_start(void)
         ESP_LOGI(TAG, "already active");
         ui_post_ble_prov(true);
         return ESP_OK;
+    }
+    if (ap_prov_active()) {
+        ESP_LOGW(TAG, "skip BLE prov: AP active");
+        return ESP_ERR_INVALID_STATE;
     }
     /* UI first — icon must appear even if controller init is slow */
     ui_post_ble_prov(true);

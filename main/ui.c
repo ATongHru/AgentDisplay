@@ -81,6 +81,20 @@ static bool voice_playing;
 static bool voice_text_visible;
 static bool voice_session;
 static bool s_ble_prov;
+static bool s_ap_prov;
+static char s_cached_face_status[24];
+static char s_cached_face_source[16];
+
+static bool prov_ui_active(void)
+{
+    return s_ble_prov || s_ap_prov;
+}
+
+static void anim_sync_tick(void)
+{
+    last_anim_tick = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    frame_elapsed_ms = 0;
+}
 static bool caption_mode;
 static bool caption_suppress_append;
 static bool caption_streaming;
@@ -492,10 +506,47 @@ static void apply_ble_prov_ui(bool on)
         if (source_label) {
             lv_label_set_text(source_label, "BLE");
         }
-    } else {
+    } else if (!s_ap_prov) {
         if (source_label) {
             lv_label_set_text(source_label, agent_source[0] ? agent_source : "BOT");
         }
+        s_cached_face_status[0] = 0;
+        anim_sync_tick();
+        refresh_face_display();
+    }
+}
+
+static void apply_ap_prov_ui(bool on)
+{
+    if (on) {
+        animation_index = UI_ST_WAITING;
+        frame_index = 0;
+        frame_elapsed_ms = 0;
+        if (animation_count > 0 && animations[animation_index].count > 0) {
+            uint8_t *back = (frame_buffer_front == frame_buffer_a) ? frame_buffer_b : frame_buffer_a;
+            decode_frame_rle(&animations[animation_index].frames[frame_index], back,
+                             (size_t)FACE_SIZE * FACE_SIZE * 2);
+            frame_buffer_front = back;
+            display_blit_rgb565(frame_buffer_front, FACE_X, FACE_Y, FACE_SIZE, FACE_SIZE);
+        }
+        s_ap_prov = true;
+        if (status_label) {
+            lv_obj_clear_flag(status_label, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(status_label, "热点配网");
+            lv_obj_set_style_text_color(status_label, lv_color_hex(0xFBBF24), 0);
+        }
+        if (source_label) {
+            lv_label_set_text(source_label, "AP");
+        }
+    } else {
+        s_ap_prov = false;
+    }
+    if (!on && !s_ble_prov) {
+        if (source_label) {
+            lv_label_set_text(source_label, agent_source[0] ? agent_source : "BOT");
+        }
+        s_cached_face_status[0] = 0;
+        anim_sync_tick();
         refresh_face_display();
     }
 }
@@ -505,7 +556,7 @@ static void blit_face_frame(void)
     if (!frame_buffer_front) {
         return;
     }
-    if (!s_ble_prov && animation_count == 0) {
+    if (!prov_ui_active() && animation_count == 0) {
         return;
     }
     display_blit_rgb565(frame_buffer_front, FACE_X, FACE_Y, FACE_SIZE, FACE_SIZE);
@@ -513,7 +564,7 @@ static void blit_face_frame(void)
 
 static void render_frame(void)
 {
-    if (s_ble_prov) {
+    if (prov_ui_active()) {
         return;
     }
     if (animation_count == 0 || animations[animation_index].count == 0) {
@@ -587,7 +638,7 @@ static volatile float s_mic_pending_rms;
 
 static bool mic_level_bar_wanted(void)
 {
-    if (!voice_feature_enabled || s_ble_prov || !ws_link) {
+    if (!voice_feature_enabled || prov_ui_active() || !ws_link) {
         return false;
     }
     /* EAR.gif is the recording overlay; do not also require voice_listening —
@@ -1024,6 +1075,14 @@ static void normalize_status(char *status)
     snprintf(status, 24, "%s", ui_status_info(id)->key);
 }
 
+/* OFFLINE GIF is reserved for WS loss; ignore backend sessionEnd while connected. */
+static void coerce_connected_status(char *status)
+{
+    if (ws_link && status && strcmp(status, "OFFLINE") == 0) {
+        snprintf(status, 24, "IDLE");
+    }
+}
+
 static bool source_is_voice(const char *source)
 {
     return source && strcmp(source, "VOICE") == 0;
@@ -1072,6 +1131,7 @@ static void apply_event(const char *raw_status, const char *raw_source, const ch
     snprintf(status, sizeof(status), "%s", raw_status ? raw_status : "IDLE");
     snprintf(source, sizeof(source), "%s", raw_source ? raw_source : "BOT");
     normalize_status(status);
+    coerce_connected_status(status);
     str_upper(source);
     if (source[0] == '\0' || strcmp(source, "UNKNOWN") == 0) {
         strcpy(source, "BOT");
@@ -1262,7 +1322,7 @@ static void sync_voice_link_pending(void)
 
 static void refresh_face_display(void)
 {
-    if (s_ble_prov) {
+    if (prov_ui_active()) {
         return;
     }
     char status_key[24];
@@ -1276,8 +1336,16 @@ static void refresh_face_display(void)
     } else {
         snprintf(status_key, sizeof(status_key), "%s", agent_status[0] ? agent_status : "IDLE");
         snprintf(source, sizeof(source), "%s", agent_source[0] ? agent_source : "BOT");
+        coerce_connected_status(status_key);
     }
     normalize_status(status_key);
+    if (strcmp(status_key, s_cached_face_status) == 0 && strcmp(source, s_cached_face_source) == 0) {
+        return;
+    }
+    strncpy(s_cached_face_status, status_key, sizeof(s_cached_face_status) - 1);
+    s_cached_face_status[sizeof(s_cached_face_status) - 1] = '\0';
+    strncpy(s_cached_face_source, source, sizeof(s_cached_face_source) - 1);
+    s_cached_face_source[sizeof(s_cached_face_source) - 1] = '\0';
     render_status_pair(status_key, source);
     if (ws_link) {
         queue_display_report(status_key, source);
@@ -1294,7 +1362,7 @@ static void process_messages(void)
             portENTER_CRITICAL(&s_mux);
             s_frame_dirty_queued = false;
             portEXIT_CRITICAL(&s_mux);
-            if (!s_ble_prov) {
+            if (!prov_ui_active()) {
                 render_frame();
             }
         } else if (msg.type == UI_MSG_LINK_STATE) {
@@ -1306,6 +1374,10 @@ static void process_messages(void)
             voice_playing = msg.playing;
             wifi_rssi = msg.rssi;
             if (ws_link && !was_ws) {
+                if (strcmp(agent_status, "OFFLINE") == 0) {
+                    strncpy(agent_status, "IDLE", sizeof(agent_status) - 1);
+                    agent_status[sizeof(agent_status) - 1] = '\0';
+                }
                 portENTER_CRITICAL(&s_report_mux);
                 s_report_dirty = true;
                 portEXIT_CRITICAL(&s_report_mux);
@@ -1332,6 +1404,8 @@ static void process_messages(void)
             update_status_bar_ui();
         } else if (msg.type == UI_MSG_BLE_PROV) {
             apply_ble_prov_ui(msg.ble_prov);
+        } else if (msg.type == UI_MSG_AP_PROV) {
+            apply_ap_prov_ui(msg.ap_prov);
         } else if (msg.type == UI_MSG_VOICE_ENABLED) {
             voice_feature_enabled = msg.voice_enabled;
             if (!voice_feature_enabled) {
@@ -1504,6 +1578,12 @@ void ui_post_ble_prov(bool on)
     ui_post(&msg);
 }
 
+void ui_post_ap_prov(bool on)
+{
+    ui_msg_t msg = {.type = UI_MSG_AP_PROV, .ap_prov = on};
+    ui_post(&msg);
+}
+
 void ui_post_volume(int percent)
 {
     ui_msg_t msg = {.type = UI_MSG_VOLUME, .volume_percent = percent};
@@ -1561,10 +1641,12 @@ void ui_loop_once(void)
 
 void ui_tick_animation(uint32_t now_ms)
 {
-    if (s_ble_prov) {
+    if (animation_count == 0 || animations[animation_index].count == 0) {
+        last_anim_tick = now_ms;
         return;
     }
-    if (animation_count == 0 || animations[animation_index].count == 0) {
+    if (prov_ui_active()) {
+        last_anim_tick = now_ms;
         return;
     }
     uint32_t elapsed = now_ms - last_anim_tick;
