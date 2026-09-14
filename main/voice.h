@@ -8,6 +8,8 @@ void voice_init(void);
 void voice_loop(void);
 void voice_net_poll(void);
 void voice_on_audio_chunk(const char *session_id, const uint8_t *data, size_t len, bool end);
+bool voice_enqueue_audio_chunk(const char *session_id, const uint8_t *data, size_t len, bool end);
+bool voice_net_busy(void);
 void voice_on_server_status(const char *status);
 void voice_on_ws_lost(void);
 void voice_set_enabled(bool enabled);

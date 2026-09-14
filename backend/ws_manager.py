@@ -16,7 +16,7 @@ AUDIO_SEND_INTERVAL_SEC = 0.02
 AUDIO_BURST_BYTES = 16384
 VOICE_BUSY_TIMEOUT_SEC = 55.0
 DEVICE_PING_SEC = 2.0
-DEVICE_STALE_SEC = 5.0
+DEVICE_STALE_SEC = 30.0
 from typing import Any, Callable
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -611,6 +611,7 @@ class WsHub:
                 await asyncio.wait_for(device.send_json(header), timeout=5)
                 if chunk:
                     await asyncio.wait_for(device.send_bytes(chunk), timeout=8)
+            self._device.last_seen = time.time()
         except Exception as exc:
             self._abort_speak(session_id, f"send failed: {type(exc).__name__}: {exc}")
             return
@@ -651,6 +652,8 @@ class WsHub:
     async def _drop_stale_device(self) -> None:
         ws = self._device.websocket
         if ws is None:
+            return
+        if self._speak_sessions or self._voice_busy:
             return
         seen = self._device.last_seen
         if seen <= 0 or (time.time() - seen) <= DEVICE_STALE_SEC:

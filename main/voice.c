@@ -2,18 +2,38 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "audio.h"
 #include "ap_prov.h"
 #include "ble_prov.h"
 #include "board_pins.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "net_ws.h"
 #include "ui.h"
 
 static const char *TAG = "voice";
+
+#define WS_AUDIO_PKT_MAX 4096u
+#define WS_AUDIO_QUEUE_DEPTH 16u
+
+typedef struct {
+    char session_id[16];
+    uint16_t len;
+    bool end;
+    uint8_t data[WS_AUDIO_PKT_MAX];
+} ws_audio_slot_t;
+
+static ws_audio_slot_t *s_ws_audio_q;
+static SemaphoreHandle_t s_ws_audio_mux;
+static uint16_t s_ws_audio_head;
+static uint16_t s_ws_audio_tail;
+static uint32_t s_ws_audio_drop;
 
 enum {
     VOICE_LISTEN = 0,
@@ -191,12 +211,90 @@ static void finish_turn(bool announce)
     resume_listen();
 }
 
+static void drain_ws_audio_queue(void)
+{
+    if (!s_ws_audio_q || !s_ws_audio_mux) {
+        return;
+    }
+    for (int burst = 0; burst < 8; ++burst) {
+        ws_audio_slot_t slot;
+        if (xSemaphoreTake(s_ws_audio_mux, 0) != pdTRUE) {
+            return;
+        }
+        if (s_ws_audio_head == s_ws_audio_tail) {
+            xSemaphoreGive(s_ws_audio_mux);
+            return;
+        }
+        slot = s_ws_audio_q[s_ws_audio_tail];
+        s_ws_audio_tail = (uint16_t)((s_ws_audio_tail + 1) % WS_AUDIO_QUEUE_DEPTH);
+        xSemaphoreGive(s_ws_audio_mux);
+        voice_on_audio_chunk(slot.session_id[0] ? slot.session_id : NULL, slot.data, slot.len,
+                             slot.end);
+    }
+}
+
+bool voice_enqueue_audio_chunk(const char *session_id, const uint8_t *data, size_t len, bool end)
+{
+    if (!s_ws_audio_q || !s_ws_audio_mux) {
+        return false;
+    }
+    if ((!data || len == 0) && !end) {
+        return true;
+    }
+    if (data && len > WS_AUDIO_PKT_MAX) {
+        ESP_LOGW(TAG, "ws audio chunk too large %u", (unsigned)len);
+        return false;
+    }
+    if (xSemaphoreTake(s_ws_audio_mux, pdMS_TO_TICKS(5)) != pdTRUE) {
+        ++s_ws_audio_drop;
+        return false;
+    }
+    uint16_t next = (uint16_t)((s_ws_audio_head + 1) % WS_AUDIO_QUEUE_DEPTH);
+    if (next == s_ws_audio_tail) {
+        xSemaphoreGive(s_ws_audio_mux);
+        ++s_ws_audio_drop;
+        return false;
+    }
+    ws_audio_slot_t *slot = &s_ws_audio_q[s_ws_audio_head];
+    slot->len = 0;
+    slot->end = end;
+    slot->session_id[0] = '\0';
+    if (session_id && session_id[0]) {
+        strncpy(slot->session_id, session_id, sizeof(slot->session_id) - 1);
+        slot->session_id[sizeof(slot->session_id) - 1] = '\0';
+    }
+    if (data && len > 0) {
+        memcpy(slot->data, data, len);
+        slot->len = (uint16_t)len;
+    }
+    s_ws_audio_head = next;
+    xSemaphoreGive(s_ws_audio_mux);
+    return true;
+}
+
+bool voice_net_busy(void)
+{
+    return s_phase == VOICE_RECORDING || s_phase == VOICE_UPLOADING || s_phase == VOICE_WAIT_REPLY ||
+           s_phase == VOICE_PLAYING || audio_playback_is_active();
+}
+
 void voice_init(void)
 {
     s_phase = VOICE_LISTEN;
     s_upload_pending = false;
     s_upload_done = false;
     reset_vad_baseline();
+    if (!s_ws_audio_q) {
+        s_ws_audio_q = heap_caps_calloc(WS_AUDIO_QUEUE_DEPTH, sizeof(ws_audio_slot_t),
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_ws_audio_q) {
+            s_ws_audio_q = calloc(WS_AUDIO_QUEUE_DEPTH, sizeof(ws_audio_slot_t));
+        }
+        s_ws_audio_mux = xSemaphoreCreateMutex();
+    }
+    s_ws_audio_head = 0;
+    s_ws_audio_tail = 0;
+    s_ws_audio_drop = 0;
     ESP_LOGI(TAG, "always-listen VAD adaptive, PDM DATA=GPIO%d CLK=GPIO%d", PIN_PDM_DATA,
              PIN_PDM_CLK);
 }
@@ -474,6 +572,7 @@ void voice_net_poll(void)
 #if !VOICE_HARDWARE_ENABLED
     return;
 #endif
+    drain_ws_audio_queue();
     /* During RECORDING: open stream once, then push 4KB chunks while capturing. */
     if (s_phase == VOICE_RECORDING) {
         if (!net_ws_ready()) {

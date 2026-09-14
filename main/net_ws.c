@@ -57,6 +57,7 @@ static bool s_ap_paused;
 static uint32_t s_profile_try_ms;
 static uint32_t s_boot_ms;
 static bool s_ap_fallback_done;
+static bool s_ws_ever_ok;
 #define PROFILE_ROTATE_MS 15000u
 #define AP_FALLBACK_MS 30000u
 static esp_netif_t *s_sta;
@@ -405,7 +406,8 @@ static void handle_text(const char *text, int len)
         if (s_audio_len > 0) {
             s_expect_audio = true;
         } else {
-            voice_on_audio_chunk(s_chunk_session[0] ? s_chunk_session : NULL, NULL, 0, s_audio_end);
+            (void)voice_enqueue_audio_chunk(s_chunk_session[0] ? s_chunk_session : NULL, NULL, 0,
+                                            s_audio_end);
         }
     } else if (strcmp(t, "config") == 0) {
         const cJSON *vol = cJSON_GetObjectItem(root, "volume_percent");
@@ -467,6 +469,7 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     esp_websocket_event_data_t *evt = (esp_websocket_event_data_t *)data;
     if (id == WEBSOCKET_EVENT_CONNECTED) {
         s_ws_on = true;
+        s_ws_ever_ok = true;
         s_ws_up_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
         xEventGroupSetBits(s_events, WS_OK);
         send_hello();
@@ -490,9 +493,12 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                 const bool last_piece =
                     (evt->payload_len <= 0) ||
                     (evt->payload_offset + evt->data_len >= evt->payload_len);
-                voice_on_audio_chunk(s_chunk_session[0] ? s_chunk_session : NULL,
-                                     (const uint8_t *)evt->data_ptr, (size_t)evt->data_len,
-                                     s_audio_end && last_piece);
+                if (!voice_enqueue_audio_chunk(s_chunk_session[0] ? s_chunk_session : NULL,
+                                               (const uint8_t *)evt->data_ptr,
+                                               (size_t)evt->data_len,
+                                               s_audio_end && last_piece)) {
+                    ESP_LOGW(TAG, "ws audio queue full, drop %u", (unsigned)evt->data_len);
+                }
                 if (last_piece) {
                     s_expect_audio = false;
                 }
@@ -640,6 +646,7 @@ esp_err_t net_init(void)
     ESP_ERROR_CHECK(esp_wifi_start());
     s_boot_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     s_ap_fallback_done = false;
+    s_ws_ever_ok = false;
     ESP_LOGI(TAG, "wifi start ssid=%s ws=%s", acfg->ssid, acfg->ws_url);
     return ESP_OK;
 }
@@ -798,7 +805,7 @@ void net_loop(void)
     }
 
     /* Round-robin saved BLE profiles until WiFi+WS are both up. */
-    if (agent_cfg_profile_count() > 1) {
+    if (agent_cfg_profile_count() > 1 && !voice_net_busy()) {
         uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
         if (net_ws_ready()) {
             s_profile_try_ms = now;
@@ -813,7 +820,9 @@ void net_loop(void)
         }
     }
 
-    if (!net_ws_ready() && !s_ap_fallback_done && !ble_prov_active() && !ap_prov_active()) {
+    /* Auto AP only on first boot before WS has ever connected. */
+    if (!net_ws_ready() && !s_ws_ever_ok && !s_ap_fallback_done && !ble_prov_active() &&
+        !ap_prov_active() && !voice_net_busy()) {
         uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
         if ((now - s_boot_ms) >= AP_FALLBACK_MS) {
             s_ap_fallback_done = true;
