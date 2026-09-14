@@ -62,6 +62,8 @@ enum {
 #define MIN_CLIP_BYTES 6400
 #define PLAY_END_GRACE_MS 800
 #define PLAY_STALL_MS 15000
+#define UPLOAD_TIMEOUT_MS 20000
+#define WS_AUDIO_DRAIN_BURST 3
 
 typedef struct {
     float noise_rms;
@@ -93,6 +95,7 @@ static uint32_t s_last_vad_seq;
 static int64_t s_last_mic_ui_us;
 static int64_t s_play_end_empty_us;
 static int64_t s_play_stall_us;
+static int64_t s_upload_start_us;
 
 static int64_t now_us(void) { return esp_timer_get_time(); }
 
@@ -211,12 +214,78 @@ static void finish_turn(bool announce)
     resume_listen();
 }
 
+static void voice_reset_session(const char *reason)
+{
+    ESP_LOGW(TAG, "reset session: %s phase=%d", reason ? reason : "?", s_phase);
+#if VOICE_HARDWARE_ENABLED
+    if (audio_playback_is_active()) {
+        audio_playback_stop();
+    }
+    if (s_stream_active && s_session_id[0] && net_ws_ready()) {
+        (void)net_ws_send_audio_end(s_session_id, audio_capture_size(), true);
+    }
+    audio_capture_listen_stop();
+#endif
+    s_upload_pending = false;
+    s_upload_done = false;
+    s_upload_ok = false;
+    s_upload_start_us = 0;
+    s_stream_active = false;
+    s_stream_failed = false;
+    s_stream_sent = 0;
+    s_audio_end = false;
+    s_play_end_empty_us = 0;
+    s_play_stall_us = 0;
+    s_vad.in_speech = false;
+    s_session = false;
+    s_session_id[0] = '\0';
+    s_last_show[0] = '\0';
+    audio_capture_clear();
+    s_phase = VOICE_LISTEN;
+    ui_post_voice_link(false, false, false, "");
+    if (s_voice_enabled && !ble_prov_active() && !ap_prov_active()) {
+        resume_listen();
+    } else {
+        set_listening(false);
+    }
+}
+
+static void finalize_recording(bool maxed, bool silenced)
+{
+    audio_capture_end_store();
+    size_t pcm_len = audio_capture_size();
+    int64_t dur_us = now_us() - s_record_start_us;
+    int64_t silence_us = now_us() - s_last_voice_us;
+    ESP_LOGI(TAG, "VAD end dur=%.0fms silence=%.0fms pcm=%u max=%d sil=%d",
+             (double)dur_us / 1000.0, (double)silence_us / 1000.0, (unsigned)pcm_len, (int)maxed,
+             (int)silenced);
+    if (pcm_len < (size_t)MIN_CLIP_BYTES) {
+        ESP_LOGW(TAG, "drop short clip %u bytes", (unsigned)pcm_len);
+        if (s_stream_active) {
+            (void)net_ws_send_audio_end(s_session_id, pcm_len, true);
+            s_stream_active = false;
+        }
+        s_vad.in_speech = false;
+        audio_capture_clear();
+        s_phase = VOICE_LISTEN;
+        post_voice_ui();
+        s_cooldown_until_us = now_us() + (int64_t)VAD_COOLDOWN_MS * 1000;
+        return;
+    }
+    s_upload_ok = false;
+    s_upload_done = false;
+    s_upload_pending = true;
+    s_upload_start_us = now_us();
+    s_phase = VOICE_UPLOADING;
+    post_voice_ui();
+}
+
 static void drain_ws_audio_queue(void)
 {
     if (!s_ws_audio_q || !s_ws_audio_mux) {
         return;
     }
-    for (int burst = 0; burst < 8; ++burst) {
+    for (int burst = 0; burst < WS_AUDIO_DRAIN_BURST; ++burst) {
         ws_audio_slot_t slot;
         if (xSemaphoreTake(s_ws_audio_mux, 0) != pdTRUE) {
             return;
@@ -372,6 +441,9 @@ void voice_loop(void)
     return;
 #endif
     if (ble_prov_active() || ap_prov_active()) {
+        if (s_phase != VOICE_LISTEN) {
+            voice_reset_session("prov active");
+        }
         return;
     }
     if (!s_voice_enabled) {
@@ -441,8 +513,16 @@ void voice_loop(void)
     }
 
     if (s_phase == VOICE_UPLOADING) {
+        if (!s_upload_done && s_upload_start_us != 0 &&
+            (now_us() - s_upload_start_us) > (int64_t)UPLOAD_TIMEOUT_MS * 1000) {
+            ESP_LOGW(TAG, "upload timeout pending=%d", (int)s_upload_pending);
+            s_upload_pending = false;
+            s_upload_done = true;
+            s_upload_ok = false;
+        }
         if (s_upload_done) {
             s_upload_done = false;
+            s_upload_start_us = 0;
             if (!s_upload_ok) {
                 show("ERROR", "上传失败");
                 s_phase = VOICE_ERROR;
@@ -462,6 +542,14 @@ void voice_loop(void)
     if (!audio_capture_is_listening()) {
         resume_listen();
         return;
+    }
+
+    if (s_phase == VOICE_RECORDING) {
+        int64_t dur_us = now_us() - s_record_start_us;
+        if (dur_us > (int64_t)VAD_MAX_MS * 1000) {
+            finalize_recording(true, false);
+            return;
+        }
     }
 
     if (s_listening && s_voice_enabled &&
@@ -540,30 +628,7 @@ void voice_loop(void)
         if (!maxed && !silenced) {
             return;
         }
-        audio_capture_end_store();
-        size_t pcm_len = audio_capture_size();
-        ESP_LOGI(TAG, "VAD end dur=%.0fms silence=%.0fms pcm=%u max=%d sil=%d",
-                 (double)dur_us / 1000.0, (double)silence_us / 1000.0, (unsigned)pcm_len,
-                 (int)maxed, (int)silenced);
-        if (pcm_len < (size_t)MIN_CLIP_BYTES) {
-            ESP_LOGW(TAG, "drop short clip %u bytes", (unsigned)pcm_len);
-            if (s_stream_active) {
-                (void)net_ws_send_audio_end(s_session_id, pcm_len, true);
-                s_stream_active = false;
-            }
-            s_vad.in_speech = false;
-            audio_capture_clear();
-            s_phase = VOICE_LISTEN;
-            post_voice_ui();
-            s_cooldown_until_us = now_us() + (int64_t)VAD_COOLDOWN_MS * 1000;
-            return;
-        }
-        s_upload_ok = false;
-        s_upload_done = false;
-        s_upload_pending = true;
-        s_phase = VOICE_UPLOADING;
-        post_voice_ui();
-        /* stay on listening caption; skip upload caption */
+        finalize_recording(maxed, silenced);
     }
 }
 
@@ -684,26 +749,7 @@ void voice_set_enabled(bool enabled)
 
 void voice_on_ws_lost(void)
 {
-#if VOICE_HARDWARE_ENABLED
-    if (audio_playback_is_active()) {
-        audio_playback_stop();
-    }
-    audio_capture_listen_stop();
-#endif
-    s_upload_pending = false;
-    s_upload_done = false;
-    s_stream_active = false;
-    s_stream_failed = false;
-    s_audio_end = false;
-    s_play_end_empty_us = 0;
-    s_play_stall_us = 0;
-    s_vad.in_speech = false;
-    s_session = false;
-    s_session_id[0] = '\0';
-    s_listening = false;
-    s_phase = VOICE_LISTEN;
-    s_last_show[0] = '\0';
-    ui_post_voice_link(false, false, false, "");
+    voice_reset_session("ws lost");
 }
 
 bool voice_is_enabled(void) { return s_voice_enabled; }

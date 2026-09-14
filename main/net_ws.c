@@ -782,7 +782,6 @@ void net_loop(void)
     if (s_wifi && !s_ws) {
         start_ws();
     }
-    voice_net_poll();
     uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     if (net_ws_ready() && s_ws_up_ms != 0 && (now_ms - s_ws_up_ms) >= DISPLAY_QUIET_MS) {
         char st[24];

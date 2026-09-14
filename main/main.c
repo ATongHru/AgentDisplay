@@ -58,6 +58,7 @@ static void app_task(void *arg)
         uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
         ui_tick_animation(now);
         voice_loop();
+        voice_net_poll();
         btn_boot_poll();
         ble_prov_loop();
         ap_prov_loop();
