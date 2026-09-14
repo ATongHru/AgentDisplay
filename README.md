@@ -1471,6 +1471,6 @@ esp32s3-agent-display/
 
 ## 许可证
 
-本项目**自有源码**采用 [MIT License](LICENSE)，版权归 `11428` 所有。
+本项目**自有源码**采用 [MIT License](LICENSE)，版权归 [ATongHru](https://github.com/ATongHru)（床头指挥官）所有。
 
 第三方依赖与资源（ESP-IDF、LVGL、Noto Emoji、Vosk、`edge-tts`、字库生成用 SimHei 等）的许可说明见 [NOTICE](NOTICE)。再分发固件或后端时，请一并保留 `LICENSE` 与 `NOTICE`，并遵守 CC BY 4.0 对表情资源的署名要求。

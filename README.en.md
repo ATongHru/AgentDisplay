@@ -839,6 +839,6 @@ Download **vosk-model-small-cn-0.22** to `backend/models/vosk-model-small-cn-0.2
 
 ## License
 
-Original source in this repository is under the [MIT License](LICENSE) (Copyright `11428`).
+Original source in this repository is under the [MIT License](LICENSE) (Copyright [ATongHru](https://github.com/ATongHru)).
 
 Third-party components and assets (ESP-IDF, LVGL, Noto Emoji, Vosk, `edge-tts`, SimHei-derived font binary, etc.) are listed in [NOTICE](NOTICE). When redistributing firmware or the backend, include both files and comply with CC BY 4.0 attribution for emoji assets.
