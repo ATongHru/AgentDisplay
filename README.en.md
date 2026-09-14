@@ -113,15 +113,15 @@ No record button: VAD listens on boot. GPIO17/18 spare.
 
 ### 1.3 Flash & memory
 
-Flash partitions: see `partitions.csv`. Flash assets with `scripts/flash_animations.py` (`0x600000`) and `scripts/flash_font.py` (`0x400000`).
+Flash partitions: see `partitions.csv` (A/B OTA: `app0`+`app1` 3 MB each). Flash assets with `scripts/flash_animations.py` (`0x810000`) and `scripts/flash_font.py` (`0x610000`).
 
-PSRAM buffers: CJK font (~893 KB), record PCM (640 KB), play ring (512 KB), voice history (128 KB), LVGL partial buffers (~37.5 KB). RLE face double-buffer (~32 KB) stays in **internal DRAM**.
+PSRAM buffers: CJK font (~893 KB), record PCM (640 KB), play ring (512 KB), voice history (128 KB), LVGL partial buffers (~37.5 KB), RLE face double-buffer (32 KB, `ui_face.c`), WS audio drain slot (~4.1 KB). Boot log shows `PSRAM free ~5.71 MB`, `DRAM free ~171 KB / largest 80 KB`.
 
 ### 1.4 Configuration
 
-Key `sdkconfig.defaults`: 240 MHz, OPI PSRAM, `CONFIG_LV_USE_GIF=n`, `CONFIG_AGENT_VOICE_HW=y`, `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y`.
+Key `sdkconfig.defaults`: 240 MHz, OPI PSRAM, `CONFIG_LV_USE_GIF=n`, `CONFIG_AGENT_VOICE_HW=y`, `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y`, `CONFIG_ESP_TASK_WDT_PANIC=y` (task watchdog resets the chip after 5 s of starvation).
 
-menuconfig **Agent Display**: WiFi, static IP, `AGENT_WS_URL`. NVS (BLE/AP) overrides Kconfig defaults.
+menuconfig **Agent Display**: WiFi, static IP, `AGENT_WS_URL` — factory defaults are **empty** (no credentials in version control; fresh devices must be provisioned). The **Voice / audio tuning** submenu exposes VAD/AGC/timeout knobs. NVS (BLE/AP) overrides Kconfig defaults.
 
 ---
 
@@ -133,13 +133,15 @@ menuconfig **Agent Display**: WiFi, static IP, `AGENT_WS_URL`. NVS (BLE/AP) over
 |--------|------|------|
 | Entry | `main.c` | `app_main`, task creation |
 | Display | `display.c` | SPI, ST7789, `display_blit_rgb565` |
-| UI | `ui.c` | LVGL, queue, face refresh, captions |
+| UI | `ui.c` | LVGL, queue, captions |
+| Face | `ui_face.c` | frame double-buffer, RLE decode, animation tick, dirty-flagged SPI blit |
 | Network | `net_ws.c` | WiFi, WebSocket, voice I/O |
 | Audio | `audio.c` | PDM, AGC, I2S playback ring |
 | Voice | `voice.c` | VAD FSM, streaming upload |
 | Provisioning | `ble_prov.c` / `ap_prov.c` / `prov_cfg.c` | BLE NUS, Soft AP portal, shared NVS |
 | CLI | `serial_cli.c` | `ap` / `ap_stop` / `ble_stop` |
 | Button | `btn_boot.c` | BOOT long-press |
+| Util | `ws_url.c` | `ws://` URL parsing (shared by `net_ws` / `prov_cfg`) |
 
 ### 2.2 Boot sequence (`app_main` on Core 0)
 
@@ -161,6 +163,7 @@ menuconfig **Agent Display**: WiFi, static IP, `AGENT_WS_URL`. NVS (BLE/AP) over
 - **UI queue** (`xQueueCreate(16, ui_msg_t)`): only `lvgl` task touches LVGL.
 - **Voice**: `voice_loop` on `app` task; `voice_net_poll` on `net` task; shared PCM in PSRAM.
 - **`ui_post_voice_link`**: critical-section merge to avoid stuck `SPEAKING`.
+- **WS ingress**: text frames are copied into a PSRAM queue (8 slots x 2 KB) inside the event callback; JSON/NVS/UI work runs in `net_loop`. WiFi reconnect uses exponential backoff (5 s doubling, 60 s cap); WiFi power save toggles `PS_NONE` (voice active) / `PS_MIN_MODEM` (idle).
 
 ---
 
@@ -181,12 +184,12 @@ All app tasks use `xTaskCreatePinnedToCore`.
 |------|------|-----|-------|------|------|
 | `audio` | 0 | **6** | 8192 | 5 ms | I2S0 PDM RX, I2S1 TX; stop mic while playing |
 | `net` | 0 | 4 | 8192 | 20 ms | WiFi, WebSocket, `voice_net_poll` |
-| `lvgl` | 1 | 4 | 8192 | 5 ms | UI queue, LVGL, RLE + SPI blit |
-| `app` | 1 | 3 | 8192 | 5 ms | VAD, animation tick, BLE/AP loops |
-| `btn_boot` | 1 | 6 | 4096 | 20 ms | BOOT ≥3 s → BLE; ≥5 s → diagnostic |
+| `lvgl` | 1 | 4 | 8192 | 5–30 ms adaptive | UI queue, LVGL, animation tick, RLE + dirty-only SPI blit |
+| `app` | 1 | 3 | 8192 | 5 ms | VAD, BLE/AP loops, link-state post on change (10 dBm RSSI hysteresis) |
+| `btn_boot` | 1 | 4 | 4096 | 20 ms | BOOT ≥3 s → BLE; ≥5 s → diagnostic |
 | `cli` | 1 | 2 | 4096 | blocking | Serial `ap` / `ap_stop` / `ble_stop` |
 
-**Ephemeral**: `ble_start` (pri 5, 8192), NimBLE Host (8192).
+**Ephemeral**: `ble_start` (pri 5, 8192), NimBLE Host (8192). All four resident tasks (`audio` / `net` / `lvgl` / `app`) subscribe to the Task WDT; any 5 s stall resets the chip.
 
 ### 3.3 Priority rationale
 
@@ -196,14 +199,14 @@ Audio (6) must beat LVGL (4) on timing-critical I2S. `app` (3) and `cli` (2) are
 
 - `psram_malloc()` for PCM, play ring, CJK font, LVGL buffers.
 - `SPIRAM_MALLOC_RESERVE_INTERNAL=32768` for WiFi/BT DMA.
-- Face RLE buffers in internal BSS to reduce PSRAM bandwidth contention.
+- Face RLE double-buffer also lives in PSRAM (runtime-allocated in `ui_face.c`), keeping internal contiguous blocks for WiFi/BT.
 
 ### 3.5 Thread-safety rules
 
 1. No LVGL calls outside `lvgl` task.
 2. No LVGL in ISR.
 3. No unguarded shared PCM/text buffers.
-4. Animation **timing** on `app`; **decode + blit** only on `lvgl`.
+4. Animation **advance, decode and blit all live on `lvgl`** (`ui_face_tick` → back buffer → dirty flag → `ui_face_blit`); `ui_msg_t.json` is a PSRAM pointer freed by the consumer; the record buffer is read via the locked `audio_capture_snapshot()`.
 5. `source=VOICE` WS events update captions only; face/status from `refresh_face_display()`.
 
 ---
@@ -212,23 +215,23 @@ Audio (6) must beat LVGL (4) on timing-critical I2S. `app` (3) and `cli` (2) are
 
 ### 4.1 Display
 
-LVGL 9.2, partial buffers in PSRAM (`PARTIAL_BUF_LINES=40`). Face refresh priority: `OFFLINE` → `voice_overlay` → `agent_status`.
+LVGL 9.2, partial buffers in PSRAM (`PARTIAL_BUF_LINES=40`). Face refresh priority: `OFFLINE` → `STALE` (WS up but no frames for 8 s) → `voice_overlay` → `agent_status`. The face area only triggers SPI transfers when a frame actually changes (dirty flag), and the LVGL loop idles at 30 ms when static. Missing assets degrade gracefully: placeholder face + "no animations", or ASCII fallback for a missing CJK font.
 
 ### 4.2 Offline RLE emoji
 
-PC pre-renders GIFs to 90×90 RGB565 RLE in `animations` partition. Device mmap + Core 1 SPI blit. **No `lv_gif`.**
+PC pre-renders GIFs to 90×90 RGB565 RLE in the `animations` partition (`0x810000`, 554 frames / 4.40 MB). Device mmap + Core 1 decode into the PSRAM double-buffer, SPI blit on dirty frames only. **No `lv_gif`.**
 
 Regenerate: `python scripts/gen_frame_player.py` then `scripts/flash_animations.py`.
 
 ### 4.3 CJK font
 
-Partition `cjk_font` @ `0x400000`. 7000-char table + `extra_symbols.txt` + ASCII. Flash with `scripts/gen_cjk_font.py` + `scripts/flash_font.py`.
+Partition `cjk_font` @ `0x610000`. 7000-char table + `extra_symbols.txt` + ASCII. Flash with `scripts/gen_cjk_font.py` + `scripts/flash_font.py`.
 
 ### 4.4 Voice (summary)
 
 VAD FSM in `voice.c`: LISTEN → RECORDING → UPLOADING → WAIT_REPLY → PLAYING → LISTEN.
 
-- Stream upload: 4096 B chunks; wait for `session` up to **2.5 s**.
+- Stream upload: 4096 B chunks; session handshake is asynchronous (`net_ws_audio_session_start`/`poll`, 2.5 s timeout) so `app` never blocks. VAD/AGC/timeout constants are menuconfig-tunable (**Voice / audio tuning**).
 - No barge-in during playback.
 - Full JSON examples: [§5.2](#52-websocket-protocol).
 
@@ -801,8 +804,8 @@ Download three partition images (**v1.0**, ESP-IDF 5.4.2):
 | File | Offset | Download |
 |------|--------|----------|
 | `esp32s3_agent_display.bin` | `0x10000` | [Releases](https://github.com/ATongHru/AgentDisplay/releases/download/v1.0/esp32s3_agent_display.bin) |
-| `font_cjk_16.bin` | `0x400000` | [Releases](https://github.com/ATongHru/AgentDisplay/releases/download/v1.0/font_cjk_16.bin) |
-| `animations.bin` | `0x600000` | [Releases](https://github.com/ATongHru/AgentDisplay/releases/download/v1.0/animations.bin) |
+| `font_cjk_16.bin` | `0x610000` | [Releases](https://github.com/ATongHru/AgentDisplay/releases/download/v1.0/font_cjk_16.bin) |
+| `animations.bin` | `0x810000` | [Releases](https://github.com/ATongHru/AgentDisplay/releases/download/v1.0/animations.bin) |
 
 In-repo paths: `firmware/releases/v1.0/` (app) + `firmware/data/` (font, animations). Flash steps and SHA256: [firmware/releases/v1.0/README.md](firmware/releases/v1.0/README.md).
 
