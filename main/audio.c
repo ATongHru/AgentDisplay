@@ -2,7 +2,10 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+
+#include "sdkconfig.h"
 
 #include "board_pins.h"
 #include "mem_utils.h"
@@ -54,12 +57,13 @@ static int s_volume_percent = 100;
 #define FADE_SAMPLES 160
 #define PRE_ROLL_MS 400
 #define PRE_ROLL_BYTES ((VOICE_SAMPLE_RATE * 2 * PRE_ROLL_MS) / 1000)
-#define PDM_AGC_GAIN_MIN 3.0f
-#define PDM_AGC_GAIN_MAX 10.0f
-#define PDM_AGC_GAIN_INIT 5.0f
-#define PDM_AGC_TARGET_RMS 0.3f
-#define PDM_AGC_ALPHA 0.1f
-#define PDM_READ_TIMEOUT_MS 20
+/* Kconfig 可调（menuconfig → Agent Display → Voice / audio tuning）。 */
+#define PDM_AGC_GAIN_MIN (CONFIG_AGENT_PDM_AGC_GAIN_MIN_X10 / 10.0f)
+#define PDM_AGC_GAIN_MAX (CONFIG_AGENT_PDM_AGC_GAIN_MAX_X10 / 10.0f)
+#define PDM_AGC_GAIN_INIT (CONFIG_AGENT_PDM_AGC_GAIN_INIT_X10 / 10.0f)
+#define PDM_AGC_TARGET_RMS (CONFIG_AGENT_PDM_AGC_TARGET_RMS_X1000 / 1000.0f)
+#define PDM_AGC_ALPHA (CONFIG_AGENT_PDM_AGC_ALPHA_X100 / 100.0f)
+#define PDM_READ_TIMEOUT_MS CONFIG_AGENT_PDM_READ_TIMEOUT_MS
 #define PDM_QUIET_PEAK 40
 #define PDM_QUIET_SWITCH_READS 50
 
@@ -159,6 +163,17 @@ esp_err_t audio_init(void)
     s_preroll_cap = PRE_ROLL_BYTES;
     s_preroll = psram_malloc(s_preroll_cap);
     if (!s_mutex || !s_record || !s_ring || !s_preroll) {
+        free(s_record);
+        s_record = NULL;
+        free(s_ring);
+        s_ring = NULL;
+        free(s_preroll);
+        s_preroll = NULL;
+        if (s_mutex) {
+            vSemaphoreDelete(s_mutex);
+            s_mutex = NULL;
+        }
+        ESP_LOGE(TAG, "buffer alloc failed");
         return ESP_ERR_NO_MEM;
     }
     s_preroll_w = 0;
@@ -200,6 +215,7 @@ esp_err_t audio_init(void)
     s_inited = true;
     ESP_LOGI(TAG, "I2S ready PDM din=GPIO%d clk=GPIO%d tx din=GPIO%d ws=GPIO%d bclk=GPIO%d",
              PIN_PDM_DATA, PIN_PDM_CLK, PIN_I2S_DIN, PIN_I2S_LRC, PIN_I2S_BCLK);
+    mem_report("audio");
     return ESP_OK;
 }
 
@@ -407,6 +423,23 @@ bool audio_capture_is_listening(void) { return s_listening; }
 const uint8_t *audio_capture_data(void) { return s_record; }
 size_t audio_capture_size(void) { return s_record_size; }
 
+void audio_capture_snapshot(const uint8_t **data, size_t *size)
+{
+    const uint8_t *p = NULL;
+    size_t n = 0;
+    if (lock(pdMS_TO_TICKS(50))) {
+        p = s_record;
+        n = s_record_size;
+        unlock();
+    }
+    if (data) {
+        *data = p;
+    }
+    if (size) {
+        *size = n;
+    }
+}
+
 void audio_capture_reset(void)
 {
     audio_capture_listen_stop();
@@ -466,16 +499,22 @@ void audio_playback_stop(void)
 
 void audio_playback_begin_fadeout(void)
 {
-    if (!s_fade_out_req) {
-        s_fade_out_req = true;
-        s_fade_out_pos = 0;
+    if (!lock(pdMS_TO_TICKS(50))) {
+        return;
     }
+    s_fade_out_req = true;
+    s_fade_out_pos = 0;
+    unlock();
 }
 
 void audio_playback_cancel_fadeout(void)
 {
+    if (!lock(pdMS_TO_TICKS(50))) {
+        return;
+    }
     s_fade_out_req = false;
     s_fade_out_pos = 0;
+    unlock();
 }
 
 bool audio_playback_write(const uint8_t *data, size_t len)
@@ -505,8 +544,9 @@ bool audio_playback_write(const uint8_t *data, size_t len)
     size_t off = 0;
     int64_t start = (int64_t)xTaskGetTickCount();
     while (off < len) {
-        if ((int64_t)xTaskGetTickCount() - start > pdMS_TO_TICKS(2000)) {
-            ESP_LOGW(TAG, "playback ring timeout, dropped %u", (unsigned)(len - off));
+        /* 有界等待 200ms：旧值 2s 会把 app 任务（UI/事件循环）卡死；超时丢弃剩余并告警。 */
+        if ((int64_t)xTaskGetTickCount() - start > pdMS_TO_TICKS(200)) {
+            ESP_LOGW(TAG, "playback ring full 200ms, dropped %u", (unsigned)(len - off));
             return off > 0;
         }
         if (!lock(pdMS_TO_TICKS(50))) {
@@ -523,10 +563,16 @@ bool audio_playback_write(const uint8_t *data, size_t len)
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
-        for (size_t i = 0; i < n; ++i) {
-            s_ring[s_ring_head] = data[off + i];
-            s_ring_head = (s_ring_head + 1) % s_ring_cap;
+        /* 环形缓冲两段 memcpy，替代逐字节拷贝。 */
+        size_t first = s_ring_cap - s_ring_head;
+        if (first > n) {
+            first = n;
         }
+        memcpy(s_ring + s_ring_head, data + off, first);
+        if (n > first) {
+            memcpy(s_ring, data + off + first, n - first);
+        }
+        s_ring_head = (s_ring_head + n) % s_ring_cap;
         unlock();
         off += n;
     }
@@ -543,10 +589,22 @@ void audio_playback_service(void)
     if (!lock(0)) {
         return;
     }
-    while (n < sizeof(s_play_mono) && s_ring_tail != s_ring_head) {
-        s_play_mono[n++] = s_ring[s_ring_tail];
-        s_ring_tail = (s_ring_tail + 1) % s_ring_cap;
+    /* 读出端同样两段 memcpy。 */
+    size_t avail = ring_used();
+    size_t to_read = sizeof(s_play_mono) - n;
+    if (to_read > avail) {
+        to_read = avail;
     }
+    size_t first = s_ring_cap - s_ring_tail;
+    if (first > to_read) {
+        first = to_read;
+    }
+    memcpy(s_play_mono + n, s_ring + s_ring_tail, first);
+    if (to_read > first) {
+        memcpy(s_play_mono + n + first, s_ring, to_read - first);
+    }
+    s_ring_tail = (s_ring_tail + to_read) % s_ring_cap;
+    n += to_read;
     unlock();
     n &= ~(size_t)1;
     if (n == 0) {

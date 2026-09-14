@@ -153,8 +153,8 @@ GPIO3 在复位时会参与 strapping，接麦 DATA 可能干扰 USB 下载。
 
 | 排名 | 分区 | 资源 | 文件 | 大小 | 占分区 | 占 Flash |
 |------|------|------|------|------|--------|----------|
-| 1 | animations | 表情 GIF → RLE 帧序列（mmap） | `firmware/data/animations.bin` | 4.41 MB | 73.4% | 27.5% |
-| 2 | app0 | 主程序固件 | `build/esp32s3_agent_display.bin` | 1.38 MB | 46.0% | 8.6% |
+| 1 | animations | 表情 GIF → RLE 帧序列（mmap） | `firmware/data/animations.bin` | 4.40 MB | 99.3%（4.5 MB 槽） | 27.5% |
+| 2 | app0 | 主程序固件 | `build/esp32s3_agent_display.bin` | 1.43 MB | 47.7% | 8.8% |
 | 3 | cjk_font | 中文字库 | `firmware/data/font_cjk_16.bin` | 893 KB | 43.6% | 5.4% |
 | 4 | bootloader | 引导程序 | `build/bootloader/bootloader.bin` | 21.8 KB | 68.3% | 0.1% |
 | 5 | otadata | OTA 槽位 | `build/ota_data_initial.bin` | 8.0 KB | 100% | 0.05% |
@@ -165,11 +165,13 @@ GPIO3 在复位时会参与 strapping，接麦 DATA 可能干扰 USB 下载。
 | 分区 | 偏移 | 容量 | 说明 |
 |------|------|------|------|
 | nvs | `0x009000` | 20 KB | BLE / `agent_cfg`、WiFi 等 |
-| spiffs | `0x310000` | 896 KB | 遗留空 |
-| coredump | `0x3F0000` | 64 KB | 崩溃转储 |
-| storage | `0xC00000` | 4 MB | 预留 |
+| app1 | `0x310000` | 3 MB | OTA B 槽（`ota_1`） |
+| cjk_font | `0x610000` | 2 MB | CJK 字模 |
+| animations | `0x810000` | 4.5 MB | 表情动画 |
+| storage | `0xC80000` | 3.4 MB | 预留 |
+| coredump | `0xFF0000` | 64 KB | 崩溃转储 |
 
-烧录：`scripts/flash_animations.py` → `0x600000`；`scripts/flash_font.py` → `0x400000`。
+烧录：`scripts/flash_animations.py` → `0x810000`；`scripts/flash_font.py` → `0x610000`。
 
 #### PSRAM — 8 MB
 
@@ -180,8 +182,10 @@ GPIO3 在复位时会参与 strapping，接麦 DATA 可能干扰 USB 下载。
 | 3 | 播放 ring | `VOICE_PLAY_RING_BYTES` | 512 KB | 6.3% |
 | 4 | 语音历史 | `VOICE_HISTORY_BYTES` | 128 KB | 1.6% |
 | 5 | LVGL partial×2 | `PARTIAL_BUF_LINES=40` | 37.5 KB | 0.5% |
+| 6 | 表情 RLE 双缓冲 | `ui_face.c` `frame_buffer_a/b` | 32 KB | 0.4% |
+| 7 | WS 音频流出队槽 | `voice.c` `s_ws_audio_drain` | 4.1 KB | 0.05% |
 
-已知缓冲合计 ≈ **2.14 MB**（26.8%），空闲堆 ≈ **5.86 MB**。表情 RLE 双缓冲（≈32 KB）在**片内 DRAM**。
+已知缓冲合计 ≈ **2.18 MB**（27%），开机实测 `PSRAM free ≈ 5.71 MB`。表情 RLE 双缓冲已迁至 PSRAM（原占片内 DRAM 32 KB）。
 
 #### 片内 DRAM — 约 512 KB 可用池（示意）
 
@@ -189,9 +193,8 @@ GPIO3 在复位时会参与 strapping，接麦 DATA 可能干扰 USB 下载。
 |------|--------|-------------|------|
 | 1 | 应用任务栈等 | FreeRTOS 各任务 | ≈80 KB |
 | 2 | SPIRAM 预留片内 | `SPIRAM_MALLOC_RESERVE_INTERNAL=32768` | 32 KB |
-| 3 | 表情双缓冲 BSS | `main/ui.c` `frame_buffer_a/b` | 32 KB |
 
-NimBLE / WiFi DMA 为动态占用。配网前需 `wifi_deinit` 腾连续块，否则 BT controller 可能 `Malloc failed` 断言重启。
+NimBLE / WiFi DMA 为动态占用。配网前需 `wifi_deinit` 腾连续块，否则 BT controller 可能 `Malloc failed` 断言重启。开机实测 `DRAM free ≈ 171 KB / largest 80 KB`。
 
 ### 1.4 硬件与固件配置
 
@@ -207,9 +210,10 @@ NimBLE / WiFi DMA 为动态占用。配网前需 `wifi_deinit` 腾连续块，�
 | `CONFIG_LV_USE_GIF` | n | 禁用运行时 GIF |
 | `CONFIG_LV_USE_CLIB_MALLOC` | y | CJK binfont 需大堆 |
 | `CONFIG_AGENT_VOICE_HW` | y | 启用 PDM + 功放 |
+| `CONFIG_ESP_TASK_WDT_PANIC` | y | 任务看门狗 5 s 超时直接复位（死锁自恢复） |
 | `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL` | y | NimBLE 堆走 PSRAM |
 
-menuconfig「Agent Display」：WiFi SSID/密码、静态 IP、`AGENT_WS_URL` 等。出厂默认可读 Kconfig；BLE 写入 NVS 后 **NVS 优先**。
+menuconfig「Agent Display」：WiFi SSID/密码、静态 IP、`AGENT_WS_URL` 等**出厂默认留空**（凭证不入库，新设备强制配网）；「Voice / audio tuning」子菜单可现场调 VAD/AGC/超时参数。BLE/AP 写入 NVS 后 **NVS 优先**。
 
 ---
 
@@ -235,7 +239,8 @@ menuconfig「Agent Display」：WiFi SSID/密码、静态 IP、`AGENT_WS_URL` �
 |------|------|------|
 | 入口 | `main.c` | `app_main` 初始化、创建任务 |
 | 显示 | `display.c` | SPI 总线、ST7789、`display_blit_rgb565` 直绘 |
-| UI | `ui.c` / `ui_msg.h` | LVGL 控件、消息队列、表情刷新、字幕 |
+| UI | `ui.c` / `ui_msg.h` | LVGL 控件、消息队列、字幕 |
+| 表情 | `ui_face.c` | 帧双缓冲、RLE 解码、动画推进、按需 SPI 直绘 |
 | 动画 | `anim_loader.c` | mmap `animations` 分区、帧表索引 |
 | 字库 | `font_loader.c` | 从 `cjk_font` 分区加载 binfont |
 | 网络 | `net_ws.c` | WiFi、WebSocket、语音上传/下行 |
@@ -245,6 +250,7 @@ menuconfig「Agent Display」：WiFi SSID/密码、静态 IP、`AGENT_WS_URL` �
 | 串口 CLI | `serial_cli.c` | `ap` / `ap_stop` / `ble_stop` 调试命令 |
 | 按键 | `btn_boot.c` | BOOT 长按检测 |
 | 内存 | `mem_utils.c` | `psram_malloc` / `dram_malloc`、诊断报告 |
+| 工具 | `ws_url.c` | `ws://` URL 解析（`net_ws` / `prov_cfg` 共用） |
 
 ### 2.2 启动流程
 
@@ -312,17 +318,16 @@ Core 0                          Core 1
 ────────                        ────────
 audio_task  (pri 6)             lvgl_task (pri 4)
   ├ I2S0 PDM RX                   ├ xQueueReceive → LVGL API
-  └ I2S1 功放 TX                  ├ refresh_face_display()
-net_task    (pri 4)               └ RLE 解码 + SPI 直绘 90×90
-  ├ WiFi 事件
+  └ I2S1 功放 TX                  ├ ui_face_tick() 动画推进
+net_task    (pri 4)               ├ refresh_face_display()
+  ├ WiFi 事件                     └ RLE 解码 + 按需 SPI 直绘 90×90
   ├ esp_websocket_client
   └ voice_net_poll()
 WiFi / lwIP (IDF)               app_task  (pri 3)
 NimBLE Host (按需)                ├ voice_loop() VAD
-                                  ├ ui_tick_animation()
                                   ├ ble_prov_loop() / ap_prov_loop()
-                                  └ link_state 周期投递
-                                btn_boot  (pri 6)
+                                  └ link_state 变化才投递
+                                btn_boot  (pri 4)
                                   └ GPIO0 长按轮询
 ```
 
@@ -334,9 +339,9 @@ NimBLE Host (按需)                ├ voice_loop() VAD
 |--------|------|--------|--------|-------------|------|
 | `audio` | **0** | **6** | 8192 | `audio_task_loop` + `vTaskDelay(5ms)` | I2S0 PDM 读入、AGC、录音缓冲写入；I2S1 播放出队；**播放期停麦** |
 | `net` | **0** | **4** | 8192 | `net_loop` + `vTaskDelay(20ms)` | WiFi 连接/重连、`esp_websocket_client`、JSON 事件解析、`voice_net_poll` 流式上传 |
-| `lvgl` | **1** | **4** | 8192 | `ui_loop_once` + `vTaskDelay(5ms)` | 排空 UI 队列、调用 LVGL、`refresh_face_display`、表情帧 SPI 直绘 |
-| `app` | **1** | **3** | 8192 | `vTaskDelay(5ms)` | `voice_loop` VAD 状态机；动画 tick；`ble_prov_loop` / `ap_prov_loop`；1 s 时钟、250 ms 链路状态投递 UI |
-| `btn_boot` | **1** | **6** | 4096 | `vTaskDelay(20ms)` 轮询 | BOOT 按住 ≥3 s → BLE；≥5 s → 诊断覆盖层 |
+| `lvgl` | **1** | **4** | 8192 | `ui_loop_once` + 自适应 `vTaskDelay(5–30ms)` | 排空 UI 队列、调用 LVGL、动画推进、表情帧按需 SPI 直绘 |
+| `app` | **1** | **3** | 8192 | `vTaskDelay(5ms)` | `voice_loop` VAD 状态机；`ble_prov_loop` / `ap_prov_loop`；1 s 时钟、链路状态变化才投递 UI（rssi 10 dBm 滞回） |
+| `btn_boot` | **1** | **4** | 4096 | `vTaskDelay(20ms)` 轮询 | BOOT 按住 ≥3 s → BLE；≥5 s → 诊断覆盖层 |
 | `cli` | **1** | **2** | 4096 | `getchar` 阻塞 | 串口命令：`ap` / `ap_stop` / `ble_stop` / `help` |
 
 **临时任务**（非常驻）：
@@ -346,6 +351,8 @@ NimBLE Host (按需)                ├ voice_loop() VAD
 | `ble_start` | 未绑核 | 5 | 8192 | `btn_boot` 长按 | 调用 `ble_prov_start()` 后自删除 |
 | `NimBLE Host` | IDF 默认 | — | 8192 | 首次 BLE 配网 | `nimble_port_freertos_init`；`CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE` |
 
+四个常驻任务（`audio` / `net` / `lvgl` / `app`）均已订阅任务看门狗：`CONFIG_ESP_TASK_WDT_PANIC=y`，任一卡死 5 s 自动复位（死锁自恢复）。
+
 ### 3.3 优先级与调度策略
 
 FreeRTOS 优先级：**数值越大越优先**（ESP-IDF 默认可用范围通常 0–24，应用使用 3–6）。
@@ -354,10 +361,10 @@ FreeRTOS 优先级：**数值越大越优先**（ESP-IDF 默认可用范围通�
 优先级 (高 → 低)
 
   6  audio_task ─────────  Core 0  I2S 实时供数，必须高于 LVGL
-  6  btn_boot   ─────────  Core 1  按键响应（与 audio 不同核，不冲突）
   5  ble_start  (临时)
   4  net_task   ─────────  Core 0  WebSocket / WiFi
   4  lvgl_task  ─────────  Core 1  显示刷新
+  4  btn_boot   ─────────  Core 1  按键轮询（20 ms，与 LVGL 同级不冲突）
   3  app_task   ─────────  Core 1  VAD 决策（可容忍数 ms 抖动）
   2  cli        ─────────  Core 1  串口调试（最低，不影响实时路径）
 ```
@@ -367,7 +374,7 @@ FreeRTOS 优先级：**数值越大越优先**（ESP-IDF 默认可用范围通�
 
 **同优先级：** `net_task` 与 `lvgl_task` 均为 4，分属不同核心，互不抢占。
 
-**tick：** `CONFIG_FREERTOS_HZ=1000`，`vTaskDelay(1)` = 1 ms。`lvgl_task` / `app_task` 5 ms 循环 ≈ 200 Hz；`net_task` 20 ms ≈ 50 Hz 足够驱动 WS 与上传。
+**tick：** `CONFIG_FREERTOS_HZ=1000`，`vTaskDelay(1)` = 1 ms。`lvgl_task` 忙时 5 ms / 静帧空闲 30 ms 自适应降耗；`app_task` 5 ms ≈ 200 Hz；`net_task` 20 ms ≈ 50 Hz 足够驱动 WS 与上传。
 
 ### 3.4 IDF 系统任务与临时任务
 
@@ -392,7 +399,7 @@ BLE 配网特殊流程：`ensure_nimble()` 前调用 `net_pause_for_ble()`（`wi
 | `dram_malloc()` | `MALLOC_CAP_DMA \| INTERNAL` | 需 DMA 的驱动缓冲 |
 | `malloc()` | 先 internal ≤4 KB，否则 PSRAM | `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096` |
 
-大块原则：**>4 KB 默认 PSRAM**；片内保留 32 KB 给 WiFi/BT DMA。表情 `frame_buffer_a/b`（90×90×2×2）故意放 **BSS 片内**，减轻 PSRAM 带宽争用。
+大块原则：**>4 KB 默认 PSRAM**；片内保留 32 KB 给 WiFi/BT DMA。表情 `frame_buffer_a/b`（90×90×2×2）同样走 PSRAM（`ui_face.c` 运行时分配），把片内连续块留给 WiFi/BT。
 
 启动后 `mem_report()` 输出 DRAM/PSRAM free 与 largest block；PC 发 `{"type":"debug"}` 或 **按住 BOOT ≥5 s** 可看屏幕诊断。
 
@@ -409,9 +416,9 @@ BLE 配网特殊流程：`ensure_nimble()` 前调用 `net_pause_for_ble()`（`wi
 **正确做法：**
 
 - `app_task` / `net_task` 只 `ui_post_*` 投递队列；`lvgl_task` 独占 LVGL。
-- 动画**计时**在 `app_task`（`ui_tick_animation`），**解码与刷屏**只在 `lvgl_task`（`refresh_face_display`）。
+- 动画**推进、解码、刷屏全部收归 `lvgl_task`**：`ui_face_tick()` 推进帧并解到后缓冲、置脏，循环末尾 `ui_face_blit()` 统一按需传输；其它任务不触碰帧状态。
 - `ui_post_voice_link()` 在临界区内合并 `voice_hold` / `overlay`，防止连续帧覆盖 `voice_hold=false`。
-- 长文本不进队列体：语音历史用 PSRAM 指针；`ui_msg_t.json` 上限 **1024 B**。
+- 长文本不进队列体：`ui_msg_t.json` 为 PSRAM 指针（发送方分配、消费端释放）；语音历史用 PSRAM 滚动缓冲。录音缓冲经 `audio_capture_snapshot()` 锁内快照读取；WS 文本帧在事件回调里只拷入 PSRAM 队列（8 槽 × ≤2 KB），由 `net_loop` 统一消化。
 - `source=VOICE` 的 WS 事件**只更新底部字幕**；中部 GIF/状态行由 `refresh_face_display()` 统一决定。Agent `status` 在 `voice_hold` 期间暂存 `agent_status`，结束后恢复。
 
 ---
@@ -427,22 +434,25 @@ BLE 配网特殊流程：`ensure_nimble()` 前调用 `net_pause_for_ble()`（`wi
 | 优先级 | 条件 | 显示 |
 |--------|------|------|
 | 1 | WS 未连接 | `OFFLINE` |
-| 2 | `voice_hold=true` | `voice_overlay`（EAR / THINKING / SPEAKING） |
-| 3 | 其它 | `agent_status`（Hook 推送） |
+| 2 | WS 在线但 ≥8 s 无任何帧（含 2 s 心跳） | `STALE` |
+| 3 | `voice_hold=true` | `voice_overlay`（EAR / THINKING / SPEAKING） |
+| 4 | 其它 | `agent_status`（Hook 推送） |
 
 - **录音音量条**：仅 `voice_hold` + 监听 + `overlay=EAR` 时显示 80×4 绿色条。
+- **表情按需刷新**：帧内容变化才发起 SPI 传输（脏标记），静帧零总线占用；LVGL 循环忙时 5 ms、闲时 30 ms 自适应。
+- **资源缺失降级**：无动画分区数据 → 占位脸（红叉眼 + 平嘴）+「无动画资源」；无中文字库 →「FONT MISSING」+ ASCII 回退。
 
 ### 4.2 表情动画（离线 RLE）
 
 PC 将 GIF 展开、按背景 `#10151B` 预混合，编成 90×90 RGB565 RLE。设备 **禁止** `lv_gif`。
 
 ```text
-mmap(animations) → gif_id 帧表 → Core1 RLE 解到双缓冲 → display_blit_rgb565
+mmap(animations) → gif_id 帧表 → Core1 RLE 解到 PSRAM 双缓冲 → 置脏 → display_blit_rgb565（仅脏帧）
 ```
 
 二进制（小端）：`magic "AGIF"` + version + anim_count + width/height；每套 `frame_count/table_off`；每帧 `duration_ms/rle_size/rle_off`；RLE `(count, hi, lo)` 重复。
 
-当前：`ANIM_BIN_SIZE=3557266`，`ANIM_FACE_SIZE=90`，`ANIM_FRAME_COUNT=434`。
+当前：`ANIM_BIN_SIZE=4619137`，`ANIM_FACE_SIZE=90`，`ANIM_FRAME_COUNT=554`（14 套，见 `main/anim_size.h`）。
 
 | gif_id | status | 中文 | 源文件 |
 |--------|--------|------|--------|
@@ -468,11 +478,11 @@ python scripts/gen_frame_player.py
 python scripts/flash_animations.py -p COMx
 ```
 
-只烧 app、不烧 `animations.bin` → 有字无表情。
+只烧 app、不烧 `animations.bin` → 屏幕显示占位脸与「无动画资源」提示（产测可辨）。
 
 ### 4.3 中文字库
 
-独立分区 `cjk_font`（`0x400000`，2 MB），16px / 4bpp，`simhei.ttf` 源。字模组成：
+独立分区 `cjk_font`（`0x610000`，2 MB），16px / 4bpp，`simhei.ttf` 源。字模组成：
 
 | 来源 | 文件 / 范围 | 说明 |
 |------|-------------|------|
@@ -493,7 +503,9 @@ python scripts/flash_font.py -p COMx
 
 - 组件：`espressif/esp_websocket_client`
 - 连接后发 `{"type":"hello","role":"device","rssi":…}`；服务端 `ack` 含 `server_time`
-- 断线约 **3 s** 重连（`WS_RECONNECT_MS`）
+- WS 断线约 **3 s** 重连（`WS_RECONNECT_MS`）；WiFi 断线**指数退避**重连（5 s 起翻倍、封顶 60 s，见 `board_pins.h` `WIFI_RETRY_MS`）
+- WS 事件回调只把文本帧拷入 PSRAM 队列（8 槽 × ≤2 KB），JSON 解析 / NVS / UI 投递统一在 `net_loop` 执行
+- WiFi 省电按需切换：语音会话 / 播放 / 配网期间 `PS_NONE`，空闲自动 `PS_MIN_MODEM`（`net_loop` 每轮评估）
 - `source`：`PI` / `CURSOR` / `VOICE` / `BOT` / `UNKNOWN`；设备来源行**不显示 `VOICE`**
 
 通用帧类型见 [§5.2](#52-websocket-协议)。
@@ -550,6 +562,8 @@ WAIT_REPLY ──(IDLE|ERROR / 超时)──► LISTEN
 PLAYING ──(播完)──► LISTEN（冷却 800 ms）
 ```
 
+> 下表常量均可在 menuconfig「Agent Display → Voice / audio tuning」现场调整（表内为默认值）。
+
 | 常量 | 值 | 含义 |
 |------|-----|------|
 | `VAD_RMS_START_FLOOR` | 0.012 | 起始 RMS 下限 |
@@ -585,6 +599,7 @@ PLAYING ──(播完)──► LISTEN（冷却 800 ms）
 | `main/audio.c` | PDM、AGC、播放 ring |
 | `main/net_ws.c` | `audio_upload` / binary / `audio_chunk` |
 | `main/ui.c` | 字幕、PSRAM 历史、`refresh_face_display` |
+| `main/ui_face.c` | 表情帧缓冲、动画推进、按需直绘 |
 | `backend/ws_manager.py` | WS hub、流式会话、音频泵 |
 | `backend/voice_pipeline.py` | ASR → LLM → TTS |
 
@@ -1420,8 +1435,8 @@ idf.py -p COMx monitor
 | 文件 | 分区偏移 | 直链 |
 |------|----------|------|
 | `esp32s3_agent_display.bin` | `0x10000` | [Releases](https://github.com/ATongHru/AgentDisplay/releases/download/v1.0/esp32s3_agent_display.bin) |
-| `font_cjk_16.bin` | `0x400000` | [Releases](https://github.com/ATongHru/AgentDisplay/releases/download/v1.0/font_cjk_16.bin) |
-| `animations.bin` | `0x600000` | [Releases](https://github.com/ATongHru/AgentDisplay/releases/download/v1.0/animations.bin) |
+| `font_cjk_16.bin` | `0x610000` | [Releases](https://github.com/ATongHru/AgentDisplay/releases/download/v1.0/font_cjk_16.bin) |
+| `animations.bin` | `0x810000` | [Releases](https://github.com/ATongHru/AgentDisplay/releases/download/v1.0/animations.bin) |
 
 仓库内路径：`firmware/releases/v1.0/`（主程序）+ `firmware/data/`（字库、表情）。烧录步骤与 SHA256 见 [firmware/releases/v1.0/README.md](firmware/releases/v1.0/README.md)。
 

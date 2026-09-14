@@ -16,6 +16,8 @@ idf_component_register(
         "font_loader.c"
         "font_status_icons.c"
         "mem_utils.c"
+        "ws_url.c"
+        "ui_face.c"
     INCLUDE_DIRS "."
     REQUIRES
         driver

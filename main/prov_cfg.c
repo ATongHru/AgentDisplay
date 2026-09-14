@@ -4,49 +4,12 @@
 #include <string.h>
 
 #include "agent_cfg.h"
+#include "ws_url.h"
 #include "ap_prov.h"
 #include "esp_log.h"
 #include "net_ws.h"
 
 static const char *TAG = "prov_cfg";
-
-static void split_ws_host_port(const char *ws_url, char *host, size_t host_len, int *port)
-{
-    host[0] = 0;
-    *port = 8000;
-    if (!ws_url) {
-        return;
-    }
-    const char *u = ws_url;
-    if (strncmp(u, "ws://", 5) == 0) {
-        u += 5;
-    } else if (strncmp(u, "wss://", 6) == 0) {
-        u += 6;
-    }
-    char tmp[AGENT_CFG_HOST_MAX];
-    size_t n = strlen(u);
-    if (n >= 3 && strcmp(u + n - 3, "/ws") == 0) {
-        n -= 3;
-    }
-    if (n >= sizeof(tmp)) {
-        n = sizeof(tmp) - 1;
-    }
-    memcpy(tmp, u, n);
-    tmp[n] = 0;
-    char *colon = strrchr(tmp, ':');
-    if (colon) {
-        *colon = 0;
-        strncpy(host, tmp, host_len - 1);
-        host[host_len - 1] = 0;
-        int p = atoi(colon + 1);
-        if (p > 0 && p <= 65535) {
-            *port = p;
-        }
-    } else {
-        strncpy(host, tmp, host_len - 1);
-        host[host_len - 1] = 0;
-    }
-}
 
 static bool json_copy_str(const cJSON *obj, const char *key, char *out, size_t out_len)
 {
@@ -68,7 +31,7 @@ void prov_cfg_fill_json(cJSON *root)
     const agent_cfg_t *cfg = agent_cfg_get();
     char host[AGENT_CFG_HOST_MAX];
     int port = 8000;
-    split_ws_host_port(cfg->ws_url, host, sizeof(host), &port);
+    ws_url_split_host_port(cfg->ws_url, host, sizeof(host), &port);
     cJSON_AddStringToObject(root, "ssid", cfg->ssid);
     cJSON_AddStringToObject(root, "password", cfg->pass);
     cJSON_AddStringToObject(root, "host", host);

@@ -277,8 +277,9 @@ static int gatt_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_ga
         if (rc != 0) {
             return BLE_ATT_ERR_UNLIKELY;
         }
-        if (s_lock) {
-            xSemaphoreTake(s_lock, portMAX_DELAY);
+        /* NimBLE host 上下文不可无限等锁：超时丢弃，防 host 阻塞/死锁。 */
+        if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(10)) != pdTRUE) {
+            return BLE_ATT_ERR_UNLIKELY;
         }
         feed_rx(tmp, om_len);
         if (s_lock) {

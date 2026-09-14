@@ -21,6 +21,8 @@ void audio_capture_reset_hp(void);
 bool audio_capture_is_listening(void);
 const uint8_t *audio_capture_data(void);
 size_t audio_capture_size(void);
+/* 锁内快照：data 指针恒定、size 一致；快照后读 [0, size) 不与录音追加路径重叠。 */
+void audio_capture_snapshot(const uint8_t **data, size_t *size);
 void audio_capture_reset(void);
 
 bool audio_playback_start(void);

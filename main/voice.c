@@ -7,6 +7,7 @@
 
 #include "audio.h"
 #include "ap_prov.h"
+#include "cJSON.h"
 #include "ble_prov.h"
 #include "board_pins.h"
 #include "esp_heap_caps.h"
@@ -15,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "net_ws.h"
+#include "sdkconfig.h"
 #include "ui.h"
 
 static const char *TAG = "voice";
@@ -30,6 +32,7 @@ typedef struct {
 } ws_audio_slot_t;
 
 static ws_audio_slot_t *s_ws_audio_q;
+static ws_audio_slot_t *s_ws_audio_drain; /* PSRAM 暂存槽，避免 4KB 栈拷贝 */
 static SemaphoreHandle_t s_ws_audio_mux;
 static uint16_t s_ws_audio_head;
 static uint16_t s_ws_audio_tail;
@@ -46,23 +49,26 @@ enum {
 
 /* 能量按放大后归一化（与旧 int16 VAD 同一量纲）。
  * 旧起始约 peak>=1400、rms>=280 → 归一化 0.043 / 0.0085；阈值抬高，减少环境音误触发。 */
-#define VAD_RMS_START_FLOOR 0.012f
-#define VAD_PEAK_START_FLOOR 0.060f
-#define VAD_NOISE_MULT 3.5f
-#define VAD_RMS_HOLD_FLOOR 0.003f
-#define VAD_NOISE_ALPHA 0.05f
-#define VAD_NOISE_INIT_FRAMES 24
-#define VAD_NOISE_RMS_CAP 0.024f
-#define VAD_NOISE_PEAK_CAP 0.16f
-#define VAD_MIN_MS 500
-#define VAD_SILENCE_MS 800
-#define VAD_MAX_MS 15000
-#define VAD_COOLDOWN_MS 800
+/* 现场可调参数迁 Kconfig（menuconfig → Agent Display → Voice / audio tuning）。 */
+#define VAD_RMS_START_FLOOR (CONFIG_AGENT_VAD_RMS_START_FLOOR_X1000 / 1000.0f)
+#define VAD_PEAK_START_FLOOR (CONFIG_AGENT_VAD_PEAK_START_FLOOR_X1000 / 1000.0f)
+#define VAD_NOISE_MULT (CONFIG_AGENT_VAD_NOISE_MULT_X10 / 10.0f)
+#define VAD_RMS_HOLD_FLOOR (CONFIG_AGENT_VAD_RMS_HOLD_FLOOR_X1000 / 1000.0f)
+#define VAD_NOISE_ALPHA (CONFIG_AGENT_VAD_NOISE_ALPHA_X100 / 100.0f)
+#define VAD_NOISE_INIT_FRAMES CONFIG_AGENT_VAD_NOISE_INIT_FRAMES
+#define VAD_NOISE_RMS_CAP (CONFIG_AGENT_VAD_NOISE_RMS_CAP_X1000 / 1000.0f)
+#define VAD_NOISE_PEAK_CAP (CONFIG_AGENT_VAD_NOISE_PEAK_CAP_X1000 / 1000.0f)
+#define VAD_MIN_MS CONFIG_AGENT_VAD_MIN_MS
+#define VAD_SILENCE_MS CONFIG_AGENT_VAD_SILENCE_MS
+#define VAD_MAX_MS CONFIG_AGENT_VAD_MAX_MS
+#define VAD_COOLDOWN_MS CONFIG_AGENT_VAD_COOLDOWN_MS
+/* session 异步握手超时（与原阻塞等待同为 2.5s，但不再阻塞 app 任务） */
+#define VOICE_SESSION_WAIT_US 2500000LL
 #define WAIT_REPLY_MS 55000
 #define MIN_CLIP_BYTES 6400
-#define PLAY_END_GRACE_MS 800
-#define PLAY_STALL_MS 15000
-#define UPLOAD_TIMEOUT_MS 20000
+#define PLAY_END_GRACE_MS CONFIG_AGENT_PLAY_END_GRACE_MS
+#define PLAY_STALL_MS CONFIG_AGENT_PLAY_STALL_MS
+#define UPLOAD_TIMEOUT_MS CONFIG_AGENT_UPLOAD_TIMEOUT_MS
 #define WS_AUDIO_DRAIN_BURST 3
 
 typedef struct {
@@ -89,6 +95,10 @@ static volatile bool s_upload_ok;
 static size_t s_stream_sent;
 static bool s_stream_active;
 static bool s_stream_failed;
+static bool s_stream_begin_pending;
+static int64_t s_stream_begin_us;
+static bool s_upload_meta_pending;
+static int64_t s_upload_meta_us;
 static char s_last_show[24];
 static vad_state_t s_vad = {.noise_rms = 0.001f, .noise_peak = 0.005f};
 static uint32_t s_last_vad_seq;
@@ -105,16 +115,24 @@ static void show(const char *status, const char *text)
         (!text || text[0] == '\0')) {
         return;
     }
-    char json[192];
-    if (text && text[0]) {
-        snprintf(json, sizeof(json),
-                 "{\"status\":\"%s\",\"source\":\"VOICE\",\"text\":\"%s\"}", status, text);
-    } else {
-        snprintf(json, sizeof(json), "{\"status\":\"%s\",\"source\":\"VOICE\"}", status);
+    /* cJSON 生成，text 含引号/反斜杠/换行也能正确转义（旧手拼会破坏 JSON 丢字幕）。 */
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return;
     }
+    cJSON_AddStringToObject(root, "status", status ? status : "");
+    cJSON_AddStringToObject(root, "source", "VOICE");
+    if (text && text[0]) {
+        cJSON_AddStringToObject(root, "text", text);
+    }
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
     snprintf(s_last_show, sizeof(s_last_show), "%s", status ? status : "");
     s_session = strcmp(status, "IDLE") != 0;
-    ui_post_event_json(json, false);
+    if (json) {
+        ui_post_event_json(json, false); /* ui_post_event_json 内部会拷贝 */
+        free(json);
+    }
 }
 
 static void post_voice_ui(void)
@@ -222,7 +240,9 @@ static void voice_reset_session(const char *reason)
         audio_playback_stop();
     }
     if (s_stream_active && s_session_id[0] && net_ws_ready()) {
-        (void)net_ws_send_audio_end(s_session_id, audio_capture_size(), true);
+        size_t rec_len = 0;
+        audio_capture_snapshot(NULL, &rec_len);
+        (void)net_ws_send_audio_end(s_session_id, rec_len, true);
     }
     audio_capture_listen_stop();
 #endif
@@ -232,6 +252,8 @@ static void voice_reset_session(const char *reason)
     s_upload_start_us = 0;
     s_stream_active = false;
     s_stream_failed = false;
+    s_stream_begin_pending = false;
+    s_upload_meta_pending = false;
     s_stream_sent = 0;
     s_audio_end = false;
     s_play_end_empty_us = 0;
@@ -253,7 +275,8 @@ static void voice_reset_session(const char *reason)
 static void finalize_recording(bool maxed, bool silenced)
 {
     audio_capture_end_store();
-    size_t pcm_len = audio_capture_size();
+    size_t pcm_len = 0;
+    audio_capture_snapshot(NULL, &pcm_len);
     int64_t dur_us = now_us() - s_record_start_us;
     int64_t silence_us = now_us() - s_last_voice_us;
     ESP_LOGI(TAG, "VAD end dur=%.0fms silence=%.0fms pcm=%u max=%d sil=%d",
@@ -285,8 +308,12 @@ static void drain_ws_audio_queue(void)
     if (!s_ws_audio_q || !s_ws_audio_mux) {
         return;
     }
+    if (!s_ws_audio_drain) {
+        return;
+    }
     for (int burst = 0; burst < WS_AUDIO_DRAIN_BURST; ++burst) {
-        ws_audio_slot_t slot;
+        /* 拷到 PSRAM 暂存槽而非栈：槽体 4KB+，app 任务栈仅 8KB。 */
+        ws_audio_slot_t *slot = s_ws_audio_drain;
         if (xSemaphoreTake(s_ws_audio_mux, 0) != pdTRUE) {
             return;
         }
@@ -294,11 +321,11 @@ static void drain_ws_audio_queue(void)
             xSemaphoreGive(s_ws_audio_mux);
             return;
         }
-        slot = s_ws_audio_q[s_ws_audio_tail];
+        *slot = s_ws_audio_q[s_ws_audio_tail];
         s_ws_audio_tail = (uint16_t)((s_ws_audio_tail + 1) % WS_AUDIO_QUEUE_DEPTH);
         xSemaphoreGive(s_ws_audio_mux);
-        voice_on_audio_chunk(slot.session_id[0] ? slot.session_id : NULL, slot.data, slot.len,
-                             slot.end);
+        voice_on_audio_chunk(slot->session_id[0] ? slot->session_id : NULL, slot->data, slot->len,
+                             slot->end);
     }
 }
 
@@ -360,6 +387,16 @@ void voice_init(void)
             s_ws_audio_q = calloc(WS_AUDIO_QUEUE_DEPTH, sizeof(ws_audio_slot_t));
         }
         s_ws_audio_mux = xSemaphoreCreateMutex();
+    }
+    if (!s_ws_audio_drain) {
+        s_ws_audio_drain =
+            heap_caps_malloc(sizeof(ws_audio_slot_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_ws_audio_drain) {
+            s_ws_audio_drain = malloc(sizeof(ws_audio_slot_t));
+        }
+        if (!s_ws_audio_drain) {
+            ESP_LOGE(TAG, "ws audio drain slot alloc failed");
+        }
     }
     s_ws_audio_head = 0;
     s_ws_audio_tail = 0;
@@ -606,6 +643,7 @@ void voice_loop(void)
         s_stream_sent = 0;
         s_stream_active = false;
         s_stream_failed = false;
+        s_stream_begin_pending = false;
         s_session_id[0] = '\0';
         s_phase = VOICE_RECORDING;
         post_voice_ui();
@@ -644,18 +682,33 @@ void voice_net_poll(void)
             return;
         }
         if (!s_stream_active && !s_stream_failed) {
-            s_session_id[0] = '\0';
-            if (net_ws_send_audio_stream_begin(s_session_id, sizeof(s_session_id))) {
+            if (!s_stream_begin_pending) {
+                /* 异步握手：只发元信息，session 由 net 任务回填，app 任务不再阻塞。 */
+                s_session_id[0] = '\0';
+                if (net_ws_audio_session_start(true, 0)) {
+                    s_stream_begin_pending = true;
+                    s_stream_begin_us = now_us();
+                } else {
+                    s_stream_failed = true;
+                    ESP_LOGW(TAG, "stream begin send failed, will bulk-upload");
+                }
+            } else if (net_ws_audio_session_poll(s_session_id, sizeof(s_session_id))) {
+                s_stream_begin_pending = false;
                 s_stream_active = true;
                 ESP_LOGI(TAG, "stream begin session=%s", s_session_id);
-            } else {
+            } else if (now_us() - s_stream_begin_us > VOICE_SESSION_WAIT_US) {
+                s_stream_begin_pending = false;
                 s_stream_failed = true;
-                ESP_LOGW(TAG, "stream begin failed, will bulk-upload");
+                ESP_LOGW(TAG, "stream begin timeout, will bulk-upload");
             }
         }
         if (s_stream_active) {
-            const uint8_t *pcm = audio_capture_data();
-            size_t total = audio_capture_size();
+            const uint8_t *pcm = NULL;
+            size_t total = 0;
+            audio_capture_snapshot(&pcm, &total);
+            if (!pcm) {
+                return;
+            }
             int burst = 0;
             while (burst < 8 && total >= s_stream_sent + (size_t)VOICE_UPLOAD_CHUNK) {
                 if (!net_ws_send_audio_binary(pcm + s_stream_sent, (size_t)VOICE_UPLOAD_CHUNK)) {
@@ -681,9 +734,16 @@ void voice_net_poll(void)
         return;
     }
 
-    const uint8_t *pcm = audio_capture_data();
-    size_t pcm_len = audio_capture_size();
+    const uint8_t *pcm = NULL;
+    size_t pcm_len = 0;
+    audio_capture_snapshot(&pcm, &pcm_len);
     bool ok = false;
+    if (!pcm || pcm_len == 0) {
+        s_upload_ok = false;
+        s_upload_pending = false;
+        s_upload_done = true;
+        return;
+    }
 
     if (s_stream_active) {
         /* Flush remainder then audio_end. */
@@ -703,9 +763,31 @@ void voice_net_poll(void)
                  (int)ok);
         s_stream_active = false;
     } else {
-        /* Fallback: one-shot upload (legacy). */
-        s_session_id[0] = '\0';
-        ok = net_ws_send_audio_upload(pcm, pcm_len, s_session_id, sizeof(s_session_id));
+        /* 回退整包上传：元信息异步握手，session 就绪后再发 PCM。 */
+        if (!s_upload_meta_pending) {
+            s_session_id[0] = '\0';
+            if (net_ws_audio_session_start(false, pcm_len)) {
+                s_upload_meta_pending = true;
+                s_upload_meta_us = now_us();
+            } else {
+                s_upload_ok = false;
+                s_upload_pending = false;
+                s_upload_done = true;
+            }
+            return;
+        }
+        if (!net_ws_audio_session_poll(s_session_id, sizeof(s_session_id))) {
+            if (now_us() - s_upload_meta_us > VOICE_SESSION_WAIT_US) {
+                ESP_LOGW(TAG, "upload session timeout len=%u", (unsigned)pcm_len);
+                s_upload_meta_pending = false;
+                s_upload_ok = false;
+                s_upload_pending = false;
+                s_upload_done = true;
+            }
+            return;
+        }
+        s_upload_meta_pending = false;
+        ok = net_ws_send_audio_binary(pcm, pcm_len);
         if (ok) {
             ESP_LOGI(TAG, "uploaded %u bytes session=%s", (unsigned)pcm_len, s_session_id);
         } else {
@@ -716,6 +798,7 @@ void voice_net_poll(void)
     s_upload_ok = ok;
     s_upload_pending = false;
     s_upload_done = true;
+    s_upload_meta_pending = false;
 }
 
 void voice_set_enabled(bool enabled)
@@ -731,13 +814,16 @@ void voice_set_enabled(bool enabled)
             audio_playback_stop();
         }
         if (s_stream_active) {
-            size_t pcm_len = audio_capture_size();
+            size_t pcm_len = 0;
+            audio_capture_snapshot(NULL, &pcm_len);
             (void)net_ws_send_audio_end(s_session_id, pcm_len, true);
             ESP_LOGI(TAG, "discard stream on disable session=%s bytes=%u",
                      s_session_id, (unsigned)pcm_len);
         }
         s_upload_pending = false;
+        s_upload_meta_pending = false;
         s_stream_active = false;
+        s_stream_begin_pending = false;
         s_vad.in_speech = false;
         audio_capture_listen_stop();
         s_phase = VOICE_LISTEN;
@@ -755,6 +841,8 @@ void voice_on_ws_lost(void)
 bool voice_is_enabled(void) { return s_voice_enabled; }
 bool voice_session_active(void) { return s_session; }
 bool voice_is_listening(void) { return s_listening; }
+
+bool voice_is_busy(void) { return s_session; } /* 语音会话（录音/流式/播报）进行中 */
 
 void voice_fill_debug(voice_debug_t *out)
 {

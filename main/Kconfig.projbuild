@@ -2,34 +2,36 @@ menu "Agent Display"
 
     config AGENT_WIFI_SSID
         string "WiFi SSID"
-        default "MSL803"
+        default ""
+        help
+            默认留空：凭证不入库，首次启动请用 BLE/热点配网。
 
     config AGENT_WIFI_PASSWORD
         string "WiFi password"
-        default "1234567890"
+        default ""
 
     config AGENT_WIFI_STATIC_IP
         bool "Use static IP"
-        default y
+        default n
 
     config AGENT_WIFI_IP
         string "ESP static IP"
-        default "192.168.10.162"
+        default ""
         depends on AGENT_WIFI_STATIC_IP
 
     config AGENT_WIFI_GATEWAY
         string "Gateway / DNS"
-        default "192.168.10.1"
+        default ""
         depends on AGENT_WIFI_STATIC_IP
 
     config AGENT_WIFI_NETMASK
         string "Netmask"
-        default "255.255.255.0"
+        default ""
         depends on AGENT_WIFI_STATIC_IP
 
     config AGENT_WS_URL
         string "Backend WebSocket URL"
-        default "ws://192.168.10.167:8000/ws"
+        default ""
 
     config AGENT_VOICE_HW
         bool "Enable PDM mic + I2S amp"
@@ -37,5 +39,73 @@ menu "Agent Display"
         help
             PDM DATA=GPIO16, CLK=GPIO15. Clock starts only in audio_task after app_main.
             Device listens continuously (VAD), no BOOT record button.
+
+    menu "Voice / audio tuning"
+
+        config AGENT_VAD_RMS_START_FLOOR_X1000
+            int "VAD start RMS floor (x1000)"
+            default 12
+        config AGENT_VAD_PEAK_START_FLOOR_X1000
+            int "VAD start peak floor (x1000)"
+            default 60
+        config AGENT_VAD_NOISE_MULT_X10
+            int "VAD noise gate multiplier (x10)"
+            default 35
+        config AGENT_VAD_RMS_HOLD_FLOOR_X1000
+            int "VAD hold RMS floor (x1000)"
+            default 3
+        config AGENT_VAD_NOISE_ALPHA_X100
+            int "VAD noise EMA alpha (x100)"
+            default 5
+        config AGENT_VAD_NOISE_INIT_FRAMES
+            int "VAD noise init frames"
+            default 24
+        config AGENT_VAD_NOISE_RMS_CAP_X1000
+            int "VAD noise RMS cap (x1000)"
+            default 24
+        config AGENT_VAD_NOISE_PEAK_CAP_X1000
+            int "VAD noise peak cap (x1000)"
+            default 160
+        config AGENT_VAD_MIN_MS
+            int "VAD min utterance (ms)"
+            default 500
+        config AGENT_VAD_SILENCE_MS
+            int "VAD silence-to-end (ms)"
+            default 800
+        config AGENT_VAD_MAX_MS
+            int "VAD max utterance (ms)"
+            default 15000
+        config AGENT_VAD_COOLDOWN_MS
+            int "VAD cooldown after end (ms)"
+            default 800
+        config AGENT_PLAY_END_GRACE_MS
+            int "Playback end grace (ms)"
+            default 800
+        config AGENT_PLAY_STALL_MS
+            int "Playback stall timeout (ms)"
+            default 15000
+        config AGENT_UPLOAD_TIMEOUT_MS
+            int "Voice upload timeout (ms)"
+            default 20000
+        config AGENT_PDM_AGC_GAIN_MIN_X10
+            int "PDM AGC gain min (x10)"
+            default 30
+        config AGENT_PDM_AGC_GAIN_MAX_X10
+            int "PDM AGC gain max (x10)"
+            default 100
+        config AGENT_PDM_AGC_GAIN_INIT_X10
+            int "PDM AGC gain init (x10)"
+            default 50
+        config AGENT_PDM_AGC_TARGET_RMS_X1000
+            int "PDM AGC target RMS (x1000)"
+            default 300
+        config AGENT_PDM_AGC_ALPHA_X100
+            int "PDM AGC EMA alpha (x100)"
+            default 10
+        config AGENT_PDM_READ_TIMEOUT_MS
+            int "PDM read timeout (ms)"
+            default 20
+
+    endmenu
 
 endmenu

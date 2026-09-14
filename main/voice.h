@@ -16,6 +16,7 @@ void voice_set_enabled(bool enabled);
 bool voice_is_enabled(void);
 bool voice_session_active(void);
 bool voice_is_listening(void);
+bool voice_is_busy(void);
 
 typedef struct {
     int phase;

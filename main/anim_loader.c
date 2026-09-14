@@ -6,6 +6,7 @@
 #include "anim_size.h"
 #include "esp_log.h"
 #include "esp_partition.h"
+#include "mem_utils.h"
 
 static const char *TAG = "anim";
 
@@ -56,7 +57,7 @@ static bool parse_blob(void)
         return false;
     }
 
-    s_all_frames = malloc(total_frames * sizeof(frame_data_t));
+    s_all_frames = psram_malloc(total_frames * sizeof(frame_data_t));
     if (!s_all_frames) {
         return false;
     }
@@ -108,6 +109,8 @@ bool anim_loader_init(void)
     s_blob = (const uint8_t *)map_ptr;
     if (!parse_blob()) {
         ESP_LOGE(TAG, "parse failed");
+        esp_partition_munmap(s_map_handle);
+        s_blob = NULL;
         return false;
     }
     ESP_LOGI(TAG, "loaded %u anims, bin %u bytes", (unsigned)animation_count, (unsigned)ANIM_BIN_SIZE);

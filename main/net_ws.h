@@ -18,8 +18,10 @@ bool net_wifi_ready(void);
 bool net_ws_ready(void);
 bool net_usb_ready(void);
 int net_rssi(void);
-bool net_ws_send_audio_upload(const uint8_t *pcm, size_t pcm_len, char *session_id, size_t session_id_len);
-bool net_ws_send_audio_stream_begin(char *session_id, size_t session_id_len);
+/* 异步 session 握手：start 只发元信息立即返回；poll 查询后端 session 是否就绪。 */
+uint32_t net_ws_last_rx_ms(void); /* 最近一次收到任意 WS 帧的 tick(ms)，供 UI 判 STALE */
+bool net_ws_audio_session_start(bool stream, size_t audio_len);
+bool net_ws_audio_session_poll(char *session_id, size_t session_id_len);
 bool net_ws_send_audio_binary(const uint8_t *pcm, size_t pcm_len);
 bool net_ws_send_audio_end(const char *session_id, size_t total_bytes, bool discard);
 bool net_ws_send_display(const char *status, const char *source);

@@ -138,14 +138,10 @@ esp_err_t btn_boot_init(void)
     ESP_LOGI(TAG, "BOOT GPIO%d init level=%d pull-up, long-press %dms", PIN_BOOT,
              gpio_get_level(PIN_BOOT), LONG_PRESS_MS);
 
-    if (xTaskCreatePinnedToCore(btn_task, "btn_boot", 4096, NULL, 6, &s_task, 1) != pdPASS) {
+    if (xTaskCreatePinnedToCore(btn_task, "btn_boot", 4096, NULL, 4, &s_task, 1) /* <= lvgl(4) */ != pdPASS) {
         ESP_LOGE(TAG, "btn_boot task create failed");
         return ESP_ERR_NO_MEM;
     }
     return err;
 }
 
-void btn_boot_poll(void)
-{
-    /* Polling moved to dedicated btn_boot task. */
-}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Flash font_cjk_16.bin to the cjk_font partition (offset 0x400000)."""
+"""Flash font_cjk_16.bin to the cjk_font partition (offset 0x610000)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "firmware" / "data" / "font_cjk_16.bin"
-PARTITION_OFFSET = 0x400000
+PARTITION_OFFSET = 0x610000
 
 
 def find_python() -> str:

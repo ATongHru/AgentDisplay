@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Flash animations.bin to the animations partition (offset 0x600000)."""
+"""Flash animations.bin to the animations partition (offset 0x810000)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "firmware" / "data" / "animations.bin"
-PARTITION_OFFSET = 0x600000
+PARTITION_OFFSET = 0x810000
 
 
 def find_python() -> str:

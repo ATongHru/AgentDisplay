@@ -12,6 +12,7 @@
 #include "audio.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_sntp.h"
@@ -28,6 +29,7 @@
 #include "sdkconfig.h"
 #include "ui.h"
 #include "voice.h"
+#include "ws_url.h"
 #include "mem_utils.h"
 
 static const char *TAG = "net";
@@ -38,10 +40,23 @@ static const char *TAG = "net";
 
 static EventGroupHandle_t s_events;
 static SemaphoreHandle_t s_ws_tx;
+
+/* 文本帧队列：WS 回调只入队，net 任务消化（cJSON/NVS/UI 等重活移出回调）。 */
+#define WS_TEXT_Q_LEN 8
+#define WS_TEXT_MAX_BYTES 2048
+typedef struct {
+    char *data;
+    int len;
+} ws_text_msg_t;
+static QueueHandle_t s_text_q;
 static esp_websocket_client_handle_t s_ws;
 static bool s_wifi;
 static bool s_ws_on;
 static uint32_t s_ws_up_ms;
+static volatile uint32_t s_last_rx_ms;      /* 最近一次收到任意 WS 帧的时间（心跳保活用） */
+static esp_timer_handle_t s_wifi_retry_timer;
+static uint32_t s_wifi_retry_ms = WIFI_RETRY_MS; /* 指数退避当前间隔 */
+static wifi_ps_type_t s_ps_mode = WIFI_PS_NONE;  /* 当前 WiFi 省电模式缓存 */
 static uint32_t s_display_sent_ms;
 static int s_rssi = -100;
 static bool s_expect_audio;
@@ -111,10 +126,37 @@ static void apply_time(int64_t epoch)
     tzset();
 }
 
+/* WiFi 断线指数退避重连：WIFI_RETRY_MS 起步翻倍，封顶 60s，避免断网时无间隔猛刷 AP。 */
+static void wifi_retry_cb(void *arg)
+{
+    (void)arg;
+    esp_wifi_connect();
+}
+
+static void schedule_wifi_retry(void)
+{
+    if (!s_wifi_retry_timer) {
+        return;
+    }
+    esp_timer_stop(s_wifi_retry_timer);
+    esp_timer_start_once(s_wifi_retry_timer, (uint64_t)s_wifi_retry_ms * 1000);
+    ESP_LOGI(TAG, "wifi retry in %lu ms", (unsigned long)s_wifi_retry_ms);
+    if (s_wifi_retry_ms < 60000) {
+        s_wifi_retry_ms *= 2;
+    }
+}
+
+uint32_t net_ws_last_rx_ms(void) { return s_last_rx_ms; }
+
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        /* STA 重启（含配网结束）：退避清零并立即首连。 */
+        s_wifi_retry_ms = WIFI_RETRY_MS;
+        if (s_wifi_retry_timer) {
+            esp_timer_stop(s_wifi_retry_timer);
+        }
         if (!s_ble_paused && !s_ap_paused) {
             esp_wifi_connect();
         }
@@ -124,9 +166,10 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         xEventGroupClearBits(s_events, WIFI_OK);
         ui_post_link_state(net_usb_ready(), false, false, voice_is_listening(), audio_playback_is_active(), s_rssi);
         if (!s_ble_paused && !s_ap_paused) {
-            esp_wifi_connect();
+            schedule_wifi_retry();
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        s_wifi_retry_ms = WIFI_RETRY_MS; /* 连上即复位退避 */
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
         s_wifi = true;
         xEventGroupSetBits(s_events, WIFI_OK);
@@ -136,44 +179,6 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
         esp_sntp_setservername(0, "ntp.aliyun.com");
         esp_sntp_init();
-    }
-}
-
-static void split_ws_host_port(const char *ws_url, char *host, size_t host_len, int *port)
-{
-    host[0] = 0;
-    *port = 8000;
-    if (!ws_url) {
-        return;
-    }
-    const char *u = ws_url;
-    if (strncmp(u, "ws://", 5) == 0) {
-        u += 5;
-    } else if (strncmp(u, "wss://", 6) == 0) {
-        u += 6;
-    }
-    char tmp[AGENT_CFG_HOST_MAX];
-    size_t n = strlen(u);
-    if (n >= 3 && strcmp(u + n - 3, "/ws") == 0) {
-        n -= 3;
-    }
-    if (n >= sizeof(tmp)) {
-        n = sizeof(tmp) - 1;
-    }
-    memcpy(tmp, u, n);
-    tmp[n] = 0;
-    char *colon = strrchr(tmp, ':');
-    if (colon) {
-        *colon = 0;
-        strncpy(host, tmp, host_len - 1);
-        host[host_len - 1] = 0;
-        int p = atoi(colon + 1);
-        if (p > 0 && p <= 65535) {
-            *port = p;
-        }
-    } else {
-        strncpy(host, tmp, host_len - 1);
-        host[host_len - 1] = 0;
     }
 }
 
@@ -206,7 +211,7 @@ static void send_wifi_profiles(void)
         }
         char host[AGENT_CFG_HOST_MAX];
         int port = 8000;
-        split_ws_host_port(cfg->ws_url, host, sizeof(host), &port);
+        ws_url_split_host_port(cfg->ws_url, host, sizeof(host), &port);
         cJSON_AddNumberToObject(item, "index", i);
         cJSON_AddStringToObject(item, "ssid", cfg->ssid);
         cJSON_AddStringToObject(item, "password", cfg->pass);
@@ -471,6 +476,7 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_ws_on = true;
         s_ws_ever_ok = true;
         s_ws_up_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        s_last_rx_ms = s_ws_up_ms;
         xEventGroupSetBits(s_events, WS_OK);
         send_hello();
         wifi_ap_record_t ap = {0};
@@ -486,8 +492,26 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         voice_on_ws_lost();
         ui_post_link_state(net_usb_ready(), s_wifi, false, voice_is_listening(), audio_playback_is_active(), s_rssi);
     } else if (id == WEBSOCKET_EVENT_DATA) {
+        s_last_rx_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
         if (evt->op_code == 0x01) {
-            handle_text(evt->data_ptr, evt->data_len);
+            if (!s_text_q || !evt->data_ptr || evt->data_len <= 0) {
+                /* ignore */
+            } else if (evt->data_len > WS_TEXT_MAX_BYTES) {
+                ESP_LOGW(TAG, "text frame too large %d, drop", evt->data_len);
+            } else {
+                char *copy = psram_malloc((size_t)evt->data_len + 1);
+                if (!copy) {
+                    ESP_LOGW(TAG, "text frame alloc failed, drop");
+                } else {
+                    memcpy(copy, evt->data_ptr, (size_t)evt->data_len);
+                    copy[evt->data_len] = 0;
+                    ws_text_msg_t msg = {.data = copy, .len = evt->data_len};
+                    if (xQueueSend(s_text_q, &msg, 0) != pdTRUE) {
+                        free(copy);
+                        ESP_LOGW(TAG, "text queue full, drop");
+                    }
+                }
+            }
         } else if (evt->op_code == 0x02 || evt->op_code == 0x00) {
             if (s_expect_audio && evt->data_ptr && evt->data_len > 0) {
                 const bool last_piece =
@@ -617,7 +641,10 @@ static void apply_ip_from_cfg(void)
 esp_err_t net_init(void)
 {
     s_events = xEventGroupCreate();
+    esp_timer_create(&(esp_timer_create_args_t){.callback = wifi_retry_cb, .name = "wifi_retry"},
+                     &s_wifi_retry_timer);
     s_ws_tx = xSemaphoreCreateMutex();
+    s_text_q = xQueueCreate(WS_TEXT_Q_LEN, sizeof(ws_text_msg_t));
     gpio_config_t uart_rx = {
         .pin_bit_mask = 1ULL << PIN_UART0_RX,
         .mode = GPIO_MODE_INPUT,
@@ -643,6 +670,7 @@ esp_err_t net_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    s_ps_mode = WIFI_PS_NONE;
     ESP_ERROR_CHECK(esp_wifi_start());
     s_boot_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     s_ap_fallback_done = false;
@@ -682,6 +710,7 @@ void net_resume_sta_after_ap(void)
         return;
     }
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    s_ps_mode = WIFI_PS_NONE;
     err = esp_wifi_start();
     ESP_LOGI(TAG, "resume STA after AP: %s", esp_err_to_name(err));
 }
@@ -728,6 +757,7 @@ static esp_err_t wifi_driver_reinit_and_start(void)
         return err;
     }
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    s_ps_mode = WIFI_PS_NONE;
     apply_ip_from_cfg();
     return esp_wifi_start();
 }
@@ -773,12 +803,34 @@ esp_err_t net_apply_config(void)
     return err;
 }
 
+/* 项33：录音/播放（语音会话）期间保持 PS_NONE 低时延，空闲切 MIN_MODEM 省电。
+ * 仅在变化时下发，避免每 20ms 调 esp_wifi_set_ps。 */
+static void wifi_ps_apply(void)
+{
+    bool busy = voice_is_busy() || audio_playback_is_active();
+    wifi_ps_type_t want = busy ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM;
+    if (want == s_ps_mode) {
+        return;
+    }
+    if (esp_wifi_set_ps(want) == ESP_OK) {
+        s_ps_mode = want;
+        ESP_LOGI(TAG, "wifi ps -> %s", want == WIFI_PS_NONE ? "NONE" : "MIN_MODEM");
+    }
+}
+
 void net_loop(void)
 {
+    /* 消化 WS 文本帧（回调内只入队，不重活）。 */
+    ws_text_msg_t msg;
+    while (s_text_q && xQueueReceive(s_text_q, &msg, 0) == pdTRUE) {
+        handle_text(msg.data, msg.len);
+        free(msg.data);
+    }
     poll_usb();
     if (s_ble_paused || s_ap_paused || ap_prov_active()) {
         return;
     }
+    wifi_ps_apply();
     if (s_wifi && !s_ws) {
         start_ws();
     }
@@ -871,73 +923,55 @@ bool net_ws_send_display(const char *status, const char *source)
     return ws_send_text(buf, n, 100);
 }
 
-bool net_ws_send_audio_upload(const uint8_t *pcm, size_t pcm_len, char *session_id, size_t session_id_len)
+/* 异步 session 握手：只发 audio_upload 元信息并立即返回；
+ * session_id 由 handle_text 收到后端 session 帧后置位（SESSION_OK）。
+ * 调用方（voice）轮询 poll，超时自行回退，app 任务不再阻塞 2.5s。 */
+static bool ws_send_audio_meta(bool stream, size_t audio_len)
 {
-    if (!net_ws_ready() || !pcm || pcm_len == 0) {
+    if (!net_ws_ready()) {
         return false;
     }
     cJSON *meta = cJSON_CreateObject();
     cJSON_AddStringToObject(meta, "type", "audio_upload");
+    if (stream) {
+        cJSON_AddBoolToObject(meta, "stream", 1);
+    }
     cJSON_AddNumberToObject(meta, "sample_rate", 16000);
     cJSON_AddNumberToObject(meta, "channels", 1);
     cJSON_AddNumberToObject(meta, "bit_depth", 16);
-    cJSON_AddNumberToObject(meta, "audio_len", (double)pcm_len);
+    cJSON_AddNumberToObject(meta, "audio_len", (double)audio_len);
     char *txt = cJSON_PrintUnformatted(meta);
     cJSON_Delete(meta);
     if (!txt) {
         return false;
     }
     xEventGroupClearBits(s_events, SESSION_OK);
-    s_session[0] = '\0';
-    bool ok = ws_send_text(txt, (int)strlen(txt), 2000);
+    s_session[0] = 0;
+    bool ok = ws_send_text(txt, (int)strlen(txt), 1000);
     free(txt);
-    if (!ok) {
+    return ok;
+}
+
+bool net_ws_audio_session_start(bool stream, size_t audio_len)
+{
+    return ws_send_audio_meta(stream, audio_len);
+}
+
+bool net_ws_audio_session_poll(char *session_id, size_t session_id_len)
+{
+    if (!s_events) {
         return false;
     }
-    if (!ws_send_bin((const char *)pcm, (int)pcm_len, 5000)) {
+    if (!(xEventGroupGetBits(s_events) & SESSION_OK) || s_session[0] == 0) {
         return false;
     }
-    EventBits_t bits = xEventGroupWaitBits(s_events, SESSION_OK, pdTRUE, pdTRUE, pdMS_TO_TICKS(2500));
-    if (!(bits & SESSION_OK) || s_session[0] == '\0') {
-        return false;
+    if (session_id && session_id_len > 0) {
+        strncpy(session_id, s_session, session_id_len - 1);
+        session_id[session_id_len - 1] = 0;
     }
-    strncpy(session_id, s_session, session_id_len - 1);
-    session_id[session_id_len - 1] = '\0';
     return true;
 }
 
-bool net_ws_send_audio_stream_begin(char *session_id, size_t session_id_len)
-{
-    if (!net_ws_ready() || !session_id || session_id_len == 0) {
-        return false;
-    }
-    cJSON *meta = cJSON_CreateObject();
-    cJSON_AddStringToObject(meta, "type", "audio_upload");
-    cJSON_AddBoolToObject(meta, "stream", 1);
-    cJSON_AddNumberToObject(meta, "sample_rate", 16000);
-    cJSON_AddNumberToObject(meta, "channels", 1);
-    cJSON_AddNumberToObject(meta, "bit_depth", 16);
-    cJSON_AddNumberToObject(meta, "audio_len", 0);
-    char *txt = cJSON_PrintUnformatted(meta);
-    cJSON_Delete(meta);
-    if (!txt) {
-        return false;
-    }
-    xEventGroupClearBits(s_events, SESSION_OK);
-    s_session[0] = '\0';
-    bool ok = ws_send_text(txt, (int)strlen(txt), 2000);
-    free(txt);
-    if (!ok) {
-        return false;
-    }
-    EventBits_t bits = xEventGroupWaitBits(s_events, SESSION_OK, pdTRUE, pdTRUE, pdMS_TO_TICKS(2500));
-    if (!(bits & SESSION_OK) || s_session[0] == '\0') {
-        return false;
-    }
-    strncpy(session_id, s_session, session_id_len - 1);
-    session_id[session_id_len - 1] = '\0';
-    return true;
-}
 
 bool net_ws_send_audio_binary(const uint8_t *pcm, size_t pcm_len)
 {

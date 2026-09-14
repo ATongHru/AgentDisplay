@@ -8,10 +8,10 @@
 #include "ui_msg.h"
 
 esp_err_t ui_init(void);
-void ui_loop_once(void);
-void ui_tick_animation(uint32_t now_ms);
+uint32_t ui_loop_once(void); /* 返回建议的下轮延迟 ms（忙 5 / 闲 30） */
 uint32_t ui_last_event_ms(void);
 bool ui_offline_active(void);
+bool ui_prov_active(void); /* 配网界面激活中（供 ui_face 停帧） */
 bool ui_voice_session_active(void);
 void ui_set_ws_link(bool on);
 void ui_set_wifi(bool on, int rssi);

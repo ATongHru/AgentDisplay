@@ -15,6 +15,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "mem_utils.h"
+#include "net_ws.h"
 #include "voice.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -23,6 +24,7 @@
 #include "font_cjk_16.h"
 #include "font_status_icons.h"
 #include "ui_status.h"
+#include "ui_face.h"
 
 static const char *TAG = "ui";
 
@@ -31,9 +33,6 @@ static const lv_font_t *ui_text_font(void)
     const lv_font_t *font = font_cjk_get();
     return font ? font : &lv_font_montserrat_14;
 }
-#define FACE_SIZE ((int)ANIM_FACE_SIZE)
-#define FACE_X ((LCD_W - FACE_SIZE) / 2)
-#define FACE_Y 71
 #define BAR_Y 9
 #define ECHO_MAX_BYTES 256
 #define CAPTION_LINES 2
@@ -48,7 +47,6 @@ static const lv_font_t *ui_text_font(void)
 
 static QueueHandle_t s_queue;
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
-static volatile bool s_frame_dirty_queued;
 
 static lv_obj_t *source_label;
 static lv_obj_t *status_label;
@@ -61,14 +59,7 @@ static lv_obj_t *mic_icon;
 static lv_obj_t *spk_icon;
 static lv_obj_t *time_label;
 
-static uint8_t frame_buffer_a[ANIM_FACE_SIZE * ANIM_FACE_SIZE * 2];
-static uint8_t frame_buffer_b[ANIM_FACE_SIZE * ANIM_FACE_SIZE * 2];
-static uint8_t *frame_buffer_front = frame_buffer_a;
-
-static uint32_t last_anim_tick;
-static uint8_t frame_index;
-static size_t animation_index;
-static uint16_t frame_elapsed_ms;
+#define UI_EVENT_JSON_MAX 1024
 
 static uint32_t last_event_ms;
 static bool usb_link;
@@ -90,11 +81,8 @@ static bool prov_ui_active(void)
     return s_ble_prov || s_ap_prov;
 }
 
-static void anim_sync_tick(void)
-{
-    last_anim_tick = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-    frame_elapsed_ms = 0;
-}
+bool ui_prov_active(void) { return prov_ui_active(); } /* 供 ui_face 查询 */
+
 static bool caption_mode;
 static bool caption_suppress_append;
 static bool caption_streaming;
@@ -406,98 +394,14 @@ static lv_color_t status_color(const char *status)
     return lv_color_hex(ui_status_info(ui_status_from_key(status))->color);
 }
 
-static void fill_rgb565_bg(uint8_t *dest, size_t dest_size)
-{
-    const uint8_t lo = (uint8_t)(FACE_BG_RGB565 & 0xFF);
-    const uint8_t hi = (uint8_t)(FACE_BG_RGB565 >> 8);
-    for (size_t i = 0; i + 1 < dest_size; i += 2) {
-        dest[i] = lo;
-        dest[i + 1] = hi;
-    }
-}
-
-static void decode_frame_rle(const frame_data_t *frame, uint8_t *dest, size_t dest_size)
-{
-    fill_rgb565_bg(dest, dest_size);
-    size_t out = 0;
-    for (size_t i = 0; i + 2 < frame->size && out + 1 < dest_size; i += 3) {
-        uint8_t count = frame->data[i];
-        uint8_t hi = frame->data[i + 1];
-        uint8_t lo = frame->data[i + 2];
-        while (count-- && out + 1 < dest_size) {
-            dest[out++] = lo;
-            dest[out++] = hi;
-        }
-    }
-}
-
-
-static void render_frame(void);
 static void sync_voice_link_pending(void);
 static void refresh_face_display(void);
-
-static void put_px(uint8_t *buf, int x, int y, uint16_t color)
-{
-    if (x < 0 || y < 0 || x >= FACE_SIZE || y >= FACE_SIZE) {
-        return;
-    }
-    size_t i = ((size_t)y * (size_t)FACE_SIZE + (size_t)x) * 2;
-    buf[i] = (uint8_t)(color & 0xFF);
-    buf[i + 1] = (uint8_t)(color >> 8);
-}
-
-static void draw_thick_line(uint8_t *buf, int x0, int y0, int x1, int y1, uint16_t color, int thick)
-{
-    int dx = abs(x1 - x0);
-    int sx = x0 < x1 ? 1 : -1;
-    int dy = -abs(y1 - y0);
-    int sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
-    for (;;) {
-        for (int ty = -thick; ty <= thick; ++ty) {
-            for (int tx = -thick; tx <= thick; ++tx) {
-                if (tx * tx + ty * ty <= thick * thick) {
-                    put_px(buf, x0 + tx, y0 + ty, color);
-                }
-            }
-        }
-        if (x0 == x1 && y0 == y1) {
-            break;
-        }
-        int e2 = 2 * err;
-        if (e2 >= dy) {
-            err += dy;
-            x0 += sx;
-        }
-        if (e2 <= dx) {
-            err += dx;
-            y0 += sy;
-        }
-    }
-}
-
-/* Classic Bluetooth rune on face background. Color #3B82F6. */
-static void render_bluetooth_face(void)
-{
-    fill_rgb565_bg(frame_buffer_a, sizeof(frame_buffer_a));
-    frame_buffer_front = frame_buffer_a;
-    const uint16_t blue = 0x3C1E; /* RGB565 #3B82F6 */
-    const int cx = FACE_SIZE / 2;
-    const int cy = FACE_SIZE / 2;
-    const int s = FACE_SIZE / 3;
-    draw_thick_line(frame_buffer_front, cx, cy - s, cx, cy + s, blue, 2);
-    draw_thick_line(frame_buffer_front, cx, cy - s, cx + (s * 2) / 3, cy - s / 3, blue, 2);
-    draw_thick_line(frame_buffer_front, cx + (s * 2) / 3, cy - s / 3, cx, cy, blue, 2);
-    draw_thick_line(frame_buffer_front, cx, cy + s, cx + (s * 2) / 3, cy + s / 3, blue, 2);
-    draw_thick_line(frame_buffer_front, cx + (s * 2) / 3, cy + s / 3, cx, cy, blue, 2);
-}
 
 static void apply_ble_prov_ui(bool on)
 {
     s_ble_prov = on;
     if (on) {
-        render_bluetooth_face();
-        display_blit_rgb565(frame_buffer_front, FACE_X, FACE_Y, FACE_SIZE, FACE_SIZE);
+        ui_face_render_bluetooth();
         if (status_label) {
             lv_obj_clear_flag(status_label, LV_OBJ_FLAG_HIDDEN);
             lv_label_set_text(status_label, "蓝牙配网");
@@ -511,7 +415,7 @@ static void apply_ble_prov_ui(bool on)
             lv_label_set_text(source_label, agent_source[0] ? agent_source : "BOT");
         }
         s_cached_face_status[0] = 0;
-        anim_sync_tick();
+        ui_face_sync_tick();
         refresh_face_display();
     }
 }
@@ -519,16 +423,7 @@ static void apply_ble_prov_ui(bool on)
 static void apply_ap_prov_ui(bool on)
 {
     if (on) {
-        animation_index = UI_ST_WAITING;
-        frame_index = 0;
-        frame_elapsed_ms = 0;
-        if (animation_count > 0 && animations[animation_index].count > 0) {
-            uint8_t *back = (frame_buffer_front == frame_buffer_a) ? frame_buffer_b : frame_buffer_a;
-            decode_frame_rle(&animations[animation_index].frames[frame_index], back,
-                             (size_t)FACE_SIZE * FACE_SIZE * 2);
-            frame_buffer_front = back;
-            display_blit_rgb565(frame_buffer_front, FACE_X, FACE_Y, FACE_SIZE, FACE_SIZE);
-        }
+        ui_face_render_ap_waiting();
         s_ap_prov = true;
         if (status_label) {
             lv_obj_clear_flag(status_label, LV_OBJ_FLAG_HIDDEN);
@@ -546,35 +441,9 @@ static void apply_ap_prov_ui(bool on)
             lv_label_set_text(source_label, agent_source[0] ? agent_source : "BOT");
         }
         s_cached_face_status[0] = 0;
-        anim_sync_tick();
+        ui_face_sync_tick();
         refresh_face_display();
     }
-}
-
-static void blit_face_frame(void)
-{
-    if (!frame_buffer_front) {
-        return;
-    }
-    if (!prov_ui_active() && animation_count == 0) {
-        return;
-    }
-    display_blit_rgb565(frame_buffer_front, FACE_X, FACE_Y, FACE_SIZE, FACE_SIZE);
-}
-
-static void render_frame(void)
-{
-    if (prov_ui_active()) {
-        return;
-    }
-    if (animation_count == 0 || animations[animation_index].count == 0) {
-        return;
-    }
-    uint8_t *back = (frame_buffer_front == frame_buffer_a) ? frame_buffer_b : frame_buffer_a;
-    decode_frame_rle(&animations[animation_index].frames[frame_index], back,
-                     (size_t)FACE_SIZE * FACE_SIZE * 2);
-    frame_buffer_front = back;
-    blit_face_frame();
 }
 
 static lv_coord_t caption_line_height(void)
@@ -714,6 +583,8 @@ static void apply_diagnostic_ui(bool on)
     if (!on) {
         lv_obj_add_flag(diag_label, LV_OBJ_FLAG_HIDDEN);
         diagnostic_until_ms = 0;
+        /* 诊断文本覆盖了表情区 GRAM，隐藏后强制重绘表情。 */
+        ui_face_mark_dirty();
         return;
     }
     char buf[256];
@@ -788,11 +659,8 @@ static void render_status_pair(const char *status_key, const char *source)
     strncpy(current_status, info->key, sizeof(current_status) - 1);
     current_status[sizeof(current_status) - 1] = '\0';
     offline_active = (info->id == UI_ST_OFFLINE);
-    if (animation_index != (size_t)info->id) {
-        animation_index = (size_t)info->id;
-        frame_index = 0;
-        frame_elapsed_ms = 0;
-        render_frame();
+    if (ui_face_animation() != (size_t)info->id) {
+        ui_face_set_animation((size_t)info->id);
     }
     if (source) {
         apply_source(source);
@@ -1330,6 +1198,11 @@ static void refresh_face_display(void)
     if (!ws_link) {
         snprintf(status_key, sizeof(status_key), "OFFLINE");
         snprintf(source, sizeof(source), "%s", agent_source[0] ? agent_source : "BOT");
+    } else if (!voice_hold &&
+               (uint32_t)(now_ms() - net_ws_last_rx_ms()) > OFFLINE_TIMEOUT_MS) {
+        /* 半开连接兜底：WS 显示连着但心跳（2s）都断了 OFFLINE_TIMEOUT_MS，判 STALE。 */
+        snprintf(status_key, sizeof(status_key), "STALE");
+        snprintf(source, sizeof(source), "%s", agent_source[0] ? agent_source : "BOT");
     } else if (voice_hold) {
         snprintf(status_key, sizeof(status_key), "%s", voice_overlay[0] ? voice_overlay : "EAR");
         snprintf(source, sizeof(source), "%s", agent_source[0] ? agent_source : "BOT");
@@ -1352,19 +1225,15 @@ static void refresh_face_display(void)
     }
 }
 
-static void process_messages(void)
+static int process_messages(void)
 {
+    int count = 0;
     ui_msg_t msg;
     while (xQueueReceive(s_queue, &msg, 0) == pdTRUE) {
+        ++count;
         if (msg.type == UI_MSG_EVENT_JSON) {
-            handle_event_json(msg.json, msg.from_usb);
-        } else if (msg.type == UI_MSG_FRAME_DIRTY) {
-            portENTER_CRITICAL(&s_mux);
-            s_frame_dirty_queued = false;
-            portEXIT_CRITICAL(&s_mux);
-            if (!prov_ui_active()) {
-                render_frame();
-            }
+            handle_event_json(msg.json ? msg.json : "", msg.from_usb);
+            free(msg.json);
         } else if (msg.type == UI_MSG_LINK_STATE) {
             usb_link = msg.usb;
             wifi_connected = msg.wifi;
@@ -1422,6 +1291,7 @@ static void process_messages(void)
             apply_diagnostic_ui(msg.diagnostic_on);
         }
     }
+    return count;
 }
 
 static void build_ui(void)
@@ -1499,38 +1369,44 @@ static void build_ui(void)
     layout_status_bar();
 }
 
-void ui_post(const ui_msg_t *msg)
+bool ui_post(const ui_msg_t *msg)
 {
     if (!s_queue || !msg) {
-        return;
+        return false;
     }
-    if (msg->type == UI_MSG_FRAME_DIRTY) {
-        portENTER_CRITICAL(&s_mux);
-        if (s_frame_dirty_queued) {
-            portEXIT_CRITICAL(&s_mux);
-            return;
-        }
-        s_frame_dirty_queued = true;
-        if (xQueueSend(s_queue, msg, 0) != pdTRUE) {
-            s_frame_dirty_queued = false;
-        }
-        portEXIT_CRITICAL(&s_mux);
-        return;
+    if (xQueueSend(s_queue, msg, pdMS_TO_TICKS(20)) == pdTRUE) {
+        return true;
     }
-    xQueueSend(s_queue, msg, pdMS_TO_TICKS(20));
+    /* 队列满限频告警，便于定位丢事件。 */
+    static uint32_t s_drop_count;
+    ++s_drop_count;
+    if ((s_drop_count % 50) == 1) {
+        ESP_LOGW(TAG, "ui queue full, drop type=%d total=%lu", (int)msg->type,
+                 (unsigned long)s_drop_count);
+    }
+    return false;
 }
 
 void ui_post_event_json(const char *json, bool from_usb)
 {
-    ui_msg_t msg = {.type = UI_MSG_EVENT_JSON, .from_usb = from_usb};
-    strncpy(msg.json, json ? json : "", sizeof(msg.json) - 1);
-    ui_post(&msg);
-}
-
-void ui_post_frame_dirty(void)
-{
-    ui_msg_t msg = {.type = UI_MSG_FRAME_DIRTY};
-    ui_post(&msg);
+    /* JSON 单独分配（PSRAM 优先），队列只传指针，process_messages 消费后 free。 */
+    const char *src = (json && json[0]) ? json : "{}";
+    size_t len = strlen(src);
+    if (len >= UI_EVENT_JSON_MAX) {
+        len = UI_EVENT_JSON_MAX - 1;
+    }
+    char *copy = psram_malloc(len + 1);
+    if (!copy) {
+        ESP_LOGW(TAG, "event json alloc failed, dropped");
+        return;
+    }
+    memcpy(copy, src, len);
+    copy[len] = '\0';
+    ui_msg_t msg = {.type = UI_MSG_EVENT_JSON, .from_usb = from_usb, .json = copy};
+    if (!ui_post(&msg)) {
+        ESP_LOGW(TAG, "event json queue full, dropped");
+        free(copy);
+    }
 }
 
 void ui_post_link_state(bool usb, bool wifi, bool ws, bool listening, bool playing, int rssi)
@@ -1603,15 +1479,22 @@ esp_err_t ui_init(void)
     } else {
         s_voice_history[0] = '\0';
     }
-    fill_rgb565_bg(frame_buffer_a, sizeof(frame_buffer_a));
-    fill_rgb565_bg(frame_buffer_b, sizeof(frame_buffer_b));
+    ui_face_init();
     build_ui();
     apply_source("BOT");
     apply_event("IDLE", "BOT", "", true);
+    /* 资源缺失降级：占位脸 + 错误态文字，产测可直接识别（项26）。 */
+    if (animation_count == 0) {
+        ui_face_render_missing();
+        set_status_label_text("无动画资源", "ERROR");
+    }
+    if (!font_cjk_get()) {
+        set_status_label_text("FONT MISSING", "ERROR");
+    }
     update_status_bar_ui();
     refresh_time_label();
-    last_anim_tick = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-    last_event_ms = last_anim_tick;
+    ui_face_sync_tick();
+    last_event_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     ESP_LOGI(TAG, "ready");
     return ESP_OK;
 }
@@ -1626,9 +1509,11 @@ static void expire_diagnostic_if_needed(void)
     }
 }
 
-void ui_loop_once(void)
+uint32_t ui_loop_once(void)
 {
-    process_messages();
+    /* 动画推进收归 lvgl 任务：frame_index/frame_elapsed_ms 仅本任务读写，消除跨任务竞态。 */
+    ui_face_tick(now_ms());
+    int msgs = process_messages();
     sync_voice_link_pending();
     refresh_face_display();
     sync_mic_level_pending();
@@ -1636,28 +1521,11 @@ void ui_loop_once(void)
     expire_mic_hint_if_needed();
     expire_diagnostic_if_needed();
     lv_timer_handler();
-    blit_face_frame();
-}
-
-void ui_tick_animation(uint32_t now_ms)
-{
-    if (animation_count == 0 || animations[animation_index].count == 0) {
-        last_anim_tick = now_ms;
-        return;
-    }
-    if (prov_ui_active()) {
-        last_anim_tick = now_ms;
-        return;
-    }
-    uint32_t elapsed = now_ms - last_anim_tick;
-    last_anim_tick = now_ms;
-    frame_elapsed_ms = (uint16_t)(frame_elapsed_ms + elapsed);
-    const frame_data_t *frame = &animations[animation_index].frames[frame_index];
-    if (frame_elapsed_ms >= frame->duration_ms) {
-        frame_elapsed_ms = (uint16_t)(frame_elapsed_ms - frame->duration_ms);
-        frame_index = (uint8_t)((frame_index + 1) % animations[animation_index].count);
-        ui_post_frame_dirty();
-    }
+    /* 有活动保持 5ms 跟手；静帧空闲拉长到 30ms 降 Core1/SPI 空转（项34）。 */
+    bool busy = ui_face_dirty_pending() || msgs > 0 || voice_listening || voice_playing ||
+                prov_ui_active() || diagnostic_mode || mic_hint_active;
+    ui_face_blit();
+    return busy ? 5 : 30;
 }
 
 uint32_t ui_last_event_ms(void) { return last_event_ms; }
