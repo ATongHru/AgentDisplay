@@ -6,8 +6,14 @@ import json
 import os
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - Windows is the supported desktop host
+    msvcrt = None
 
 HOOK_QUEUE = Path(
     os.getenv(
@@ -19,6 +25,36 @@ HOOK_ONLINE = HOOK_QUEUE.parent / "backend_online.json"
 
 _hook_stop = threading.Event()
 _hook_last_online = 0.0
+
+
+@contextmanager
+def hook_queue_lock(queue: Path, timeout: float = 0.5) -> Iterator[bool]:
+    """Coordinate queue append and rename on Windows with a sidecar byte lock."""
+    lock_path = queue.with_suffix(queue.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        handle.seek(0)
+        handle.write(b"\0")
+        handle.flush()
+        if msvcrt is None:
+            yield True
+            return
+        deadline = time.monotonic() + timeout
+        acquired = False
+        while time.monotonic() < deadline:
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                acquired = True
+                break
+            except OSError:
+                time.sleep(0.01)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def touch_hook_online(force: bool = False) -> None:
@@ -36,22 +72,31 @@ def touch_hook_online(force: bool = False) -> None:
 
 def drain_hook_queue(apply_line: Callable[[dict], None]) -> int:
     """Atomically take the queue file and apply each JSON line. Returns applied count."""
-    if not HOOK_QUEUE.exists() or HOOK_QUEUE.stat().st_size == 0:
-        return 0
     processing = HOOK_QUEUE.with_suffix(".processing")
-    try:
-        HOOK_QUEUE.rename(processing)
-    except OSError:
-        return 0
+    with hook_queue_lock(HOOK_QUEUE) as locked:
+        if not locked:
+            return 0
+        # A previous reader may have been interrupted after rename. Drain that
+        # durable file before taking newer events from QUEUE_FILE.
+        if not processing.exists():
+            if not HOOK_QUEUE.exists() or HOOK_QUEUE.stat().st_size == 0:
+                return 0
+            try:
+                HOOK_QUEUE.rename(processing)
+            except OSError:
+                return 0
     try:
         raw = processing.read_text(encoding="utf-8")
-        processing.unlink(missing_ok=True)
     except OSError as exc:
         print(f"[hook] queue read failed: {exc}")
+        # Never delete an unread queue.  Put it back when no new producer file
+        # exists; otherwise retain .processing for manual recovery instead of
+        # silently losing events.
         try:
-            processing.unlink(missing_ok=True)
-        except OSError:
-            pass
+            if not HOOK_QUEUE.exists():
+                processing.rename(HOOK_QUEUE)
+        except OSError as restore_exc:
+            print(f"[hook] queue restore failed: {restore_exc}")
         return 0
 
     applied = 0
@@ -66,6 +111,10 @@ def drain_hook_queue(apply_line: Callable[[dict], None]) -> int:
             print(f"[hook] applied {line}")
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
             print(f"[hook] skipped: {exc} -> {line}")
+    try:
+        processing.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"[hook] processed queue cleanup failed: {exc}")
     return applied
 
 

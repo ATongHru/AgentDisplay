@@ -17,6 +17,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r backend/requirements.txt pytest ruff
       - name: Ruff
-        run: ruff check backend tests
+        run: ruff check backend scripts tests
+      - name: Python syntax
+        run: python -m compileall -q backend scripts tests
       - name: Pytest
         run: pytest tests/

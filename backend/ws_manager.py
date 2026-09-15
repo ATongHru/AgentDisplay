@@ -254,21 +254,27 @@ class WsHub:
             return
 
         meta = self._device.waiting_audio
-        self._device.waiting_audio = None
         if not meta:
             await self._send_ws_json(websocket, {"type": "error", "detail": "unexpected binary frame"})
             return
 
         expected = int(meta.get("audio_len", len(data)))
-        if expected and len(data) != expected:
+        pcm = meta.setdefault("_pcm", bytearray())
+        pcm.extend(data)
+        if expected and len(pcm) > expected:
+            self._device.waiting_audio = None
             await self._send_ws_json(
                 websocket,
                 {
                     "type": "error",
-                    "detail": f"audio_len mismatch: expected {expected}, got {len(data)}",
+                    "detail": f"audio_len mismatch: expected {expected}, got {len(pcm)}",
                 },
             )
             return
+        if expected and len(pcm) < expected:
+            return
+        self._device.waiting_audio = None
+        data = bytes(pcm)
 
         if self._voice_busy:
             print("[voice] drop upload, previous session still running")

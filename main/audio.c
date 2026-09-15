@@ -519,11 +519,17 @@ void audio_playback_cancel_fadeout(void)
 
 bool audio_playback_write(const uint8_t *data, size_t len)
 {
-    if (!s_playing || !data || len == 0) {
+    if (!data || len == 0 || !lock(pdMS_TO_TICKS(50))) {
         return false;
     }
+    bool playing = s_playing;
     if (s_fade_out_req) {
-        audio_playback_cancel_fadeout();
+        s_fade_out_req = false;
+        s_fade_out_pos = 0;
+    }
+    unlock();
+    if (!playing) {
+        return false;
     }
     if (!s_logged_pcm && len >= 2) {
         const int16_t *src = (const int16_t *)data;
@@ -582,11 +588,15 @@ bool audio_playback_write(const uint8_t *data, size_t len)
 
 void audio_playback_service(void)
 {
-    if (!s_playing || !s_tx) {
+    if (!s_tx) {
         return;
     }
     size_t n = 0;
     if (!lock(0)) {
+        return;
+    }
+    if (!s_playing) {
+        unlock();
         return;
     }
     /* 读出端同样两段 memcpy。 */
@@ -614,10 +624,14 @@ void audio_playback_service(void)
     if (samples > (sizeof(s_play_stereo) / sizeof(s_play_stereo[0])) / 2) {
         samples = (sizeof(s_play_stereo) / sizeof(s_play_stereo[0])) / 2;
     }
+    if (!lock(pdMS_TO_TICKS(50))) {
+        return;
+    }
+    const int volume_percent = s_volume_percent;
     const int16_t *src = (const int16_t *)s_play_mono;
     for (size_t i = 0; i < samples; ++i) {
         float fade = playback_fade_factor();
-        int32_t v = (int32_t)(((int32_t)src[i] * PLAY_GAIN_100 * s_volume_percent) / 100 * fade);
+        int32_t v = (int32_t)(((int32_t)src[i] * PLAY_GAIN_100 * volume_percent) / 100 * fade);
         if (v > 32767) {
             v = 32767;
         } else if (v < -32768) {
@@ -626,6 +640,7 @@ void audio_playback_service(void)
         s_play_stereo[2 * i] = (int16_t)v;
         s_play_stereo[2 * i + 1] = (int16_t)v;
     }
+    unlock();
     size_t written = 0;
     size_t want = samples * 4;
     esp_err_t err = i2s_channel_write(s_tx, s_play_stereo, want, &written, pdMS_TO_TICKS(80));
@@ -656,17 +671,37 @@ void audio_set_volume_percent(int percent)
     } else if (percent > 100) {
         percent = 100;
     }
+    if (!lock(pdMS_TO_TICKS(50))) {
+        return;
+    }
     s_volume_percent = percent;
-    ESP_LOGI(TAG, "volume %d%%", s_volume_percent);
+    unlock();
+    ESP_LOGI(TAG, "volume %d%%", percent);
 }
 
-int audio_get_volume_percent(void) { return s_volume_percent; }
+int audio_get_volume_percent(void)
+{
+    int percent = 100;
+    if (lock(pdMS_TO_TICKS(50))) {
+        percent = s_volume_percent;
+        unlock();
+    }
+    return percent;
+}
 
 size_t audio_record_capacity(void) { return s_record_cap; }
 size_t audio_play_ring_capacity(void) { return s_ring_cap; }
 float audio_get_pdm_gain(void) { return s_pdm_gain; }
 
-bool audio_playback_is_active(void) { return s_playing; }
+bool audio_playback_is_active(void)
+{
+    bool playing = false;
+    if (lock(pdMS_TO_TICKS(5))) {
+        playing = s_playing;
+        unlock();
+    }
+    return playing;
+}
 
 size_t audio_playback_pending(void)
 {

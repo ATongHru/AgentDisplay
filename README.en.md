@@ -1,947 +1,162 @@
 # ESP32-S3 Agent Display
 
-[中文](README.md) | **English** · [开发环境搭建](docs/开发环境搭建.md) · [Dev Setup (EN)](docs/dev-setup.en.md)
+[中文](README.md) | **English** · [Development setup](docs/dev-setup.en.md) · [Prebuilt firmware v1.1](firmware/releases/v1.1/README.md)
 
-ESP32-S3 N16R8 desktop status display: WebSocket status push, offline RGB565 RLE emoji, PDM always-on listening, PC backend ASR + LLM, timestamped web logs.
+A desktop Agent status display for **ESP32-S3 N16R8 (16 MB Flash / 8 MB PSRAM)**. The device receives Agent status over WebSocket and provides offline emoji, CJK UI, voice interaction, and BLE / AP provisioning. A PC-side FastAPI service supplies the Dashboard, ASR, LLM, and TTS pipeline.
 
-| Item | Spec |
-|------|------|
-| Firmware | ESP-IDF **5.4.2** + FreeRTOS + LVGL **9.2.2** |
-| Transport | WebSocket (`espressif/esp_websocket_client`) |
-| Backend | FastAPI + uvicorn, default `127.0.0.1:8000` (set `AGENT_BIND_HOST` for LAN) |
+| Layer | Current implementation |
+|---|---|
+| Firmware | ESP-IDF 5.4.2, FreeRTOS, LVGL 9.2.2 |
+| Display / emoji | 240×240 ST7789 SPI; 90×90 RGB565 RLE offline emoji |
+| Network | Wi-Fi STA + WebSocket; optional token authentication |
+| Audio | 16 kHz / mono / s16le PDM input and I2S PCM playback |
+| Backend | FastAPI / uvicorn, Vosk or SpeechRecognition, OpenAI-compatible LLM, edge-tts / Windows SAPI |
 
-### Preview
+> This README is checked against the current source, `partitions.csv`, and v1.1 build artifacts. Credentials, models, and machine-local configuration are not included in the repository or firmware.
 
-| Hardware prototype | Web dashboard |
-|:--:|:--:|
-| ![Hardware prototype](docs/images/hardware-prototype.jpg) | ![Web dashboard](docs/images/dashboard.png) |
-| ST7789 round display showing Cursor agent status | Backend dashboard: status push, voice, BLE/AP setup, LLM config |
+## Hardware
 
-### Design rules
+| Part | Specification / pins |
+|---|---|
+| Controller | ESP32-S3 N16R8, dual-core 240 MHz, 16 MB Flash, 8 MB OPI PSRAM |
+| Display | ST7789 240×240: CS GPIO8, DC GPIO9, RST GPIO10, MOSI GPIO11, SCLK GPIO12 |
+| I2S amplifier | DIN GPIO5, WS GPIO6, BCLK GPIO7; 5 V supply and common ground are recommended |
+| PDM microphone | CLK GPIO15, DATA GPIO16 |
+| Button | BOOT / GPIO0 |
+| Console | USB Serial/JTAG (GPIO19 / GPIO20) |
 
-1. **Audio on Core 0**, priority above LVGL; late I2S feeding causes crackling / mic stalls.
-2. **Only `lvgl` task may call LVGL APIs**; all others post to a FreeRTOS queue.
-3. **Emoji via offline RLE + Core 1 SPI blit**; do not enable `lv_gif` on device.
-4. **PDM DATA on GPIO16**; never GPIO48 (on-board WS2812) or GPIO3 (strapping).
-5. **LLM keys live in `backend/llm.json` (editable in Dashboard) or seed in `backend/.env`**; both are gitignored; never commit secrets.
+GPIO26–32 are used by OPI Flash / PSRAM; GPIO45 / 46 are strapping pins; GPIO48 drives the on-board RGB LED. Do not reuse them. Do not put PDM DATA on GPIO3 or GPIO48.
 
-```mermaid
-flowchart LR
-  gifSrc[emoji-gif] --> genPy[gen_frame_player.py]
-  genPy --> animBin[animations.bin]
-  animBin --> flashPart[animations partition mmap]
-  flashPart --> rle[Core1 RLE decode]
-  rle --> spi[ST7789 SPI blit]
-  hook[Pi/Cursor Hook] --> backend[FastAPI :8000]
-  backend --> ws[ws://pc:8000/ws]
-  ws --> netTask[Core0 net_task]
-  netTask -->|UI queue| lvglTask[Core1 lvgl_task]
-  i2sTask[Core0 audio_task] --> pdm[PDM GPIO16/15]
-  i2sTask --> amp[I2S amp GPIO5/6/7]
+### BOOT button
+
+The button is ignored for the first two seconds after boot. Short presses belong to one sequence when the interval from a release to the next press is under 600 ms; the action runs about 600 ms after the final release:
+
+| Action | Result |
+|---|---|
+| Two short presses | Start Soft AP provisioning |
+| Three short presses | Start BLE provisioning |
+| Hold for at least 3 seconds | Start BLE provisioning (retained shortcut) |
+| Hold for at least 5 seconds | Show the runtime diagnostics overlay |
+
+BLE and AP provisioning are mutually exclusive. AP pauses STA; BLE releases Wi-Fi resources for NimBLE.
+
+## Quick start
+
+### 1. Start the PC backend
+
+On Windows, run `start.bat` and then open <http://127.0.0.1:8000/>. For a first setup:
+
+```bat
+copy backend\.env.example backend\.env
+python -m pip install -r backend\requirements.txt
+start.bat
 ```
 
----
+The default `backend/.env` binds to `127.0.0.1` only. To serve an ESP over LAN, set `AGENT_BIND_HOST=0.0.0.0` and a strong `AGENT_API_TOKEN`, then provision the same token into the device. The Dashboard manages LLMs, volume, TTS, voice enablement, BLE provisioning, and Wi-Fi profiles of connected devices.
 
-## Table of contents
+For Vosk, put a compatible model below `backend/models/` and select it with `ASR_ENGINE`. Models are not distributed with the project.
 
-- [1. Hardware](#1-hardware)
-- [2. Firmware architecture](#2-firmware-architecture)
-- [3. FreeRTOS dual-core & tasks](#3-freertos-dual-core--tasks)
-- [4. Core features](#4-core-features)
-- [5. Backend service](#5-backend-service)
-- [6. Build & deploy](#6-build--deploy)
-  - [6.4 Troubleshooting](#64-troubleshooting)
-- [Appendix](#appendix)
+### 2. Provision the device
 
----
+Configuration is stored in NVS and overrides menuconfig factory defaults. Up to five Wi-Fi / backend profiles are supported.
 
-## 1. Hardware
-
-### 1.1 Architecture
-
-| Subsystem | Spec | Notes |
-|-----------|------|-------|
-| MCU | ESP32-S3 N16R8 | Dual Xtensa LX7, **240 MHz** |
-| Flash | 16 MB QIO 80 MHz | Custom `partitions.csv` |
-| PSRAM | 8 MB OPI 80 MHz | `SPIRAM_USE_MALLOC`; large buffers in PSRAM |
-| Display | ST7789 240×240 | **SPI** (not I2C), RGB565 16-bit |
-| Mic | PDM, I2S0 RX | 16 kHz / mono / 16-bit |
-| Amp | I2S1 TX, Philips | 16 kHz / 16-bit; playback writes stereo |
-| Console | USB Serial/JTAG | GPIO19 / GPIO20 |
-| Button | BOOT (GPIO0) | Long-press BLE / hold diagnostic; AP fallback on WiFi failure |
-
-Audio: 16 kHz mono s16le; max clip 15 s (VAD) / 20 s buffer; play ring **512 KB** (PSRAM).
-
-### 1.2 Pinout
-
-#### ST7789
-
-| Signal | GPIO |
-|--------|------|
-| CS | 8 |
-| DC | 9 |
-| RST | 10 |
-| MOSI | 11 |
-| SCLK | 12 |
-
-#### I2S amplifier (I2S1 TX)
-
-| Signal | GPIO |
-|--------|------|
-| DIN | 5 |
-| LRCLK / WS | 6 |
-| BCLK | 7 |
-
-Amp VCC recommended **5V** (3V3 is quiet); common ground with ESP and display.
-
-#### PDM microphone (I2S0 RX)
-
-| Signal | GPIO | Notes |
-|--------|------|-------|
-| CLK | 15 | Enabled only after `audio_task` starts |
-| DATA | **16** | Not GPIO3 (strapping) or GPIO48 (WS2812) |
-
-No record button: VAD listens on boot. GPIO17/18 spare.
-
-#### Reserved GPIO
-
-| GPIO | Reason |
-|------|--------|
-| 19 / 20 | USB Serial/JTAG |
-| 26–32 | OPI Flash / PSRAM |
-| 45 / 46 | strapping |
-| 48 | On-board RGB LED |
-
-### 1.3 Flash & memory
-
-Flash partitions: see `partitions.csv` (A/B OTA: `app0`+`app1` 3 MB each). Flash assets with `scripts/flash_animations.py` (`0x810000`) and `scripts/flash_font.py` (`0x610000`).
-
-PSRAM buffers: CJK font (~893 KB), record PCM (640 KB), play ring (512 KB), voice history (128 KB), LVGL partial buffers (~37.5 KB), RLE face double-buffer (32 KB, `ui_face.c`), WS audio drain slot (~4.1 KB). Boot log shows `PSRAM free ~5.71 MB`, `DRAM free ~171 KB / largest 80 KB`.
-
-### 1.4 Configuration
-
-Key `sdkconfig.defaults`: 240 MHz, OPI PSRAM, `CONFIG_LV_USE_GIF=n`, `CONFIG_AGENT_VOICE_HW=y`, `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y`, `CONFIG_ESP_TASK_WDT_PANIC=y` (task watchdog resets the chip after 5 s of starvation).
-
-menuconfig **Agent Display**: WiFi, static IP, `AGENT_WS_URL`, `AGENT_WS_TOKEN` — factory defaults are **empty** (no credentials in version control; fresh devices must be provisioned). The **Voice / audio tuning** submenu exposes VAD/AGC/timeout knobs. NVS (BLE/AP) overrides Kconfig defaults. When `AGENT_WS_TOKEN` matches backend `AGENT_API_TOKEN`, the firmware appends `?token=` on WebSocket connect.
-
----
-
-## 2. Firmware architecture
-
-### 2.1 Modules
-
-| Module | File | Role |
-|--------|------|------|
-| Entry | `main.c` | `app_main`, task creation |
-| Display | `display.c` | SPI, ST7789, `display_blit_rgb565` |
-| UI | `ui.c` | LVGL, queue, captions |
-| Face | `ui_face.c` | frame double-buffer, RLE decode, animation tick, dirty-flagged SPI blit |
-| Network | `net_ws.c` | WiFi, WebSocket, voice I/O |
-| Audio | `audio.c` | PDM, AGC, I2S playback ring |
-| Voice | `voice.c` | VAD FSM, streaming upload |
-| Provisioning | `ble_prov.c` / `ap_prov.c` / `prov_cfg.c` | BLE NUS, Soft AP portal, shared NVS |
-| CLI | `serial_cli.c` | `ap` / `ap_stop` / `ble_stop` |
-| Button | `btn_boot.c` | BOOT long-press |
-| Util | `ws_url.c` | `ws://` URL parsing (shared by `net_ws` / `prov_cfg`) |
-
-### 2.2 Boot sequence (`app_main` on Core 0)
-
-1. `nvs_flash_init`
-2. `anim_loader_init` → mmap animations
-3. `display_init` → SPI + ST7789 + LVGL
-4. `font_cjk_init`
-5. `ui_init` → UI queue (depth 16)
-6. `agent_cfg_load`
-7. `btn_boot_init` → `btn_boot` task
-8. `net_init`
-9. `serial_cli_init` → `cli` task
-10. `voice_init`
-11. `mem_report("boot")`
-12. Create tasks: `audio` / `net` / `lvgl` / `app` in `main.c`
-
-### 2.3 Inter-task IPC
-
-- **UI queue** (`xQueueCreate(16, ui_msg_t)`): only `lvgl` task touches LVGL.
-- **Voice**: `voice_loop` on `app` task; `voice_net_poll` on `net` task; shared PCM in PSRAM.
-- **`ui_post_voice_link`**: critical-section merge to avoid stuck `SPEAKING`.
-- **WS ingress**: text frames are copied into a PSRAM queue (8 slots x 2 KB) inside the event callback; JSON/NVS/UI work runs in `net_loop`. WiFi reconnect uses exponential backoff (5 s doubling, 60 s cap); WiFi power save toggles `PS_NONE` (voice active) / `PS_MIN_MODEM` (idle).
-
----
-
-## 3. FreeRTOS dual-core & tasks
-
-All app tasks use `xTaskCreatePinnedToCore`.
-
-### 3.1 Core roles
-
-| Core | Role | Tasks |
-|------|------|-------|
-| **0** | Real-time I/O + network | `audio`, `net`, WiFi, lwIP, NimBLE (when provisioning) |
-| **1** | Display + app logic | `lvgl`, `app`, `btn_boot`, `cli` |
-
-### 3.2 Task table
-
-| Task | Core | Pri | Stack | Loop | Role |
-|------|------|-----|-------|------|------|
-| `audio` | 0 | **6** | 8192 | 5 ms | I2S0 PDM RX, I2S1 TX; stop mic while playing |
-| `net` | 0 | 4 | 8192 | 20 ms | WiFi, WebSocket, `voice_net_poll` |
-| `lvgl` | 1 | 4 | 8192 | 5–30 ms adaptive | UI queue, LVGL, animation tick, RLE + dirty-only SPI blit |
-| `app` | 1 | 3 | 8192 | 5 ms | VAD, BLE/AP loops, link-state post on change (10 dBm RSSI hysteresis) |
-| `btn_boot` | 1 | 4 | 4096 | 20 ms | BOOT ≥3 s → BLE; ≥5 s → diagnostic |
-| `cli` | 1 | 2 | 4096 | blocking | Serial `ap` / `ap_stop` / `ble_stop` |
-
-**Ephemeral**: `ble_start` (pri 5, 8192), NimBLE Host (8192). All four resident tasks (`audio` / `net` / `lvgl` / `app`) subscribe to the Task WDT; any 5 s stall resets the chip.
-
-### 3.3 Priority rationale
-
-Audio (6) must beat LVGL (4) on timing-critical I2S. `app` (3) and `cli` (2) are lowest; VAD and serial debug tolerate jitter.
-
-### 3.4 Memory
-
-- `psram_malloc()` for PCM, play ring, CJK font, LVGL buffers.
-- `SPIRAM_MALLOC_RESERVE_INTERNAL=32768` for WiFi/BT DMA.
-- Face RLE double-buffer also lives in PSRAM (runtime-allocated in `ui_face.c`), keeping internal contiguous blocks for WiFi/BT.
-
-### 3.5 Thread-safety rules
-
-1. No LVGL calls outside `lvgl` task.
-2. No LVGL in ISR.
-3. No unguarded shared PCM/text buffers.
-4. Animation **advance, decode and blit all live on `lvgl`** (`ui_face_tick` → back buffer → dirty flag → `ui_face_blit`); `ui_msg_t.json` is a PSRAM pointer freed by the consumer; the record buffer is read via the locked `audio_capture_snapshot()`.
-5. `source=VOICE` WS events update captions only; face/status from `refresh_face_display()`.
-
----
-
-## 4. Core features
-
-### 4.1 Display
-
-LVGL 9.2, partial buffers in PSRAM (`PARTIAL_BUF_LINES=40`). Face refresh priority: `OFFLINE` → `STALE` (WS up but no frames for 8 s) → `voice_overlay` → `agent_status`. The face area only triggers SPI transfers when a frame actually changes (dirty flag), and the LVGL loop idles at 30 ms when static. Missing assets degrade gracefully: placeholder face + "no animations", or ASCII fallback for a missing CJK font.
-
-### 4.2 Offline RLE emoji
-
-PC pre-renders GIFs to 90×90 RGB565 RLE in the `animations` partition (`0x810000`, 554 frames / 4.40 MB). Device mmap + Core 1 decode into the PSRAM double-buffer, SPI blit on dirty frames only. **No `lv_gif`.**
-
-Regenerate: `python scripts/gen_frame_player.py` then `scripts/flash_animations.py`.
-
-### 4.3 CJK font
-
-Partition `cjk_font` @ `0x610000`. 7000-char table + `extra_symbols.txt` + ASCII. Flash with `scripts/gen_cjk_font.py` + `scripts/flash_font.py`.
-
-### 4.4 Voice (summary)
-
-VAD FSM in `voice.c`: LISTEN → RECORDING → UPLOADING → WAIT_REPLY → PLAYING → LISTEN.
-
-- Stream upload: 4096 B chunks; session handshake is asynchronous (`net_ws_audio_session_start`/`poll`, 2.5 s timeout) so `app` never blocks. VAD/AGC/timeout constants are menuconfig-tunable (**Voice / audio tuning**).
-- No barge-in during playback.
-- Full JSON examples: [§5.2](#52-websocket-protocol).
-
-### 4.5 BLE provisioning
-
-Long-press BOOT ≥3 s → NimBLE NUS (`AgentDisplay`). Text protocol (UTF-8, newline-terminated):
+- **AP**: double-press BOOT, connect to `AgentDisplay-XXXX`, open <http://192.168.4.1/>, and enter Wi-Fi, backend address, optional token, and optional static IP.
+- **BLE**: triple-press or hold BOOT, use the Dashboard BLE card, or send newline-terminated commands to the `AgentDisplay` NUS service:
 
 ```text
 WIFI:<ssid>,<password>
 HOST:<ip>:<port>
-TOKEN:<api_token>     # optional; same as backend AGENT_API_TOKEN
-IP:<x.x.x.x>          # optional static IP
+TOKEN:<api_token>       # optional
+IP:<x.x.x.x>            # optional static IP
 MASK:<x.x.x.x>
 GW:<x.x.x.x>
-GET
 APPLY
 ```
 
-Use Dashboard **BLE provisioning** card (optional API Token field) or SerialTest (LE).
+- **Serial**: use 115200 baud; `ap`, `ap_stop`, `ble_stop`, and `help` are debug commands.
 
-After `APPLY`, advertising stops in ~0.5 s, **NimBLE shuts down** to free the radio, and WiFi/WS reconnect. `prov_cfg_apply_saved()` resets the auto-AP fallback timer (see [§4.6](#46-ap-provisioning-fallback)).
+After connecting, the device sends `hello`; the backend returns `ack` and the current volume configuration. Agent Hooks and the Dashboard send status through `/ws`. The PDM microphone uses VAD to record automatically; PCM is uploaded in chunks and the backend performs ASR → LLM → optional TTS. The ESP only plays returned PCM.
 
-### 4.6 AP provisioning (fallback)
+## Network recovery
 
-On **cold boot** (WebSocket never connected), if WiFi+WS are not up within **30 s**, the device opens Soft AP `AgentDisplay-XXXX` (open), portal at `http://192.168.4.1/`. After BLE/AP `APPLY`, auto-AP waits **60 s** before triggering. `ble_radio_shutdown()` runs before AP mode to avoid BLE+AP radio conflicts. Serial command `ap` forces AP mode. BLE and AP are **mutually exclusive**.
+Wi-Fi, WebSocket, and profile fallback are separate paths:
 
-Portal form fields map to the same NVS layout as BLE: WiFi SSID/password, backend host/port (→ `ws://<host>:<port>/ws`), optional **`api_token`** (same as `AGENT_API_TOKEN`), optional static IP/netmask/gateway.
+1. After Wi-Fi disconnect, `esp_wifi_connect()` uses **5 → 10 → 20 → 40 → 60 seconds** exponential backoff. Receiving an IP resets the delay to five seconds.
+2. When Wi-Fi works but the backend is unavailable, the WebSocket client retries every **3 seconds**; one connection attempt waits at most **3 seconds**.
+3. The next saved profile is selected only after **two completed WS failures** on the current profile and only when no voice network session is active. A planned disconnect while switching profiles is not counted as a failure.
+4. On a cold boot that has never made a WS connection, 30 seconds without Wi-Fi+WS starts AP provisioning. After applying BLE/AP configuration, this AP fallback waits 60 seconds.
 
-**`GET /api/config`** (AP mode):
+The task watchdog remains a five-second last-resort recovery for genuine deadlocks. The current path avoids stopping a WebSocket synchronously during an in-flight connection.
 
-```json
-{
-  "ok": true,
-  "ssid": "MyWiFi",
-  "password": "12345678",
-  "host": "192.168.10.167",
-  "port": 8000,
-  "ip": "",
-  "netmask": "",
-  "gateway": "",
-  "api_token": "",
-  "profile_count": 1,
-  "active": 0
-}
-```
+## Backend and authentication
 
-**`POST /api/config`**:
+| Item | Default / behavior |
+|---|---|
+| Dashboard | `http://127.0.0.1:8000/` |
+| WebSocket | `ws://<pc-ip>:8000/ws` |
+| LAN authentication | `AGENT_API_TOKEN`; HTTP uses `Authorization: Bearer` or `X-Api-Token`, WS uses `?token=` |
+| TTS | `VOICE_TTS=0` shows captions only; `1` generates PCM speech |
+| Status endpoints | `/health`, `/api/status`, `/api/logs`, `/api/history` |
 
-```json
-{
-  "ssid": "MyWiFi",
-  "password": "12345678",
-  "host": "192.168.10.167",
-  "port": 8000,
-  "api_token": "",
-  "ip": "",
-  "netmask": "",
-  "gateway": ""
-}
-```
+Binding the backend to LAN without a token creates a security warning. Never commit `backend/.env`, `backend/llm.json`, `backend/settings.json`, Vosk models, or API keys.
 
-Success: `{"ok":true}` — applied ~3.5 s later, AP shuts down.
+## Build, flash, and prebuilt firmware
 
----
-
-## 5. Backend service
-
-### 5.1 Modules
-
-`backend/main.py` — FastAPI, default **`127.0.0.1:8000`** (`AGENT_BIND_HOST`). For LAN exposure set `0.0.0.0` and **also** set `AGENT_API_TOKEN`. Start/stop: `start.bat` / `stop.bat`.
-
-| Module | Role |
-|--------|------|
-| `ws_manager.py` | `/ws` hub, voice sessions, TTS pump |
-| `voice_pipeline.py` | ASR → LLM → TTS |
-| `asr.py` | Vosk streaming |
-| `llm.py` | OpenAI-compatible API |
-| `ble_prov.py` | Dashboard BLE provisioning |
-
-### 5.2 WebSocket protocol
-
-Endpoint: `ws://<pc-ip>:8000/ws` (with auth: `ws://<pc-ip>:8000/ws?token=<AGENT_API_TOKEN>`). First frame must be JSON text. Binary frames only follow `audio_upload` (bulk) or `audio_chunk` header.
-
-#### Authentication (optional)
-
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `AGENT_BIND_HOST` | Listen address | `127.0.0.1` |
-| `AGENT_API_TOKEN` | Bearer token / WS `?token=` | empty (no auth) |
-
-- HTTP: header `Authorization: Bearer <token>` or `X-Api-Token`
-- WebSocket: query `?token=<token>` (firmware `AGENT_WS_TOKEN` / BLE `TOKEN:` / AP `api_token`)
-- Dashboard: open `http://127.0.0.1:8000/?token=<token>` once to store token in `localStorage`
-
-| Item | Value |
-|------|-------|
-| Audio | 16 kHz / mono / s16le |
-| Stream chunk | 4096 B |
-| Session wait (device) | **2.5 s** |
-| TTS burst cap | **16384 B** |
-| Keepalive | Server `ping` every **2 s**; stale after **5 s** no uplink |
-
-`volume_percent` applies on device only; backend does not rescale TTS PCM.
-
-#### Volume & TTS voice (source of truth)
-
-| Setting | Stored in | Notes |
-|---------|-----------|-------|
-| `volume_percent` | `backend/settings.json` (default **33%**) | Saved from Dashboard slider; pushed as `config` on WS connect |
-| `voice_enabled` | same | Mic listen-stream master switch |
-| `tts_voice` | same | **PC-side TTS only** (edge-tts or Windows SAPI, e.g. `sapi:TTS_MS_ZH-CN_HUIHUI_11.0`); ESP plays PCM only |
-| Device gain | ESP **RAM** (`audio.c`, not NVS) | Defaults to 100% on boot, then overwritten by backend `config` |
-
-Adjust volume/voice in Dashboard → writes `settings.json` and pushes to the device. ESP reboot alone does not persist volume; reconnect reapplies the backend value (often 33% if never saved).
-
----
-
-#### 5.2.1 Connection & keepalive
-
-**ESP → PC: `hello`**
-
-```json
-{"type":"hello","role":"device","rssi":-58}
-```
-
-**PC → ESP: `ack`**
-
-```json
-{"type":"ack","role":"device","server_time":1735689600}
-```
-
-**`ping` / `pong`**
-
-```json
-{"type":"ping"}
-```
-
-```json
-{"type":"pong","server_time":1735689600}
-```
-
-Device replies `{"type":"pong"}` without `server_time`.
-
----
-
-#### 5.2.2 Agent status (PC → ESP)
-
-**`status`**
-
-```json
-{
-  "type": "status",
-  "status": "THINKING",
-  "source": "CURSOR",
-  "text": "Analyzing code…",
-  "gif": "THINKING",
-  "time": "14:32:05",
-  "status_detail": "tool_running",
-  "tool_category": "read",
-  "task_label": "explore"
-}
-```
-
-**`text`** (caption only)
-
-```json
-{
-  "type": "text",
-  "text": "Hello, how can I help?",
-  "source": "BOT"
-}
-```
-
-**`append`** (streaming ASR / LLM caption)
-
-```json
-{
-  "type": "append",
-  "text": "Hello",
-  "source": "VOICE",
-  "role": "assistant",
-  "reset": true
-}
-```
-
-**ESP → PC: `display`** (device reports on-screen state)
-
-```json
-{
-  "type": "display",
-  "status": "CODING",
-  "source": "CURSOR",
-  "gif": "CODING"
-}
-```
-
-Throttled: 400 ms quiet after connect; min gap 120 ms.
-
----
-
-#### 5.2.3 Voice upload (ESP → PC)
-
-**Streaming (primary)**
-
-① Start:
-
-```json
-{
-  "type": "audio_upload",
-  "stream": true,
-  "sample_rate": 16000,
-  "channels": 1,
-  "bit_depth": 16,
-  "audio_len": 0
-}
-```
-
-② PC replies `session` (§5.2.4)
-
-③ Multiple **binary** PCM frames (4096 B preferred)
-
-④ End:
-
-```json
-{
-  "type": "audio_end",
-  "session_id": "a1b2c3d4e5f6",
-  "total_bytes": 48000
-}
-```
-
-Cancel short clip:
-
-```json
-{
-  "type": "audio_end",
-  "session_id": "a1b2c3d4e5f6",
-  "total_bytes": 3200,
-  "discard": true
-}
-```
-
-**Bulk fallback**
-
-Text + single binary; `audio_len` must match binary size.
-
-Streaming when `stream == true` **or** `audio_len == 0`.
-
----
-
-#### 5.2.4 Voice downlink (PC → ESP)
-
-**`session`**
-
-```json
-{
-  "type": "session",
-  "session_id": "a1b2c3d4e5f6",
-  "volume_percent": 33
-}
-```
-
-Default volume from `backend/settings.json` (**33%**).
-
-**`status` (voice round end)**
-
-```json
-{
-  "type": "status",
-  "status": "IDLE",
-  "text": "",
-  "source": "VOICE"
-}
-```
-
-**TTS `audio_chunk` + binary**
-
-Firmware parses the JSON header **synchronously** in the WS callback before accepting the following binary PCM (queued delay caused garbled playback in older builds).
-
-```json
-{
-  "type": "audio_chunk",
-  "session_id": "a1b2c3d4e5f6",
-  "len": 4096,
-  "end": false
-}
-```
-
-End marker only:
-
-```json
-{
-  "type": "audio_chunk",
-  "session_id": "a1b2c3d4e5f6",
-  "len": 0,
-  "end": true
-}
-```
-
-**`config`**
-
-```json
-{
-  "type": "config",
-  "volume_percent": 90,
-  "voice_enabled": true
-}
-```
-
-`voice_enabled=false` rejects new uploads and aborts active listen stream.
-
----
-
-#### 5.2.5 WiFi profiles (over WS)
-
-Up to **5** profiles. Dashboard `POST /api/device/wifi-profiles/*` proxies these frames.
-
-**Query**
-
-```json
-{"type":"get_wifi_profiles"}
-```
-
-**List response**
-
-```json
-{
-  "type": "wifi_profiles",
-  "ok": true,
-  "count": 2,
-  "active": 0,
-  "profiles": [
-    {
-      "index": 0,
-      "ssid": "MyWiFi",
-      "password": "secret",
-      "host": "192.168.1.100",
-      "port": 8000,
-      "ip": "192.168.1.50",
-      "netmask": "255.255.255.0",
-      "gateway": "192.168.1.1"
-    }
-  ]
-}
-```
-
-**Save**
-
-```json
-{
-  "type": "wifi_profile_save",
-  "index": 0,
-  "ssid": "MyWiFi",
-  "password": "secret",
-  "host": "192.168.1.100",
-  "port": 8000,
-  "ip": "",
-  "netmask": "",
-  "gateway": ""
-}
-```
-
-**Delete / activate**
-
-```json
-{"type":"wifi_profile_delete","index":1}
-```
-
-```json
-{"type":"wifi_profile_activate","index":0}
-```
-
----
-
-#### 5.2.6 Debug & errors
-
-**Request**
-
-```json
-{"type":"debug"}
-```
-
-**Response**
-
-```json
-{
-  "type": "debug",
-  "dram_free": 180224,
-  "dram_largest": 98304,
-  "psram_free": 6123456,
-  "psram_largest": 4194304,
-  "rec_bytes": 12288,
-  "rec_cap": 640000,
-  "play_bytes": 0,
-  "play_cap": 524288,
-  "vad_phase": 0,
-  "noise_rms": 0.0042,
-  "noise_peak": 0.0310,
-  "start_rms": 0.0147,
-  "start_peak": 0.1085,
-  "last_rms": 0.0021,
-  "last_peak": 0.0180,
-  "pdm_gain": 5.0
-}
-```
-
-**Errors**
-
-```json
-{"type":"error","detail":"voice pipeline busy"}
-```
-
-```json
-{"type":"error","detail":"audio_len mismatch: expected 48000, got 40960"}
-```
-
-```json
-{"type":"error","detail":"voice chat disabled"}
-```
-
----
-
-#### 5.2.7 Dashboard-only (`role` ≠ `device`)
-
-```json
-{
-  "type": "transcript",
-  "time": "2026-03-14 10:30:00",
-  "text": "What's the weather today?",
-  "session_id": "a1b2c3d4e5f6",
-  "role": "user"
-}
-```
-
-```json
-{
-  "type": "backend_log",
-  "time": "10:30:01",
-  "level": "info",
-  "text": "[voice] stream end session=…"
-}
-```
-
-### 5.3 Voice pipeline
-
-```
-audio_upload(stream) → VoskStreamRecognizer → audio_end → LLM → append
-  → [VOICE_TTS] edge-tts → audio_chunk pump → IDLE (source=VOICE)
-```
-
-| Step | Behavior |
-|------|----------|
-| Too short | < 6400 B → IDLE "didn't catch that" |
-| Busy | `_voice_busy`; timeout 55 s |
-| TTS pump | Burst max 16384 B, interval 0.02 s |
-| Profile rotate | Every 15 s if multiple profiles and not connected |
-
-#### Environment (`backend/.env`)
-
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | LLM seed (first `llm.json`) | see [§5.4](#54-llm-configuration) |
-| `VOICE_TTS` | TTS after LLM reply | `0` |
-| `TTS_VOICE` / `TTS_RATE` | edge-tts options | `zh-CN-XiaoxiaoNeural` / `+20%` |
-| `ASR_ENGINE` | ASR engine | `vosk` |
-| `VOSK_MODEL_PATH` | Vosk model directory | `backend/models/vosk-model-small-cn-0.22` |
-| `AGENT_BIND_HOST` | Backend listen address | `127.0.0.1` |
-| `AGENT_API_TOKEN` | API / WS auth token | empty |
-| `LLM_HISTORY_MAX_LINES` | `llm_chat.jsonl` rotation cap | `2000` |
-
-Copy `backend/.env.example` → `backend/.env`. Full LLM setup: [§5.4](#54-llm-configuration).
-
-### 5.4 LLM configuration
-
-After ASR, the voice pipeline calls an **OpenAI-compatible Chat Completions** API (HTTP streaming, `stream: true`).
-
-| File | Role | Committed? |
-|------|------|------------|
-| `backend/.env` | **Seed** on first run; used to create the default profile when `llm.json` is missing | No |
-| `backend/llm.json` | **Runtime config**; Dashboard writes here; hot-reload, no restart | No |
-
-Use Dashboard → **LLM Config** for day-to-day edits, or seed via `.env` before first start.
-
-#### 5.4.1 Fields
-
-| Field | Required | Notes |
-|-------|----------|-------|
-| **Name** | No | Label, e.g. `Qwen`, `2api relay`; defaults to model id |
-| **Base URL** | Yes | API root — see [URL rules](#542-base-url-rules) |
-| **API Key** | Yes | Bearer token (`Authorization: Bearer <key>`) |
-| **Model** | Yes | Provider model id, e.g. `gpt-4o`, `qwen3.8-max` |
-
-Up to **8** profiles; one **active** profile is used for voice chat.
-
-#### 5.4.2 Base URL rules
-
-`chat_completions_url()` in `llm.py` appends the path:
-
-| You enter | POST URL |
-|-----------|----------|
-| `https://2api.store` | `https://2api.store/v1/chat/completions` |
-| `https://api.openai.com/v1` | `https://api.openai.com/v1/chat/completions` |
-| `https://dashscope.aliyuncs.com/compatible-mode/v1` | `…/compatible-mode/v1/chat/completions` |
-| Full URL ending in `/chat/completions` | Used as-is |
-
-Do **not** append `/chat/completions` yourself — only the root or `/v1` prefix from the provider docs.
-
-#### 5.4.3 How to configure
-
-**A. `.env` seed (first deploy)**
+With ESP-IDF 5.4.2 activated:
 
 ```bash
-cd backend
-cp .env.example .env
-# Edit .env — at minimum set LLM_API_KEY
-```
-
-```ini
-LLM_BASE_URL=https://2api.store
-LLM_API_KEY=sk-xxxxxxxx
-LLM_MODEL=gpt-5.6-luna
-```
-
-On first `start.bat`, if `llm.json` is missing, a **默认 / Default** profile is created from `.env`.
-
-**B. Dashboard (daily use / multiple models)**
-
-1. Open `http://<pc-ip>:8000`
-2. Top bar → **LLM Config**
-3. **New** or **Edit** on an existing row
-4. Fill Base URL, API Key, Model
-5. **Save & activate** — takes effect immediately, **no backend restart**
-6. **Save** only (no switch) or **Activate** on another row to switch
-
-**API Key when editing**: Keys are masked (first 4 + last 4). **Leave blank or enter only `****` to keep the existing key**; paste a full new key to replace.
-
-**C. Edit `llm.json` directly (advanced)**
-
-```json
-{
-  "active": "3b1ddf919139",
-  "profiles": [
-    {
-      "id": "default",
-      "name": "Default",
-      "base_url": "https://2api.store",
-      "api_key": "sk-xxxxxxxx",
-      "model": "gpt-5.6-luna"
-    }
-  ]
-}
-```
-
-Use **Reload** in Dashboard to refresh the form after manual edits.
-
-#### 5.4.4 Provider examples
-
-| Scenario | Base URL | Model example | Key |
-|----------|----------|---------------|-----|
-| Relay (e.g. 2api) | `https://2api.store` | id from console | Relay dashboard |
-| OpenAI | `https://api.openai.com/v1` | `gpt-4o` | platform.openai.com |
-| Alibaba Bailian (Qwen) | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` | Bailian API key |
-| DeepSeek | `https://api.deepseek.com` | `deepseek-chat` | platform.deepseek.com |
-| Local Ollama | `http://127.0.0.1:11434/v1` | local model name | placeholder `ollama` often works |
-| LM Studio | `http://127.0.0.1:1234/v1` | loaded model id | placeholder |
-
-Streaming Chat Completions required. On 400 errors mentioning `stream_options`, the backend retries without usage in stream.
-
-#### 5.4.5 Verify & troubleshoot
-
-| Symptom | Fix |
-|---------|-----|
-| No reply after speech / `LLM_API_KEY is empty` | **Save & activate** a profile with a valid key |
-| HTTP 401 / 403 | Expired or wrong key; wrong Base URL for provider |
-| HTTP 404 | Base URL includes `/chat/completions` — use root or `/v1` only |
-| Unknown model | Match model id to provider list |
-| Check active profile | **Current** tag in Dashboard, or startup log `[llm] loaded … active=…` |
-| History | Dashboard → **Chat History**; file `log/llm_chat.jsonl` |
-
-REST: `GET /api/llm` (masked keys), `POST /api/llm`, `POST /api/llm/activate`, `POST /api/llm/delete` (keep ≥1 profile).
-
-### 5.5 Agent hooks
-
-Install hooks in **user home**, not in this repo (duplicate hooks collide).
-
-| Agent | Path |
-|-------|------|
-| Pi | `%USERPROFILE%\.pi\agent\extensions\agent-display.ts` |
-| Cursor | `%USERPROFILE%\.cursor\hooks.json` |
-
-Cursor: do **not** register `beforeAgentResponse` (invalid in 3.x).
-
-| Status | GIF | Notes |
-|--------|-----|-------|
-| IDLE / THINKING / CODING / READING / TESTING / WAITING / DONE / ERROR | matching `.gif` | From Pi/Cursor hooks |
-| OFFLINE | OFFLINE.gif | WS disconnected |
-| STALE | STALE.gif | Pi: 30 s idle |
-| EAR / SPEAKING | voice overlay | Voice phases |
-
----
-
-## 6. Build & deploy
-
-### 6.1 Dependencies
-
-- ESP-IDF **5.4.2**
-- Python 3.10+ for backend: `pip install -r backend/requirements.txt`
-- Pillow, Node.js + `lv_font_conv` for asset scripts
-
-### 6.2 Flash
-
-Requires ESP-IDF **5.4.2**. `scripts/idf_build.bat` wraps `python %IDF_PATH%\tools\idf.py` and does **not** activate ESP-IDF by itself — set `IDF_PATH` and the IDF Python venv first (`export.bat` or the EIM PowerShell profile). See [docs/dev-setup.en.md](docs/dev-setup.en.md).
-
-**Recommended (PowerShell, EIM example):**
-
-```powershell
-. D:\Espressif\tools\Microsoft.v5.4.2.PowerShell_profile.ps1   # adjust path
-cd D:\0-C\esp32s3-agent-display
-scripts\idf_build.bat build
-scripts\idf_build.bat -p COMx flash
+idf.py set-target esp32s3
+idf.py build
+idf.py -p COMx flash
 python scripts/flash_font.py -p COMx
 python scripts/flash_animations.py -p COMx
-scripts\idf_build.bat -p COMx monitor
 ```
 
-> Do **not** run `idf.py` from Git Bash (MSYS guard skips execution). `idf_build.bat` and `idf.py build` are equivalent after env activation.
+`idf.py flash` writes bootloader, partition table, OTA data, and the app only. Font and animation are independent partitions and must be flashed separately. See [development setup](docs/dev-setup.en.md) for Windows details.
 
-You can set `ESPPORT=COMx` instead of passing `-p` to the flash scripts.
+v1.1 is built with ESP-IDF 5.4.2 for this project's **16 MB N16R8 partition table**; it is not generic ESP32-S3 firmware. See [firmware/releases/v1.1/README.md](firmware/releases/v1.1/README.md) for complete assets, SHA-256 checksums, and esptool commands.
 
-Copy `backend/.env.example` → `backend/.env`. `start.bat` uses `_run_hidden.py`, which **`load_dotenv`s before reading `AGENT_BIND_HOST`** — required for LAN bind from `.env`.
+| Partition | Offset | Contents |
+|---|---:|---|
+| bootloader | `0x0000` | bootloader |
+| partition table | `0x8000` | this project's 16 MB table |
+| otadata | `0xE000` | initial OTA data |
+| app0 | `0x10000` | application |
+| cjk_font | `0x610000` | `font_cjk_16.bin` |
+| animations | `0x810000` | `animations.bin` |
 
-#### LAN deployment checklist
+Updating only the app does not erase the font or animation partitions.
 
-1. In `backend/.env`: `AGENT_BIND_HOST=0.0.0.0` and `AGENT_API_TOKEN=<strong-random-string>`.
-2. `netstat` should show `0.0.0.0:8000`, not only `127.0.0.1:8000`.
-3. Provision the device with the PC **LAN IP** as `HOST:` (not `127.0.0.1`) and the same token (Dashboard BLE **API Token**, BLE `TOKEN:`, or AP `api_token`).
-4. Open Dashboard once with `?token=<same>` when auth is enabled.
-
-#### Prebuilt firmware (no compile)
-
-Download three partition images (**v1.0**, ESP-IDF 5.4.2):
-
-| File | Offset | Download |
-|------|--------|----------|
-| `esp32s3_agent_display.bin` | `0x10000` | [Releases](https://github.com/ATongHru/AgentDisplay/releases/download/v1.0/esp32s3_agent_display.bin) |
-| `font_cjk_16.bin` | `0x610000` | [Releases](https://github.com/ATongHru/AgentDisplay/releases/download/v1.0/font_cjk_16.bin) |
-| `animations.bin` | `0x810000` | [Releases](https://github.com/ATongHru/AgentDisplay/releases/download/v1.0/animations.bin) |
-
-In-repo paths: `firmware/releases/v1.0/` (app) + `firmware/data/` (font, animations). Flash steps and SHA256: [firmware/releases/v1.0/README.md](firmware/releases/v1.0/README.md).
-
-### 6.3 Layout
+## Architecture and layout
 
 ```text
-esp32s3-agent-display/
-├── README.md          Chinese docs
-├── README.en.md       English docs (this file)
-├── docs/
-│   ├── 开发环境搭建.md
-│   └── dev-setup.en.md
-├── backend/           FastAPI + Dashboard
-├── main/              Firmware
-├── scripts/           Build & flash tools
-└── firmware/
-    ├── data/          animations.bin / font_cjk_16.bin
-    └── releases/v1.0/ prebuilt esp32s3_agent_display.bin
+ESP32 ── WebSocket ── FastAPI backend ── ASR / LLM / TTS
+  │                         │
+  ├─ net_task (Core 0)      └─ Dashboard / Hook bridge
+  ├─ audio_task (Core 0)
+  ├─ lvgl_task (Core 1)     ← the only task allowed to call LVGL
+  └─ app_task / btn_boot (Core 1)
 ```
 
-### 6.4 Troubleshooting
+| Path | Contents |
+|---|---|
+| `main/` | ESP-IDF firmware: display, audio, voice, Wi-Fi/WS, BLE/AP, UI |
+| `backend/` | FastAPI, Dashboard, WS hub, ASR/LLM/TTS, Hook bridge |
+| `firmware/data/` | Font and RLE animation assets |
+| `firmware/releases/` | Prebuilt release artifacts and checksums |
+| `scripts/` | Font/animation generation and flash tools |
+| `tests/` | Backend unit tests |
 
-#### Device offline after BLE provisioning
+Audio and networking run on Core 0; LVGL may only be used by `lvgl_task`; UI work crosses tasks through a queue; large PCM and font buffers live in PSRAM.
 
-Backend defaults to `127.0.0.1:8000` — the ESP cannot reach that via WiFi. Set `AGENT_BIND_HOST=0.0.0.0` and `AGENT_API_TOKEN` in `backend/.env`, restart with `stop.bat` / `start.bat`, verify `curl http://<PC-LAN-IP>:8000/health`, and provision `HOST:` with the PC LAN IP (not `127.0.0.1`).
+## Troubleshooting
 
-#### Dashboard URL not loading
+| Symptom | What to check |
+|---|---|
+| Wi-Fi is connected but WS is offline | PC LAN IP, `AGENT_BIND_HOST`, firewall, and token; serial logs include connection/retry reasons |
+| Missing display resources | Flash `firmware/data/font_cjk_16.bin` and `firmware/data/animations.bin` separately |
+| AP does not appear | Double-press after the boot guard; automatic AP only runs before the first successful WS connection |
+| BLE does not start | Stop AP, use an S3 N16R8 with PSRAM, and inspect serial memory logs |
+| Backend is unreachable | Run `start.bat`, check `/health`, and use the PC LAN IP rather than `127.0.0.1` from the ESP |
 
-Use `http://127.0.0.1:8000/` on the PC (not `localhost` if IPv6 `::1` fails). With auth enabled, open `http://127.0.0.1:8000/?token=<token>`. Other devices must use `http://<PC-LAN-IP>:8000/`.
-
-#### Volume resets to 33% after ESP reboot
-
-Volume and TTS voice live in **`backend/settings.json`**, not ESP NVS. The backend pushes `config` on every WS connect. Save from the Dashboard slider (release to persist). See [Volume & TTS voice](#volume--tts-voice-source-of-truth).
-
-#### Garbled TTS / “Send and speak”
-
-Flash firmware with synchronous `audio_chunk` header handling in `net_ws.c`. Raise Dashboard volume if too low (amplifier hiss). Check `[tts]` lines in `backend/backend.log`.
-
-#### “AP provisioning” screen or freeze after BLE
-
-Older firmware could auto-start AP after a long BLE session while NimBLE was still running. Current firmware: 60 s grace after `APPLY`, `ble_radio_shutdown()` on apply and before AP. Reflash (see [§6.2](#62-flash)).
-
-#### `IDF_PATH is not set`
-
-Activate ESP-IDF in the same terminal before `scripts\idf_build.bat` (see [§6.2](#62-flash)), or use the VS Code ESP-IDF extension Build button.
-
----
-
-## Appendix
-
-### Emoji source
-
-[Noto Emoji Animation](https://googlefonts.github.io/noto-emoji-animation/) → `third_party/emoji-gif/`.
-
-### Vosk model
-
-Download **vosk-model-small-cn-0.22** to `backend/models/vosk-model-small-cn-0.22/` or set `VOSK_MODEL_PATH`.
-
----
-
-## License
-
-Original source in this repository is under the [MIT License](LICENSE) (Copyright [ATongHru](https://github.com/ATongHru)).
-
-Third-party components and assets (ESP-IDF, LVGL, Noto Emoji, Vosk, `edge-tts`, SimHei-derived font binary, etc.) are listed in [NOTICE](NOTICE). When redistributing firmware or the backend, include both files and comply with CC BY 4.0 attribution for emoji assets.
+Backend verification: `PYTHONPATH=backend python -m pytest -q`. Firmware verification: `idf.py build`.

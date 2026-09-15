@@ -1,86 +1,58 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大模型对话历史</title><style>:root{--bg:#080b10;--panel:#121820;--line:#2a3646;--text:#edf3fa;--muted:#8090a3;--ok:#3dcc86;--warn:#e6b23c;--accent:#7c96ff;--teal:#3ee0c5;--chip:#1c2734;--radius:12px}*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font:14px/1.5 Segoe UI,Microsoft YaHei,system-ui,sans-serif}body{padding:0 0 32px}.topbar{position:sticky;top:0;z-index:10;background:rgba(13,18,25,.92);backdrop-filter:blur(10px);border-bottom:1px solid var(--line);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;gap:12px}.brand{display:flex;flex-direction:column;gap:2px}.brand h1{margin:0;font-size:18px;font-weight:650}.brand span{color:var(--muted);font-size:12px}.topbar-actions{display:flex;align-items:center;gap:10px}.topbar button,.topbar a{color:var(--accent);text-decoration:none;font-size:13px;padding:6px 12px;border:1px solid var(--line);border-radius:999px;background:var(--chip);font-weight:550;cursor:pointer}.wrap{max-width:1100px;margin:18px auto 0;padding:0 20px;display:grid;gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px}.filters{display:grid;grid-template-columns:2fr 1fr 1fr 1fr auto auto;gap:8px;align-items:end}label{display:grid;gap:4px;color:var(--muted);font-size:12px}input,select,button{font:inherit}input,select{background:#0d141d;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:8px 10px;width:100%}button{border:0;border-radius:8px;padding:8px 14px;font-weight:650;cursor:pointer;min-height:38px;background:var(--accent);color:#0b1017}button.secondary{background:var(--chip);color:var(--text);border:1px solid var(--line)}.stats{display:flex;flex-wrap:wrap;gap:10px;color:var(--muted);font-size:13px}.stats b{color:var(--text)}.list{display:grid;gap:10px}.item{border:1px solid var(--line);border-radius:10px;padding:12px;background:#0f151d;display:grid;gap:8px}.item-head{display:flex;flex-wrap:wrap;gap:8px 14px;color:var(--muted);font-size:12px}.item-head .src{color:var(--teal);font-weight:650}.item-head .tok{color:var(--warn)}.bubble{display:grid;gap:4px}.bubble .role{font-size:12px;color:var(--muted)}.bubble.user .role{color:var(--accent)}.bubble.assistant .role{color:var(--ok)}.bubble .txt{white-space:pre-wrap;overflow-wrap:anywhere}.pager{display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap;margin-top:14px}.pager span{color:var(--muted);font-size:13px}.empty{color:var(--muted);padding:24px;text-align:center}.err{color:#ff8a93}@media (max-width:900px){.filters{grid-template-columns:1fr 1fr}}</style></head><body><header class="topbar"><div class="brand"><h1 data-i18n="chat.title">大模型对话历史</h1><span data-i18n="chat.subtitle">落盘于项目 log/llm_chat.jsonl，支持分页与关键词查询</span></div><div class="topbar-actions"><button type="button" id="lang-toggle">EN</button><a href="/" data-i18n="chat.back">&larr; 返回控制台</a></div></header><main class="wrap"><section class="card"><div class="filters"><label><span data-i18n="chat.keyword">关键词</span><input id="q" type="search" data-i18n-placeholder="chat.keyword_ph" placeholder="用户 / 助手 / 模型 / session"></label><label><span data-i18n="chat.source">来源</span><select id="source"><option value="" data-i18n="chat.all">全部</option><option value="VOICE">VOICE</option><option value="BOT">BOT</option><option value="CURSOR">CURSOR</option></select></label><label><span data-i18n="chat.date_from">起始日期</span><input id="date_from" type="date"></label><label><span data-i18n="chat.date_to">结束日期</span><input id="date_to" type="date"></label><button id="search-btn" type="button" data-i18n="chat.search">查询</button><button id="reset-btn" class="secondary" type="button" data-i18n="chat.reset">重置</button></div></section><section class="card"><div class="stats"><span id="stat-total"></span><span id="stat-tokens"></span><span id="stat-page"></span></div></section><section class="card"><div id="list" class="list"><div class="empty" data-i18n="chat.loading">加载中...</div></div><div class="pager"><button id="prev-btn" class="secondary" type="button" data-i18n="chat.prev">上一页</button><span id="pager-label">-</span><button id="next-btn" class="secondary" type="button" data-i18n="chat.next">下一页</button></div></section></main><script src="/dashboard_i18n.js"></script><script>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>大模型对话历史</title>
+<style>
+:root{--bg:#07111f;--panel:rgba(15,30,50,.9);--surface:#0a1b2f;--line:rgba(148,174,205,.16);--text:#e9f1fb;--muted:#91a5bd;--ok:#54d89d;--warn:#ffc361;--accent:#77a8ff;--teal:#4de0c0;--chip:rgba(133,168,215,.10);--radius:18px}
+*{box-sizing:border-box}html{background:var(--bg)}body{margin:0;min-height:100vh;color:var(--text);font:14px/1.55 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;letter-spacing:.01em;background:radial-gradient(900px 520px at -5% -12%,rgba(69,121,207,.22),transparent 58%),radial-gradient(760px 560px at 108% 10%,rgba(53,177,157,.12),transparent 52%),var(--bg)}
+.topbar{position:sticky;top:0;z-index:10;min-height:76px;padding:13px clamp(18px,4vw,48px);display:flex;align-items:center;justify-content:space-between;gap:18px;background:rgba(9,21,37,.82);backdrop-filter:blur(16px);border-bottom:1px solid var(--line);box-shadow:0 7px 28px rgba(0,0,0,.14)}
+.brand{position:relative;padding-left:42px;display:flex;flex-direction:column;gap:3px}.brand::before{content:"";position:absolute;left:0;top:50%;width:30px;height:30px;transform:translateY(-50%);border-radius:10px;background:linear-gradient(145deg,#8ab8ff,#4ee0c0);box-shadow:0 6px 18px rgba(77,224,192,.19)}.brand::after{content:"";position:absolute;left:10px;top:50%;width:10px;height:10px;transform:translateY(-50%);border:2px solid #07111f;border-radius:50%;box-shadow:7px 0 0 -2px #07111f}.brand h1{margin:0;font-size:17px;font-weight:720;letter-spacing:.07em}.brand span{color:#7f96b1;font-size:11px}
+.topbar-actions{display:flex;align-items:center;gap:6px}.topbar button,.topbar a{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:6px 11px;color:#bdd0eb;text-decoration:none;font-size:13px;border:1px solid transparent;border-radius:9px;background:transparent;font-weight:600;cursor:pointer;transition:background .18s ease,color .18s ease,border-color .18s ease}.topbar button:hover,.topbar a:hover{color:var(--text);background:var(--chip);border-color:var(--line)}.topbar button{color:var(--teal);border-color:rgba(77,224,192,.2);background:rgba(77,224,192,.07)}
+.wrap{max-width:1240px;margin:0 auto;padding:28px clamp(16px,3.2vw,48px) 42px;display:grid;gap:18px}.card{padding:20px;background:linear-gradient(145deg,rgba(20,39,63,.93),rgba(12,27,46,.9));border:1px solid var(--line);border-radius:var(--radius);box-shadow:0 16px 42px rgba(0,0,0,.13),inset 0 1px 0 rgba(255,255,255,.025)}
+.filter-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}.filter-head h2{margin:0;font-size:10px;font-weight:750;letter-spacing:.14em;color:#9bb0ca;text-transform:uppercase}.filter-head h2::before{content:"";display:inline-block;width:6px;height:6px;margin:0 8px 1px 0;border-radius:50%;background:var(--teal);box-shadow:0 0 11px rgba(77,224,192,.6)}.filter-head span{font-size:12px;color:var(--muted)}
+.filters{display:grid;grid-template-columns:2.25fr 1fr 1fr 1fr auto auto;gap:10px;align-items:end}label{display:grid;gap:5px;color:#8fa4bd;font-size:11px;font-weight:600}input,select,button{font:inherit}input,select{min-height:40px;padding:9px 11px;width:100%;outline:none;color:var(--text);background:rgba(6,20,35,.65);border:1px solid rgba(148,174,205,.20);border-radius:10px;transition:border-color .18s ease,box-shadow .18s ease,background .18s ease}input:focus,select:focus{border-color:rgba(119,168,255,.72);background:#0a1c31;box-shadow:0 0 0 3px rgba(119,168,255,.12)}button{min-height:40px;padding:9px 14px;border:0;border-radius:10px;background:linear-gradient(135deg,#85b4ff,#6c94eb);color:#071322;font-weight:700;cursor:pointer;white-space:nowrap;transition:transform .16s ease,filter .16s ease,box-shadow .16s ease}button:not(:disabled):hover{transform:translateY(-1px);filter:brightness(1.07)}button:disabled{opacity:.45;cursor:not-allowed}button.secondary{background:rgba(134,165,207,.09);color:#c7d6e7;border:1px solid var(--line)}
+.stats-card{padding:13px 18px}.stats{display:flex;flex-wrap:wrap;gap:8px;color:var(--muted);font-size:12px}.stats span{padding:5px 10px;border:1px solid rgba(148,174,205,.13);border-radius:999px;background:rgba(134,165,207,.06)}.stats span:first-child{color:#bcd3ff}.stats b{color:var(--text)}
+.history-card{padding:12px}.list{display:grid;gap:10px}.item{padding:16px 18px;display:grid;gap:14px;background:rgba(5,18,32,.44);border:1px solid rgba(148,174,205,.14);border-radius:14px;transition:border-color .18s ease,background .18s ease}.item:hover{border-color:rgba(119,168,255,.28);background:rgba(12,29,49,.64)}.item-head{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;color:#859bb5;font-size:11px}.item-head .src{padding:3px 8px;color:#09211d;background:rgba(77,224,192,.88);border-radius:999px;font-weight:750;letter-spacing:.05em}.item-head .tok{color:#f3bf61}.item-head .err{color:#ff93a0}
+.dialogue{display:grid;gap:10px}.bubble{position:relative;display:grid;gap:4px;padding:10px 13px 10px 15px;border-left:2px solid rgba(119,168,255,.45);background:rgba(119,168,255,.05);border-radius:0 10px 10px 0}.bubble.assistant{border-left-color:rgba(84,216,157,.56);background:rgba(84,216,157,.045)}.bubble .role{font-size:11px;font-weight:700;letter-spacing:.08em;color:var(--accent)}.bubble.assistant .role{color:var(--ok)}.bubble .txt{white-space:pre-wrap;overflow-wrap:anywhere;color:#d5e1ef;line-height:1.65}.pager{display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap;margin-top:16px}.pager span{min-width:75px;text-align:center;color:var(--muted);font-size:12px}.empty{padding:38px 18px;color:#8095ae;text-align:center}.err{color:#ff8a93}
+@media(max-width:1020px){.filters{grid-template-columns:1fr 1fr 1fr}.filters label:first-child{grid-column:span 3}}@media(max-width:640px){.topbar{padding:14px 16px;align-items:flex-start}.topbar-actions{flex-direction:column;align-items:stretch;gap:4px}.wrap{padding:18px 14px 28px;gap:14px}.card{padding:16px}.history-card{padding:8px}.filters,.filters label:first-child{grid-template-columns:1fr;grid-column:auto}.filters button{width:100%}.filter-head span{display:none}.item{padding:13px}.item-head{gap:6px 10px}.topbar a,.topbar button{font-size:12px;padding:5px 8px}}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><h1 data-i18n="chat.title">大模型对话历史</h1><span data-i18n="chat.subtitle">落盘于项目 log/llm_chat.jsonl，支持分页与关键词查询</span></div>
+  <div class="topbar-actions"><button type="button" id="lang-toggle">EN</button><a href="/" data-i18n="chat.back">&larr; 返回控制台</a></div>
+</header>
+<main class="wrap">
+  <section class="card">
+    <div class="filter-head"><h2 data-i18n="chat.filters_title">历史记录筛选</h2><span data-i18n="chat.filters_hint">查找已保存的对话</span></div>
+    <div class="filters">
+      <label><span data-i18n="chat.keyword">关键词</span><input id="q" type="search" data-i18n-placeholder="chat.keyword_ph" placeholder="用户 / 助手 / 模型 / session"></label>
+      <label><span data-i18n="chat.source">来源</span><select id="source"><option value="" data-i18n="chat.all">全部</option><option value="VOICE">VOICE</option><option value="BOT">BOT</option><option value="CURSOR">CURSOR</option></select></label>
+      <label><span data-i18n="chat.date_from">起始日期</span><input id="date_from" type="date"></label>
+      <label><span data-i18n="chat.date_to">结束日期</span><input id="date_to" type="date"></label>
+      <button id="search-btn" type="button" data-i18n="chat.search">查询</button>
+      <button id="reset-btn" class="secondary" type="button" data-i18n="chat.reset">重置</button>
+    </div>
+  </section>
+  <section class="card stats-card"><div class="stats"><span id="stat-total"></span><span id="stat-tokens"></span><span id="stat-page"></span></div></section>
+  <section class="card history-card"><div id="list" class="list"><div class="empty" data-i18n="chat.loading">加载中...</div></div><div class="pager"><button id="prev-btn" class="secondary" type="button" data-i18n="chat.prev">上一页</button><span id="pager-label">-</span><button id="next-btn" type="button" data-i18n="chat.next">下一页</button></div></section>
+</main>
+<script src="/dashboard_i18n.js?v=20260915"></script>
+<script>
 function el(id){return document.getElementById(id);}
 var t=function(key,vars){return DashI18n.t(key,vars);};
 var state={page:1,page_size:20,total:0,pages:1};
-function esc(s){
-  return String(s||'').replace(/[&<>"']/g,function(c){
-    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
-  });
-}
-function params(){
-  var p=new URLSearchParams();
-  p.set('page',String(state.page));
-  p.set('page_size',String(state.page_size));
-  var q=el('q').value.trim();
-  var source=el('source').value.trim();
-  var date_from=el('date_from').value.trim();
-  var date_to=el('date_to').value.trim();
-  if(q) p.set('q',q);
-  if(source) p.set('source',source);
-  if(date_from) p.set('date_from',date_from);
-  if(date_to) p.set('date_to',date_to);
-  return p;
-}
-function renderItem(it){
-  var tok=Number(it.total_tokens||0);
-  var pt=Number(it.prompt_tokens||0);
-  var ct=Number(it.completion_tokens||0);
-  var lat=(it.latency_ms!=null)?it.latency_ms:null;
-  var h='<article class="item"><div class="item-head">';
-  h+='<span class="src">'+esc(it.source||'-')+'</span>';
-  h+='<span>'+esc(it.ts||'-')+'</span>';
-  h+='<span>'+esc(it.model||'-')+'</span>';
-  h+='<span class="tok">tokens '+tok+' (prompt '+pt+' / completion '+ct+')</span>';
-  if(lat!=null) h+='<span>'+lat+' ms</span>';
-  h+='<span>'+esc(it.session_id||'')+'</span>';
-  if(it.error) h+='<span class="err">'+esc(it.error)+'</span>';
-  h+='</div>';
-  h+='<div class="bubble user"><div class="role">'+esc(t('role.user'))+'</div><div class="txt">'+esc(it.user||t('chat.empty_paren'))+'</div></div>';
-  h+='<div class="bubble assistant"><div class="role">'+esc(t('role.assistant'))+'</div><div class="txt">'+esc(it.assistant||t('chat.empty_paren'))+'</div></div>';
-  h+='</article>';
-  return h;
-}
-function render(data){
-  state.page=data.page;
-  state.pages=data.pages;
-  state.total=data.total;
-  el('stat-total').textContent=t('chat.total',{n:data.total});
-  el('stat-tokens').textContent=t('chat.tokens_sum',{n:data.total_tokens||0});
-  el('stat-page').textContent=t('chat.page_of',{page:data.page,pages:data.pages});
-  el('pager-label').textContent=data.page+' / '+data.pages;
-  el('prev-btn').disabled=data.page<=1;
-  el('next-btn').disabled=data.page>=data.pages;
-  var items=data.items||[];
-  if(!items.length){
-    el('list').innerHTML='<div class="empty">'+esc(t('chat.no_records'))+'</div>';
-    return;
-  }
-  el('list').innerHTML=items.map(renderItem).join('');
-}
-async function load(){
-  el('list').innerHTML='<div class="empty">'+esc(t('chat.loading'))+'</div>';
-  try{
-    var res=await fetch('/api/chat-history?'+params().toString(),{cache:'no-store'});
-    if(!res.ok) throw new Error('HTTP '+res.status);
-    render(await res.json());
-  }catch(err){
-    el('list').innerHTML='<div class="empty err">'+esc(t('chat.load_fail',{detail:err.message||err}))+'</div>';
-  }
-}
-el('search-btn').onclick=function(){state.page=1; load();};
-el('reset-btn').onclick=function(){
-  el('q').value='';
-  el('source').value='';
-  el('date_from').value='';
-  el('date_to').value='';
-  state.page=1;
-  load();
-};
-el('prev-btn').onclick=function(){if(state.page>1){state.page--; load();}};
-el('next-btn').onclick=function(){if(state.page<state.pages){state.page++; load();}};
-el('q').addEventListener('keydown',function(e){if(e.key==='Enter'){state.page=1; load();}});
-el('lang-toggle').onclick=function(){DashI18n.toggleLang();};
-DashI18n.onLangChange(function(){DashI18n.applyStatic(); load();});
-document.title=t('chat.title');
-load();
-</script></body></html>
+function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+/* Keep the token when this page is opened directly or from the dashboard. */
+(function(){var token=new URLSearchParams(location.search).get('token');if(token)localStorage.setItem('agent_api_token',token);})();
+function apiAuthHeaders(extra){var headers=Object.assign({},extra||{}),token=localStorage.getItem('agent_api_token')||'';if(token)headers.Authorization='Bearer '+token;return headers;}
+function params(){var p=new URLSearchParams();p.set('page',String(state.page));p.set('page_size',String(state.page_size));var q=el('q').value.trim(),source=el('source').value.trim(),date_from=el('date_from').value.trim(),date_to=el('date_to').value.trim();if(q)p.set('q',q);if(source)p.set('source',source);if(date_from)p.set('date_from',date_from);if(date_to)p.set('date_to',date_to);return p;}
+function renderItem(it){var tok=Number(it.total_tokens||0),pt=Number(it.prompt_tokens||0),ct=Number(it.completion_tokens||0),lat=it.latency_ms!=null?it.latency_ms:null;var h='<article class="item"><div class="item-head">';h+='<span class="src">'+esc(it.source||'-')+'</span><span>'+esc(it.ts||'-')+'</span><span>'+esc(it.model||'-')+'</span><span class="tok">tokens '+tok+' (prompt '+pt+' / completion '+ct+')</span>';if(lat!=null)h+='<span>'+lat+' ms</span>';h+='<span>'+esc(it.session_id||'')+'</span>';if(it.error)h+='<span class="err">'+esc(it.error)+'</span>';h+='</div><div class="dialogue">';h+='<div class="bubble user"><div class="role">'+esc(t('role.user'))+'</div><div class="txt">'+esc(it.user||t('chat.empty_paren'))+'</div></div>';h+='<div class="bubble assistant"><div class="role">'+esc(t('role.assistant'))+'</div><div class="txt">'+esc(it.assistant||t('chat.empty_paren'))+'</div></div></div></article>';return h;}
+function render(data){state.page=data.page;state.pages=data.pages;state.total=data.total;el('stat-total').textContent=t('chat.total',{n:data.total});el('stat-tokens').textContent=t('chat.tokens_sum',{n:data.total_tokens||0});el('stat-page').textContent=t('chat.page_of',{page:data.page,pages:data.pages});el('pager-label').textContent=data.page+' / '+data.pages;el('prev-btn').disabled=data.page<=1;el('next-btn').disabled=data.page>=data.pages;var items=data.items||[];el('list').innerHTML=items.length?items.map(renderItem).join(''):'<div class="empty">'+esc(t('chat.no_records'))+'</div>';}
+async function load(){el('list').innerHTML='<div class="empty">'+esc(t('chat.loading'))+'</div>';try{var res=await fetch('/api/chat-history?'+params().toString(),{cache:'no-store',headers:apiAuthHeaders()});if(!res.ok)throw new Error('HTTP '+res.status);render(await res.json());}catch(err){el('list').innerHTML='<div class="empty err">'+esc(t('chat.load_fail',{detail:err.message||err}))+'</div>';}}
+el('search-btn').onclick=function(){state.page=1;load();};el('reset-btn').onclick=function(){el('q').value='';el('source').value='';el('date_from').value='';el('date_to').value='';state.page=1;load();};el('prev-btn').onclick=function(){if(state.page>1){state.page--;load();}};el('next-btn').onclick=function(){if(state.page<state.pages){state.page++;load();}};el('q').addEventListener('keydown',function(e){if(e.key==='Enter'){state.page=1;load();}});el('lang-toggle').onclick=function(){DashI18n.toggleLang();};DashI18n.onLangChange(function(){DashI18n.applyStatic();load();});document.title=t('chat.title');load();
+</script>
+</body>
+</html>

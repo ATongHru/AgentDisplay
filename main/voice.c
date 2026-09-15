@@ -99,6 +99,7 @@ static bool s_stream_begin_pending;
 static int64_t s_stream_begin_us;
 static bool s_upload_meta_pending;
 static int64_t s_upload_meta_us;
+static size_t s_upload_sent;
 static char s_last_show[24];
 static vad_state_t s_vad = {.noise_rms = 0.001f, .noise_peak = 0.005f};
 static uint32_t s_last_vad_seq;
@@ -254,6 +255,7 @@ static void voice_reset_session(const char *reason)
     s_stream_failed = false;
     s_stream_begin_pending = false;
     s_upload_meta_pending = false;
+    s_upload_sent = 0;
     s_stream_sent = 0;
     s_audio_end = false;
     s_play_end_empty_us = 0;
@@ -298,6 +300,8 @@ static void finalize_recording(bool maxed, bool silenced)
     s_upload_ok = false;
     s_upload_done = false;
     s_upload_pending = true;
+    s_upload_meta_pending = false;
+    s_upload_sent = 0;
     s_upload_start_us = now_us();
     s_phase = VOICE_UPLOADING;
     post_voice_ui();
@@ -763,12 +767,13 @@ void voice_net_poll(void)
                  (int)ok);
         s_stream_active = false;
     } else {
-        /* 回退整包上传：元信息异步握手，session 就绪后再发 PCM。 */
+        /* 回退上传仍按 4KB 分帧。后端按 audio_len 聚合，避免 app 任务在单次
+         * send_bin 中长时间阻塞，也不等待只有收齐音频后才会返回的 session。 */
         if (!s_upload_meta_pending) {
-            s_session_id[0] = '\0';
             if (net_ws_audio_session_start(false, pcm_len)) {
                 s_upload_meta_pending = true;
                 s_upload_meta_us = now_us();
+                s_upload_sent = 0;
             } else {
                 s_upload_ok = false;
                 s_upload_pending = false;
@@ -776,23 +781,21 @@ void voice_net_poll(void)
             }
             return;
         }
-        if (!net_ws_audio_session_poll(s_session_id, sizeof(s_session_id))) {
-            if (now_us() - s_upload_meta_us > VOICE_SESSION_WAIT_US) {
-                ESP_LOGW(TAG, "upload session timeout len=%u", (unsigned)pcm_len);
-                s_upload_meta_pending = false;
-                s_upload_ok = false;
-                s_upload_pending = false;
-                s_upload_done = true;
+        if (s_upload_sent < pcm_len) {
+            size_t part = pcm_len - s_upload_sent;
+            if (part > (size_t)VOICE_UPLOAD_CHUNK) {
+                part = (size_t)VOICE_UPLOAD_CHUNK;
             }
+            if (!net_ws_send_audio_binary(pcm + s_upload_sent, part)) {
+                /* 保持偏移不变，下一次 app loop 重试；总超时由 voice_loop 收敛。 */
+                return;
+            }
+            s_upload_sent += part;
             return;
         }
         s_upload_meta_pending = false;
-        ok = net_ws_send_audio_binary(pcm, pcm_len);
-        if (ok) {
-            ESP_LOGI(TAG, "uploaded %u bytes session=%s", (unsigned)pcm_len, s_session_id);
-        } else {
-            ESP_LOGW(TAG, "upload failed len=%u", (unsigned)pcm_len);
-        }
+        ok = true;
+        ESP_LOGI(TAG, "uploaded %u bytes in chunks", (unsigned)pcm_len);
     }
 
     s_upload_ok = ok;

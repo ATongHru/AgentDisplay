@@ -44,6 +44,7 @@ static SemaphoreHandle_t s_ws_tx;
 /* 文本帧队列：WS 回调只入队，net 任务消化（cJSON/NVS/UI 等重活移出回调）。 */
 #define WS_TEXT_Q_LEN 8
 #define WS_TEXT_MAX_BYTES 2048
+#define WS_AUDIO_SEND_TIMEOUT_MS 50
 typedef struct {
     char *data;
     int len;
@@ -69,12 +70,16 @@ static size_t s_usb_len;
 static bool s_usb_ready;
 static bool s_ble_paused;
 static bool s_ap_paused;
-static uint32_t s_profile_try_ms;
 static uint32_t s_boot_ms;
 static bool s_ap_fallback_done;
 static bool s_ws_ever_ok;
 static bool s_prov_applied;
-#define PROFILE_ROTATE_MS 15000u
+/* The client stop API waits for an in-flight connect, so this must remain
+ * below the 5 s task-watchdog window. */
+#define WS_CONNECT_TIMEOUT_MS 3000
+#define PROFILE_WS_FAILURES_BEFORE_ROTATE 2u
+static volatile uint8_t s_ws_failures;
+static volatile bool s_ws_stop_requested;
 #define AP_FALLBACK_MS 30000u
 #define AP_FALLBACK_AFTER_PROV_MS 60000u
 static esp_netif_t *s_sta;
@@ -144,7 +149,8 @@ static void schedule_wifi_retry(void)
     esp_timer_start_once(s_wifi_retry_timer, (uint64_t)s_wifi_retry_ms * 1000);
     ESP_LOGI(TAG, "wifi retry in %lu ms", (unsigned long)s_wifi_retry_ms);
     if (s_wifi_retry_ms < 60000) {
-        s_wifi_retry_ms *= 2;
+        uint32_t next_retry_ms = s_wifi_retry_ms * 2;
+        s_wifi_retry_ms = next_retry_ms > 60000 ? 60000 : next_retry_ms;
     }
 }
 
@@ -176,7 +182,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_wifi = true;
         xEventGroupSetBits(s_events, WIFI_OK);
         ESP_LOGI(TAG, "got ip " IPSTR, IP2STR(&event->ip_info.ip));
-        s_profile_try_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        s_ws_failures = 0;
         esp_sntp_stop();
         esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
         esp_sntp_setservername(0, "ntp.aliyun.com");
@@ -500,6 +506,7 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     esp_websocket_event_data_t *evt = (esp_websocket_event_data_t *)data;
     if (id == WEBSOCKET_EVENT_CONNECTED) {
         s_ws_on = true;
+        s_ws_failures = 0;
         s_ws_ever_ok = true;
         s_ws_up_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
         s_last_rx_ms = s_ws_up_ms;
@@ -516,6 +523,11 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_ws_up_ms = 0;
         s_expect_audio = false;
         xEventGroupClearBits(s_events, WS_OK);
+        if (!s_ws_stop_requested && s_wifi && s_ws_failures < 255u) {
+            s_ws_failures++;
+            ESP_LOGW(TAG, "ws failure %u/%u", (unsigned)s_ws_failures,
+                     (unsigned)PROFILE_WS_FAILURES_BEFORE_ROTATE);
+        }
         voice_on_ws_lost();
         ui_post_link_state(net_usb_ready(), s_wifi, false, voice_is_listening(), audio_playback_is_active(), s_rssi);
     } else if (id == WEBSOCKET_EVENT_DATA) {
@@ -606,9 +618,16 @@ static void stop_ws(void)
     if (!s_ws) {
         return;
     }
-    esp_websocket_client_stop(s_ws);
+    /* esp_websocket_client_stop waits for its task to leave connect(). Mark
+     * planned teardown so its DISCONNECTED event is not counted as a failure. */
+    s_ws_stop_requested = true;
+    esp_err_t err = esp_websocket_client_stop(s_ws);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ws stop %s", esp_err_to_name(err));
+    }
     esp_websocket_client_destroy(s_ws);
     s_ws = NULL;
+    s_ws_stop_requested = false;
     s_ws_on = false;
     s_expect_audio = false;
     if (s_events) {
@@ -627,7 +646,7 @@ static void start_ws(void)
     esp_websocket_client_config_t cfg = {
         .uri = s_ws_uri,
         .reconnect_timeout_ms = WS_RECONNECT_MS,
-        .network_timeout_ms = 10000,
+        .network_timeout_ms = WS_CONNECT_TIMEOUT_MS,
         .buffer_size = 8192,
     };
     s_ws = esp_websocket_client_init(&cfg);
@@ -896,19 +915,15 @@ void net_loop(void)
         }
     }
 
-    /* Round-robin saved BLE profiles until WiFi+WS are both up. */
-    if (agent_cfg_profile_count() > 1 && !voice_net_busy()) {
-        uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-        if (net_ws_ready()) {
-            s_profile_try_ms = now;
-        } else if (s_profile_try_ms == 0) {
-            s_profile_try_ms = now;
-        } else if ((now - s_profile_try_ms) >= PROFILE_ROTATE_MS) {
-            if (agent_cfg_next_profile()) {
-                ESP_LOGW(TAG, "profile rotate -> idx=%u", (unsigned)agent_cfg_active_index());
-                (void)net_apply_config();
-            }
-            s_profile_try_ms = now;
+    /* Rotate only after completed WS failures. The previous time-based path
+     * could tear down a client while its connect() call still blocked. */
+    if (agent_cfg_profile_count() > 1 && !voice_net_busy() &&
+        s_ws_failures >= PROFILE_WS_FAILURES_BEFORE_ROTATE) {
+        s_ws_failures = 0;
+        if (agent_cfg_next_profile()) {
+            ESP_LOGW(TAG, "profile rotate after WS failures -> idx=%u",
+                     (unsigned)agent_cfg_active_index());
+            (void)net_apply_config();
         }
     }
 
@@ -1021,7 +1036,8 @@ bool net_ws_send_audio_binary(const uint8_t *pcm, size_t pcm_len)
     if (!net_ws_ready() || !pcm || pcm_len == 0) {
         return false;
     }
-    return ws_send_bin((const char *)pcm, (int)pcm_len, 5000);
+    /* app 任务调用：发送必须有很短上界，失败由 voice 状态机在后续轮次重试。 */
+    return ws_send_bin((const char *)pcm, (int)pcm_len, WS_AUDIO_SEND_TIMEOUT_MS);
 }
 
 bool net_ws_send_audio_end(const char *session_id, size_t total_bytes, bool discard)

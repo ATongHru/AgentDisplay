@@ -41,11 +41,19 @@ static bool on_color_trans_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_e
     return hp_woken == pdTRUE;
 }
 
-/* 等本次 DMA 完成；超时兜底防死锁（40MHz 下整缓冲约 4ms）。 */
+/* 每次提交前清掉异常遗留的信号；之后必须等本次 DMA 真正完成。
+ * 不在超时后放行缓冲，否则迟到的回调会令下一帧误消费旧信号。 */
+static void begin_tx(void)
+{
+    while (s_tx_done && xSemaphoreTake(s_tx_done, 0) == pdTRUE) {
+        ESP_LOGW(TAG, "discard stale tx completion");
+    }
+}
+
 static void wait_tx_done(void)
 {
-    if (s_tx_done && xSemaphoreTake(s_tx_done, pdMS_TO_TICKS(100)) != pdTRUE) {
-        ESP_LOGW(TAG, "tx done timeout");
+    if (s_tx_done) {
+        xSemaphoreTake(s_tx_done, portMAX_DELAY);
     }
 }
 
@@ -55,7 +63,8 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
     const int y1 = area->y1;
     const int x2 = area->x2;
     const int y2 = area->y2;
-    esp_lcd_panel_draw_bitmap(s_panel, x1, y1, x2 + 1, y2 + 1, px_map);
+    begin_tx();
+    ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(s_panel, x1, y1, x2 + 1, y2 + 1, px_map));
     /* DMA 完成后再放行 LVGL 复用缓冲，否则可能花屏。 */
     wait_tx_done();
     lv_display_flush_ready(disp);
@@ -66,7 +75,11 @@ void display_blit_rgb565(const uint8_t *buf, int x, int y, int w, int h)
     if (!s_panel || !buf) {
         return;
     }
-    esp_lcd_panel_draw_bitmap(s_panel, x, y, x + w, y + h, buf);
+    begin_tx();
+    if (esp_lcd_panel_draw_bitmap(s_panel, x, y, x + w, y + h, buf) != ESP_OK) {
+        ESP_LOGE(TAG, "face blit submit failed");
+        return;
+    }
     /* 与 LVGL flush 串行共用信号量：所有绘制都在 lvgl 任务上下文，
      * 等待完成后再让调用方复用帧缓冲。 */
     wait_tx_done();
@@ -75,6 +88,9 @@ void display_blit_rgb565(const uint8_t *buf, int x, int y, int w, int h)
 esp_err_t display_init(void)
 {
     s_tx_done = xSemaphoreCreateBinary();
+    if (!s_tx_done) {
+        return ESP_ERR_NO_MEM;
+    }
     spi_bus_config_t buscfg = {
         .sclk_io_num = PIN_LCD_SCLK,
         .mosi_io_num = PIN_LCD_MOSI,

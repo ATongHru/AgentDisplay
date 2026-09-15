@@ -8,6 +8,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "net_ws.h"
 #include "ui.h"
 
 static const char *TAG = "btn_boot";
@@ -17,6 +18,7 @@ static const char *TAG = "btn_boot";
 #define BOOT_GRACE_MS 2000
 #define POLL_MS 20
 #define RELEASE_DEBOUNCE_MS 80
+#define MULTI_PRESS_GAP_MS 600
 
 static int64_t s_boot_ms;
 static TaskHandle_t s_task;
@@ -52,6 +54,19 @@ static void kick_ble_start(void)
     }
 }
 
+static void kick_ap_start(void)
+{
+    if (s_ble_starting) {
+        ESP_LOGI(TAG, "AP start skipped: BLE is starting");
+        return;
+    }
+    ESP_LOGI(TAG, "starting AP provision");
+    esp_err_t err = net_force_ap_prov();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "AP provision start failed %s", esp_err_to_name(err));
+    }
+}
+
 static void btn_task(void *arg)
 {
     (void)arg;
@@ -60,6 +75,8 @@ static void btn_task(void *arg)
     bool fired_diag = false;
     int64_t press_start = 0;
     int64_t release_at = 0;
+    int64_t last_short_release = 0;
+    uint8_t short_press_count = 0;
     int last_level = 1;
     int64_t last_log_ms = 0;
 
@@ -77,6 +94,23 @@ static void btn_task(void *arg)
         if (level != last_level) {
             ESP_LOGI(TAG, "GPIO%d -> %d (%s)", PIN_BOOT, level, down ? "pressed" : "released");
             last_level = level;
+        }
+
+        /* Wait for the inter-press gap so a double press is not triggered
+         * before the user completes a possible triple press. */
+        if (!pressed && short_press_count > 0 &&
+            (now - last_short_release) >= MULTI_PRESS_GAP_MS) {
+            if (short_press_count == 2) {
+                ESP_LOGI(TAG, "BOOT double-press -> AP provision");
+                kick_ap_start();
+            } else if (short_press_count == 3) {
+                ESP_LOGI(TAG, "BOOT triple-press -> BLE provision");
+                kick_ble_start();
+            } else {
+                ESP_LOGI(TAG, "BOOT %u short presses ignored", (unsigned)short_press_count);
+            }
+            short_press_count = 0;
+            last_short_release = 0;
         }
 
         if (down) {
@@ -107,7 +141,18 @@ static void btn_task(void *arg)
                 release_at = now;
             } else if ((now - release_at) >= RELEASE_DEBOUNCE_MS) {
                 if (!fired) {
-                    ESP_LOGI(TAG, "BOOT short press ignored (%lld ms)", (long long)(now - press_start));
+                    int64_t held_ms = now - press_start;
+                    if (last_short_release != 0 &&
+                        (now - last_short_release) >= MULTI_PRESS_GAP_MS) {
+                        /* A very slow next press starts a fresh sequence. */
+                        short_press_count = 0;
+                    }
+                    if (short_press_count < 255u) {
+                        short_press_count++;
+                    }
+                    last_short_release = now;
+                    ESP_LOGI(TAG, "BOOT short press %u (%lld ms), waiting %d ms",
+                             (unsigned)short_press_count, (long long)held_ms, MULTI_PRESS_GAP_MS);
                 }
                 pressed = false;
                 fired = false;
@@ -144,4 +189,3 @@ esp_err_t btn_boot_init(void)
     }
     return err;
 }
-
