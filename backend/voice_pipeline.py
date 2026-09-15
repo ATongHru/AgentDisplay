@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import threading
 import time
 from typing import Callable
 
@@ -16,13 +15,15 @@ from settings_store import get_volume_percent, get_tts_voice
 from tts_sapi import is_local_voice, synth_local_pcm
 from voice_session import SessionPhase, VoiceSession, session_store
 
-VOICE_TTS = os.getenv("VOICE_TTS", "1").strip() not in {"0", "false", "False", ""}
-# Same edge-tts engine; faster speech shortens synthesis + transfer.
+VOICE_TTS = os.getenv("VOICE_TTS", "0").strip() not in {"0", "false", "False", ""}
 TTS_RATE = os.getenv("TTS_RATE", "+20%").strip() or "+20%"
 
 TranscriptFn = Callable[..., None]
 PushFn = Callable[..., None]
 AppendFn = Callable[..., None]
+
+_loop: asyncio.AbstractEventLoop | None = None
+_running_tasks: dict[str, asyncio.Task] = {}
 
 
 class _DeltaCoalescer:
@@ -32,28 +33,30 @@ class _DeltaCoalescer:
         self._min_sec = min_sec
         self._buf = ""
         self._last = 0.0
-        self._lock = threading.Lock()
 
     def add(self, delta: str) -> None:
         if not delta:
             return
-        with self._lock:
-            self._buf += delta
-            now = time.monotonic()
-            if len(self._buf) >= self._min_chars or now - self._last >= self._min_sec:
-                self._emit_locked()
+        now = time.monotonic()
+        self._buf += delta
+        if len(self._buf) >= self._min_chars or now - self._last >= self._min_sec:
+            self._emit()
 
     def flush(self) -> None:
-        with self._lock:
-            self._emit_locked()
+        self._emit()
 
-    def _emit_locked(self) -> None:
+    def _emit(self) -> None:
         if not self._buf:
             return
         text = self._buf
         self._buf = ""
         self._last = time.monotonic()
         self._flush_fn(text)
+
+
+def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
+    global _loop
+    _loop = loop
 
 
 def warmup() -> None:
@@ -67,7 +70,7 @@ def warmup() -> None:
 def transcribe_session_pcm(session: VoiceSession) -> str:
     session.phase = SessionPhase.ASR
     return transcribe_pcm(
-        session.pcm_data,
+        bytes(session.pcm_data),
         sample_rate=session.sample_rate,
         channels=session.channels,
         bit_depth=session.bit_depth,
@@ -75,7 +78,6 @@ def transcribe_session_pcm(session: VoiceSession) -> str:
 
 
 def _split_tts_parts(text: str) -> list[str]:
-    """Split reply into short clauses so first audio can start early."""
     text = (text or "").strip()
     if not text:
         return []
@@ -125,7 +127,7 @@ async def tts_to_pcm(text: str) -> bytes:
     if is_local_voice(preferred):
         try:
             pcm = await asyncio.to_thread(synth_local_pcm, text, preferred)
-        except Exception as exc:
+        except OSError as exc:
             print(f"[tts] {preferred} sapi failed ({exc})")
             return b""
         volume = get_volume_percent()
@@ -168,7 +170,7 @@ async def tts_to_pcm(text: str) -> bytes:
         seen.add(key)
         try:
             return await _synth(voice, rate)
-        except Exception as exc:
+        except (RuntimeError, OSError, TimeoutError) as exc:
             last_exc = exc
             print(f"[tts] {voice} rate={rate} failed ({exc})")
             await asyncio.sleep(0.25)
@@ -177,7 +179,6 @@ async def tts_to_pcm(text: str) -> bytes:
 
 
 async def synthesize_to_session(session: VoiceSession, text: str) -> int:
-    """Stream sentence-level TTS into the session so WS pump can start early."""
     parts = _split_tts_parts(text)
     total = 0
     if not parts:
@@ -222,199 +223,199 @@ def _mp3_to_pcm16k_mono(mp3: bytes) -> bytes:
     return bytes(samples)
 
 
-def run_pipeline(
+async def run_pipeline(
     session_id: str,
     push_event: PushFn,
     on_transcript: TranscriptFn | None,
     on_done: Callable[[], None] | None = None,
     push_append: AppendFn | None = None,
 ) -> None:
-    async def _run():
-        session = session_store.get(session_id)
-        if session is None:
-            return
-        try:
-            print(
-                f"[voice] session {session_id} pcm={len(session.pcm_data)} "
-                f"sr={session.sample_rate} ch={session.channels}"
-            )
-            push_event("THINKING", "正在识别", "VOICE")
-            if session.asr_ready and session.asr_text:
-                asr_text = session.asr_text.strip()
-                print(f"[voice] asr prefilled session={session_id} text={asr_text!r}")
-            else:
-                asr_text = await asyncio.to_thread(transcribe_session_pcm, session)
-            if not asr_text:
-                session.mark_done()
-                push_event("IDLE", "没听清，请再说一次", "VOICE")
-                if on_transcript:
-                    on_transcript(session_id, "")
-                print(f"[voice] asr empty {session_id}, ask retry")
-                return
-            session.set_asr(asr_text)
+    session = session_store.get(session_id)
+    if session is None:
+        return
+    try:
+        print(
+            f"[voice] session {session_id} pcm={len(session.pcm_data)} "
+            f"sr={session.sample_rate} ch={session.channels}"
+        )
+        push_event("THINKING", "正在识别", "VOICE")
+        if session.asr_ready and session.asr_text:
+            asr_text = session.asr_text.strip()
+            print(f"[voice] asr prefilled session={session_id} text={asr_text!r}")
+        else:
+            asr_text = await asyncio.to_thread(transcribe_session_pcm, session)
+        if not asr_text:
+            session.mark_done()
+            push_event("IDLE", "没听清，请再说一次", "VOICE")
             if on_transcript:
-                on_transcript(session_id, asr_text, "user")
-            push_event("THINKING", asr_text, "VOICE", "user")
+                on_transcript(session_id, "")
+            print(f"[voice] asr empty {session_id}, ask retry")
+            return
+        session.set_asr(asr_text)
+        if on_transcript:
+            on_transcript(session_id, asr_text, "user")
+        push_event("THINKING", asr_text, "VOICE", "user")
 
-            if not llm_configured():
-                session.mark_done()
-                push_event("IDLE", asr_text, "VOICE")
-                print(f"[voice] asr {session_id}: {asr_text}")
-                return
+        if not llm_configured():
+            session.mark_done()
+            push_event("IDLE", asr_text, "VOICE")
+            print(f"[voice] asr {session_id}: {asr_text}")
+            return
 
-            last = ""
-            started = False
-            tts_q: asyncio.Queue[str | None] = asyncio.Queue()
-            tts_idx = 0
+        last = ""
+        started = False
+        tts_q: asyncio.Queue[str | None] = asyncio.Queue()
+        tts_idx = 0
 
-            def take_ready(full: str, final: bool) -> list[str]:
-                nonlocal tts_idx
-                chunk = full[tts_idx:]
-                last_cut = 0
-                out: list[str] = []
-                for i, ch in enumerate(chunk):
-                    if ch in "。！？!?；;\n":
-                        piece = chunk[last_cut : i + 1].strip()
-                        if len(piece) >= 2:
-                            out.append(piece)
-                            last_cut = i + 1
-                if final:
-                    piece = chunk[last_cut:].strip()
-                    if _tts_speakable(piece) and len(piece) >= 2:
+        def take_ready(full: str, final: bool) -> list[str]:
+            nonlocal tts_idx
+            chunk = full[tts_idx:]
+            last_cut = 0
+            out: list[str] = []
+            for i, ch in enumerate(chunk):
+                if ch in "。！？!?；;\n":
+                    piece = chunk[last_cut : i + 1].strip()
+                    if len(piece) >= 2:
                         out.append(piece)
-                        last_cut = len(chunk)
-                tts_idx += last_cut
-                return out
+                        last_cut = i + 1
+            if final:
+                piece = chunk[last_cut:].strip()
+                if _tts_speakable(piece) and len(piece) >= 2:
+                    out.append(piece)
+                    last_cut = len(chunk)
+            tts_idx += last_cut
+            return out
 
-            async def tts_worker() -> int:
-                total = 0
-                while True:
-                    part = await tts_q.get()
-                    if part is None:
-                        break
-                    t0 = time.monotonic()
-                    try:
-                        pcm = await tts_to_pcm(part)
-                    except Exception as exc:
-                        print(f"[tts] skip part {part[:24]!r}: {exc}")
-                        continue
-                    dt = time.monotonic() - t0
-                    if not pcm:
-                        continue
-                    session.append_tts_pcm(pcm)
-                    total += len(pcm)
-                    print(
-                        f"[tts] live chars={len(part)} pcm={len(pcm)} "
-                        f"in {dt:.2f}s queued={total}"
-                    )
-                return total
+        async def tts_worker() -> int:
+            total = 0
+            while True:
+                part = await tts_q.get()
+                if part is None:
+                    break
+                t0 = time.monotonic()
+                try:
+                    pcm = await tts_to_pcm(part)
+                except (RuntimeError, OSError, TimeoutError) as exc:
+                    print(f"[tts] skip part {part[:24]!r}: {exc}")
+                    continue
+                dt = time.monotonic() - t0
+                if not pcm:
+                    continue
+                session.append_tts_pcm(pcm)
+                total += len(pcm)
+                print(
+                    f"[tts] live chars={len(part)} pcm={len(pcm)} "
+                    f"in {dt:.2f}s queued={total}"
+                )
+            return total
 
-            def emit_delta(delta: str) -> None:
+        def emit_delta(delta: str) -> None:
+            if push_append:
+                push_append(delta, "VOICE", False)
+
+        coalescer = _DeltaCoalescer(emit_delta)
+        worker = asyncio.create_task(tts_worker()) if VOICE_TTS else None
+
+        def on_partial(full: str) -> None:
+            nonlocal last, started
+            session.append_llm(full)
+            delta = full[len(last) :] if full.startswith(last) else full
+            last = full
+            if not delta:
+                return
+            if not started:
+                started = True
                 if push_append:
-                    push_append(delta, "VOICE", False)
+                    push_append("", "VOICE", True)
+            coalescer.add(delta)
+            if VOICE_TTS:
+                for part in take_ready(full, False):
+                    tts_q.put_nowait(part)
 
-            coalescer = _DeltaCoalescer(emit_delta)
-            worker = asyncio.create_task(tts_worker()) if VOICE_TTS else None
-
-            def on_partial(full: str) -> None:
-                nonlocal last, started
-                session.append_llm(full)
-                delta = full[len(last):] if full.startswith(last) else full
-                last = full
-                if not delta:
-                    return
-                if not started:
-                    started = True
-                    if push_append:
-                        push_append("", "VOICE", True)
-                coalescer.add(delta)
-                if VOICE_TTS:
-                    for part in take_ready(full, False):
-                        tts_q.put_nowait(part)
-
-            try:
-                history = chat_context.history_for_llm()
-                llm_result = await llm_chat(asr_text, on_partial, history=history)
-                coalescer.flush()
-                if isinstance(llm_result, dict):
-                    reply = (llm_result.get("text") or "").strip()
-                    usage = llm_result.get("usage") or {}
-                    model = llm_result.get("model") or ""
-                    latency_ms = llm_result.get("latency_ms")
-                else:
-                    reply = str(llm_result or "").strip()
-                    usage, model, latency_ms = {}, "", None
-                if not reply:
-                    append_record(
-                        user=asr_text,
-                        assistant="",
-                        model=model,
-                        usage=usage,
-                        source="VOICE",
-                        session_id=session_id,
-                        latency_ms=latency_ms,
-                        error="LLM 无回复",
-                    )
-                    session.set_error("LLM 无回复")
-                    push_event("ERROR", "LLM 无回复", "VOICE")
-                    return
-                chat_context.add_turn(asr_text, reply)
+        try:
+            history = chat_context.history_for_llm()
+            llm_result = await llm_chat(asr_text, on_partial, history=history)
+            coalescer.flush()
+            if isinstance(llm_result, dict):
+                reply = (llm_result.get("text") or "").strip()
+                usage = llm_result.get("usage") or {}
+                model = llm_result.get("model") or ""
+                latency_ms = llm_result.get("latency_ms")
+            else:
+                reply = str(llm_result or "").strip()
+                usage, model, latency_ms = {}, "", None
+            if not reply:
                 append_record(
                     user=asr_text,
-                    assistant=reply,
+                    assistant="",
                     model=model,
                     usage=usage,
                     source="VOICE",
                     session_id=session_id,
                     latency_ms=latency_ms,
+                    error="LLM 无回复",
                 )
-                session.append_llm(reply)
-                if on_transcript:
-                    on_transcript(session_id, reply, "assistant")
-                if push_append and reply and not started:
-                    # Non-streaming LLM: show the full reply once. Do not reset after
-                    # deltas — that jumped the 2-line caption back to the beginning.
-                    push_append(reply, "VOICE", True, "assistant")
-                tok = int((usage or {}).get("total_tokens") or 0)
-                print(f"[voice] llm {session_id}: tokens={tok} latency_ms={latency_ms} {reply[:80]}")
-                if not VOICE_TTS:
-                    session.mark_done()
-                    if not started:
-                        push_event("IDLE", reply, "VOICE")
-                    return
-                for part in take_ready(reply, True):
-                    await tts_q.put(part)
-                await tts_q.put(None)
-                total = await worker
-                session.finish_tts()
-                print(f"[voice] session {session_id} ready audio={total} bytes (streamed)")
-            finally:
-                if worker is not None and not worker.done():
-                    tts_q.put_nowait(None)
-                    try:
-                        await worker
-                    except Exception:
-                        pass
-                session = session_store.get(session_id)
-                if session is not None and VOICE_TTS:
-                    session.finish_tts()
-        except Exception as exc:
-            import traceback
-
-            print(f"[voice] session {session_id} failed: {exc}")
-            traceback.print_exc()
-            session = session_store.get(session_id)
-            if session:
-                session.set_error(str(exc))
-            detail = str(exc).strip().replace("\n", " ")
-            if len(detail) > 80:
-                detail = detail[:77] + "..."
-            push_event("ERROR", f"处理失败：{detail}" if detail else "处理失败", "VOICE")
+                session.set_error("LLM 无回复")
+                push_event("ERROR", "LLM 无回复", "VOICE")
+                return
+            chat_context.add_turn(asr_text, reply)
+            append_record(
+                user=asr_text,
+                assistant=reply,
+                model=model,
+                usage=usage,
+                source="VOICE",
+                session_id=session_id,
+                latency_ms=latency_ms,
+            )
+            session.append_llm(reply)
+            if on_transcript:
+                on_transcript(session_id, reply, "assistant")
+            if push_append and reply and not started:
+                push_append(reply, "VOICE", True, "assistant")
+            tok = int((usage or {}).get("total_tokens") or 0)
+            print(f"[voice] llm {session_id}: tokens={tok} latency_ms={latency_ms} {reply[:80]}")
+            if not VOICE_TTS:
+                session.mark_done()
+                if not started:
+                    push_event("IDLE", reply, "VOICE")
+                return
+            for part in take_ready(reply, True):
+                await tts_q.put(part)
+            await tts_q.put(None)
+            total = await worker
+            session.finish_tts()
+            print(f"[voice] session {session_id} ready audio={total} bytes (streamed)")
         finally:
-            if on_done:
-                on_done()
+            if worker is not None and not worker.done():
+                tts_q.put_nowait(None)
+                try:
+                    await worker
+                except (asyncio.CancelledError, RuntimeError):
+                    pass
+            session = session_store.get(session_id)
+            if session is not None and VOICE_TTS:
+                session.finish_tts()
+    except asyncio.CancelledError:
+        session = session_store.get(session_id)
+        if session is not None:
+            session.mark_done()
+        raise
+    except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
+        import traceback
 
-    asyncio.run(_run())
+        print(f"[voice] session {session_id} failed: {exc}")
+        traceback.print_exc()
+        session = session_store.get(session_id)
+        if session:
+            session.set_error(str(exc))
+        detail = str(exc).strip().replace("\n", " ")
+        if len(detail) > 80:
+            detail = detail[:77] + "..."
+        push_event("ERROR", f"处理失败：{detail}" if detail else "处理失败", "VOICE")
+    finally:
+        if on_done:
+            on_done()
 
 
 def start_pipeline(
@@ -423,10 +424,41 @@ def start_pipeline(
     on_transcript: TranscriptFn | None = None,
     on_done: Callable[[], None] | None = None,
     push_append: AppendFn | None = None,
-) -> None:
-    threading.Thread(
-        target=run_pipeline,
-        args=(session_id, push_event, on_transcript, on_done, push_append),
-        daemon=True,
-        name=f"voice-{session_id}",
-    ).start()
+) -> asyncio.Task | None:
+    loop = _loop
+    if loop is None:
+        raise RuntimeError("voice pipeline event loop not bound")
+
+    async def _wrapped() -> None:
+        try:
+            await run_pipeline(
+                session_id,
+                push_event,
+                on_transcript,
+                on_done,
+                push_append,
+            )
+        finally:
+            _running_tasks.pop(session_id, None)
+
+    task = loop.create_task(_wrapped(), name=f"voice-{session_id}")
+    _running_tasks[session_id] = task
+    return task
+
+
+def cancel_pipeline(session_id: str) -> bool:
+    task = _running_tasks.pop(session_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+    session = session_store.get(session_id)
+    if session is not None:
+        session.mark_done()
+    session_store.delete(session_id)
+    return task is not None
+
+
+def cancel_all_pipelines() -> int:
+    session_ids = list(_running_tasks.keys())
+    for session_id in session_ids:
+        cancel_pipeline(session_id)
+    return len(session_ids)

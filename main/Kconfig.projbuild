@@ -33,6 +33,13 @@ menu "Agent Display"
         string "Backend WebSocket URL"
         default ""
 
+    config AGENT_WS_TOKEN
+        string "Backend WebSocket API token"
+        default ""
+        help
+            与后端 AGENT_API_TOKEN 一致；连接时附加为 ?token=。
+            留空表示不鉴权（本地 127.0.0.1 默认场景）。
+
     config AGENT_VOICE_HW
         bool "Enable PDM mic + I2S amp"
         default y

@@ -44,6 +44,7 @@ static const ble_uuid128_t s_chr_tx_uuid =
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_tx_val_handle;
 static bool s_nimble_ready;
+static bool s_nimble_started;
 static bool s_active;
 static bool s_stop_req;
 static bool s_apply_done;
@@ -230,6 +231,15 @@ static void handle_line(const char *line_in)
         return;
     }
 
+    if (strncmp(line, "TOKEN:", 6) == 0) {
+        if (agent_cfg_set_token(line + 6) != ESP_OK) {
+            notify_text("ERR token");
+            return;
+        }
+        notify_text("OK token");
+        return;
+    }
+
     if (strncmp(line, "IP:", 3) == 0) {
         if (agent_cfg_set_ip(line + 3) != ESP_OK) {
             notify_text("ERR ip");
@@ -371,7 +381,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
             ESP_LOGI(TAG, "connected handle=%u", s_conn_handle);
-            notify_text("OK ready WIFI:/HOST:/IP:/MASK:/GW:/GET/LIST/APPLY");
+            notify_text("OK ready WIFI:/HOST:/TOKEN:/IP:/MASK:/GW:/GET/LIST/APPLY");
         } else {
             start_advertise();
         }
@@ -421,10 +431,30 @@ static void host_task(void *param)
     nimble_port_freertos_deinit();
 }
 
+void ble_radio_shutdown(void)
+{
+    if (!s_nimble_started) {
+        return;
+    }
+    ble_gap_adv_stop();
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    }
+    int rc = nimble_port_stop();
+    if (rc == 0) {
+        nimble_port_deinit();
+    } else {
+        ESP_LOGW(TAG, "nimble_port_stop rc=%d", rc);
+    }
+    s_nimble_started = false;
+    s_nimble_ready = false;
+    ESP_LOGI(TAG, "nimble shutdown");
+}
+
 static esp_err_t ensure_nimble(void)
 {
-    static bool started;
-    if (started) {
+    if (s_nimble_started) {
         return ESP_OK;
     }
     if (!s_lock) {
@@ -484,7 +514,7 @@ static esp_err_t ensure_nimble(void)
         ESP_LOGW(TAG, "name_set rc=%d", rc);
     }
     nimble_port_freertos_init(host_task);
-    started = true;
+    s_nimble_started = true;
     ESP_LOGI(TAG, "nimble started");
     return ESP_OK;
 }
@@ -547,7 +577,9 @@ void ble_prov_stop(void)
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     }
     ESP_LOGI(TAG, "provision stopped%s", s_apply_done ? " after apply" : "");
-    if (!s_apply_done) {
+    if (s_apply_done) {
+        ble_radio_shutdown();
+    } else {
         net_resume_after_ble();
     }
 }

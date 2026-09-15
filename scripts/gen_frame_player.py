@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import argparse
 import struct
+import sys
 from pathlib import Path
 
 from PIL import Image
@@ -12,6 +14,7 @@ root = Path(__file__).resolve().parents[1]
 source_dir = root / "third_party" / "emoji-gif"
 out_bin = root / "firmware" / "data" / "animations.bin"
 out_size = root / "main" / "anim_size.h"
+ANIM_PARTITION_MAX = 0x470000
 names = [
     "idle", "thinking", "coding", "reading", "testing", "waiting",
     "done", "error", "offline", "stale", "unknown",
@@ -89,11 +92,13 @@ def rgb565_rle(values):
     return bytes(out)
 
 
-def main() -> None:
+def build_blob() -> bytes:
     anims = []
     total_frames = 0
     for name in names:
         source_path = source_dir / f"{name.upper()}.gif"
+        if not source_path.is_file():
+            raise FileNotFoundError(f"missing animation source: {source_path}")
         with Image.open(source_path) as source:
             frames = []
             durations = []
@@ -133,6 +138,35 @@ def main() -> None:
     blob += frame_tables
     blob += payload
 
+    return bytes(blob), total_frames
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build animations.bin for ESP32 animations partition")
+    parser.add_argument("--source-dir", type=Path, default=source_dir)
+    parser.add_argument("--out-bin", type=Path, default=out_bin)
+    parser.add_argument("--out-size", type=Path, default=out_size)
+    parser.add_argument("--max-bytes", type=int, default=ANIM_PARTITION_MAX)
+    args = parser.parse_args()
+
+    global source_dir, out_bin, out_size
+    source_dir = args.source_dir
+    out_bin = args.out_bin
+    out_size = args.out_size
+
+    try:
+        blob, total_frames = build_blob()
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    if len(blob) > args.max_bytes:
+        print(
+            f"animations.bin too large: {len(blob)} bytes > partition {args.max_bytes} (0x{args.max_bytes:X})",
+            file=sys.stderr,
+        )
+        return 3
+
     out_bin.parent.mkdir(parents=True, exist_ok=True)
     out_bin.write_bytes(blob)
     out_size.parent.mkdir(parents=True, exist_ok=True)
@@ -145,7 +179,8 @@ def main() -> None:
         encoding="utf-8",
     )
     print(f"generated {out_bin.name} ({len(blob)} bytes, {total_frames} frames, face {WIDTH}px)")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -39,6 +39,9 @@ void prov_cfg_fill_json(cJSON *root)
     cJSON_AddStringToObject(root, "ip", cfg->ip);
     cJSON_AddStringToObject(root, "netmask", cfg->netmask);
     cJSON_AddStringToObject(root, "gateway", cfg->gateway);
+    if (cfg->ws_token[0]) {
+        cJSON_AddStringToObject(root, "api_token", cfg->ws_token);
+    }
     cJSON_AddNumberToObject(root, "profile_count", agent_cfg_profile_count());
     cJSON_AddNumberToObject(root, "active", agent_cfg_active_index());
 }
@@ -85,6 +88,13 @@ esp_err_t prov_cfg_load_from_json(const cJSON *root)
     }
     if (agent_cfg_set_host(host_port) != ESP_OK) {
         return ESP_ERR_INVALID_ARG;
+    }
+    char token[AGENT_CFG_WS_TOKEN_MAX];
+    token[0] = 0;
+    if (json_copy_str(root, "api_token", token, sizeof(token)) && token[0]) {
+        if (agent_cfg_set_token(token) != ESP_OK) {
+            return ESP_ERR_INVALID_ARG;
+        }
     }
     char ip[AGENT_CFG_IP_MAX];
     char mask[AGENT_CFG_IP_MAX];
@@ -141,6 +151,7 @@ esp_err_t prov_cfg_apply_saved(void)
         ESP_LOGE(TAG, "apply failed %s", esp_err_to_name(err));
         return err;
     }
+    net_on_config_applied();
     ESP_LOGI(TAG, "applied ssid=%s ws=%s", cfg->ssid, cfg->ws_url);
     return ESP_OK;
 }

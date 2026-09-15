@@ -10,6 +10,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+from sanitize import sanitize_ble_line
+
 NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # PC -> device (write)
 NUS_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # device -> PC (notify)
@@ -65,9 +67,10 @@ class BleProvService:
     _log: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=80))
 
     def _push(self, level: str, msg: str) -> None:
-        item = {"ts": time.time(), "level": level, "msg": msg}
+        safe = sanitize_ble_line(msg)
+        item = {"ts": time.time(), "level": level, "msg": safe}
         self._log.appendleft(item)
-        print(f"[ble_prov] {level}: {msg}")
+        print(f"[ble_prov] {level}: {safe}")
 
     def status(self) -> dict[str, Any]:
         ok, err = _bleak_available()
@@ -123,6 +126,7 @@ class BleProvService:
         ip: str | None = None,
         netmask: str | None = None,
         gateway: str | None = None,
+        api_token: str | None = None,
         scan_timeout: float = 6.0,
         reply_timeout: float = 8.0,
     ) -> dict[str, Any]:
@@ -159,11 +163,11 @@ class BleProvService:
                 if line:
                     replies.append(line)
                     notify_q.put_nowait(line)
-                    self._push("info", f"<- {line}")
+                    self._push("info", f"<- {sanitize_ble_line(line)}")
 
         async def write_line(client: BleakClient, line: str) -> None:
             payload = (line.rstrip("\n") + "\n").encode("utf-8")
-            self._push("info", f"-> {line}")
+            self._push("info", f"-> {sanitize_ble_line(line)}")
             await client.write_gatt_char(NUS_RX, payload, response=False)
 
         async def wait_prefix(prefix: str, timeout: float) -> str:
@@ -215,6 +219,11 @@ class BleProvService:
 
                     await write_line(client, f"HOST:{host}:{int(port)}")
                     await wait_prefix("OK host", reply_timeout)
+
+                    token = (api_token or "").strip()
+                    if token:
+                        await write_line(client, f"TOKEN:{token}")
+                        await wait_prefix("OK token", reply_timeout)
 
                     if ip:
                         await write_line(client, f"IP:{ip}")
@@ -286,11 +295,11 @@ class BleProvService:
                 if line:
                     replies.append(line)
                     notify_q.put_nowait(line)
-                    self._push("info", f"<- {line}")
+                    self._push("info", f"<- {sanitize_ble_line(line)}")
 
         async def write_line(client: BleakClient, line: str) -> None:
             payload = (line.rstrip("\n") + "\n").encode("utf-8")
-            self._push("info", f"-> {line}")
+            self._push("info", f"-> {sanitize_ble_line(line)}")
             await client.write_gatt_char(NUS_RX, payload, response=False)
 
         async def wait_prefix(prefix: str, timeout: float) -> str:
@@ -417,7 +426,7 @@ class BleProvService:
                     "count": count,
                     "active": active,
                     "profiles": profiles,
-                    "replies": replies,
+                    "replies": [sanitize_ble_line(line) for line in replies],
                 }
             except Exception as exc:
                 self._push("error", str(exc))

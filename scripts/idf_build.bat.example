@@ -1,0 +1,14 @@
+@echo off
+rem Copy to idf_build.bat (gitignored) or set these env vars in your shell.
+rem Requires ESP-IDF export.bat / install.ps1 to have run once.
+
+if not defined IDF_PATH (
+  echo [idf_build] Set IDF_PATH to your esp-idf directory
+  exit /b 1
+)
+
+if defined IDF_TOOLS_PATH set "PATH=%IDF_TOOLS_PATH%\tools;%PATH%"
+if defined IDF_PYTHON_ENV_PATH set "PATH=%IDF_PYTHON_ENV_PATH%\Scripts;%PATH%"
+
+cd /d "%~dp0.."
+python "%IDF_PATH%\tools\idf.py" %*

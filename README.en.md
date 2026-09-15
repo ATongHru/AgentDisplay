@@ -8,7 +8,7 @@ ESP32-S3 N16R8 desktop status display: WebSocket status push, offline RGB565 RLE
 |------|------|
 | Firmware | ESP-IDF **5.4.2** + FreeRTOS + LVGL **9.2.2** |
 | Transport | WebSocket (`espressif/esp_websocket_client`) |
-| Backend | FastAPI + uvicorn, default `:8000` |
+| Backend | FastAPI + uvicorn, default `127.0.0.1:8000` (set `AGENT_BIND_HOST` for LAN) |
 
 ### Preview
 
@@ -50,6 +50,7 @@ flowchart LR
 - [4. Core features](#4-core-features)
 - [5. Backend service](#5-backend-service)
 - [6. Build & deploy](#6-build--deploy)
+  - [6.4 Troubleshooting](#64-troubleshooting)
 - [Appendix](#appendix)
 
 ---
@@ -121,7 +122,7 @@ PSRAM buffers: CJK font (~893 KB), record PCM (640 KB), play ring (512 KB), voic
 
 Key `sdkconfig.defaults`: 240 MHz, OPI PSRAM, `CONFIG_LV_USE_GIF=n`, `CONFIG_AGENT_VOICE_HW=y`, `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y`, `CONFIG_ESP_TASK_WDT_PANIC=y` (task watchdog resets the chip after 5 s of starvation).
 
-menuconfig **Agent Display**: WiFi, static IP, `AGENT_WS_URL` — factory defaults are **empty** (no credentials in version control; fresh devices must be provisioned). The **Voice / audio tuning** submenu exposes VAD/AGC/timeout knobs. NVS (BLE/AP) overrides Kconfig defaults.
+menuconfig **Agent Display**: WiFi, static IP, `AGENT_WS_URL`, `AGENT_WS_TOKEN` — factory defaults are **empty** (no credentials in version control; fresh devices must be provisioned). The **Voice / audio tuning** submenu exposes VAD/AGC/timeout knobs. NVS (BLE/AP) overrides Kconfig defaults. When `AGENT_WS_TOKEN` matches backend `AGENT_API_TOKEN`, the firmware appends `?token=` on WebSocket connect.
 
 ---
 
@@ -237,11 +238,28 @@ VAD FSM in `voice.c`: LISTEN → RECORDING → UPLOADING → WAIT_REPLY → PLAY
 
 ### 4.5 BLE provisioning
 
-Long-press BOOT ≥3 s → NimBLE NUS (`AgentDisplay`). Text protocol: `WIFI:`, `HOST:`, `IP:`, `MASK:`, `GW:`, `GET`, `APPLY`. Use Dashboard BLE card or SerialTest (LE).
+Long-press BOOT ≥3 s → NimBLE NUS (`AgentDisplay`). Text protocol (UTF-8, newline-terminated):
+
+```text
+WIFI:<ssid>,<password>
+HOST:<ip>:<port>
+TOKEN:<api_token>     # optional; same as backend AGENT_API_TOKEN
+IP:<x.x.x.x>          # optional static IP
+MASK:<x.x.x.x>
+GW:<x.x.x.x>
+GET
+APPLY
+```
+
+Use Dashboard **BLE provisioning** card (optional API Token field) or SerialTest (LE).
+
+After `APPLY`, advertising stops in ~0.5 s, **NimBLE shuts down** to free the radio, and WiFi/WS reconnect. `prov_cfg_apply_saved()` resets the auto-AP fallback timer (see [§4.6](#46-ap-provisioning-fallback)).
 
 ### 4.6 AP provisioning (fallback)
 
-If WiFi+WS not up within **30 s**, open Soft AP `AgentDisplay-XXXX` (open), portal at `http://192.168.4.1/`. Serial command `ap` forces AP mode. BLE and AP are **mutually exclusive**.
+On **cold boot** (WebSocket never connected), if WiFi+WS are not up within **30 s**, the device opens Soft AP `AgentDisplay-XXXX` (open), portal at `http://192.168.4.1/`. After BLE/AP `APPLY`, auto-AP waits **60 s** before triggering. `ble_radio_shutdown()` runs before AP mode to avoid BLE+AP radio conflicts. Serial command `ap` forces AP mode. BLE and AP are **mutually exclusive**.
+
+Portal form fields map to the same NVS layout as BLE: WiFi SSID/password, backend host/port (→ `ws://<host>:<port>/ws`), optional **`api_token`** (same as `AGENT_API_TOKEN`), optional static IP/netmask/gateway.
 
 **`GET /api/config`** (AP mode):
 
@@ -255,6 +273,7 @@ If WiFi+WS not up within **30 s**, open Soft AP `AgentDisplay-XXXX` (open), port
   "ip": "",
   "netmask": "",
   "gateway": "",
+  "api_token": "",
   "profile_count": 1,
   "active": 0
 }
@@ -268,6 +287,7 @@ If WiFi+WS not up within **30 s**, open Soft AP `AgentDisplay-XXXX` (open), port
   "password": "12345678",
   "host": "192.168.10.167",
   "port": 8000,
+  "api_token": "",
   "ip": "",
   "netmask": "",
   "gateway": ""
@@ -282,7 +302,7 @@ Success: `{"ok":true}` — applied ~3.5 s later, AP shuts down.
 
 ### 5.1 Modules
 
-`backend/main.py` — FastAPI on `0.0.0.0:8000`. Start/stop: `start.bat` / `stop.bat`.
+`backend/main.py` — FastAPI, default **`127.0.0.1:8000`** (`AGENT_BIND_HOST`). For LAN exposure set `0.0.0.0` and **also** set `AGENT_API_TOKEN`. Start/stop: `start.bat` / `stop.bat`.
 
 | Module | Role |
 |--------|------|
@@ -294,7 +314,18 @@ Success: `{"ok":true}` — applied ~3.5 s later, AP shuts down.
 
 ### 5.2 WebSocket protocol
 
-Endpoint: `ws://<pc-ip>:8000/ws`. First frame must be JSON text. Binary frames only follow `audio_upload` (bulk) or `audio_chunk` header.
+Endpoint: `ws://<pc-ip>:8000/ws` (with auth: `ws://<pc-ip>:8000/ws?token=<AGENT_API_TOKEN>`). First frame must be JSON text. Binary frames only follow `audio_upload` (bulk) or `audio_chunk` header.
+
+#### Authentication (optional)
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `AGENT_BIND_HOST` | Listen address | `127.0.0.1` |
+| `AGENT_API_TOKEN` | Bearer token / WS `?token=` | empty (no auth) |
+
+- HTTP: header `Authorization: Bearer <token>` or `X-Api-Token`
+- WebSocket: query `?token=<token>` (firmware `AGENT_WS_TOKEN` / BLE `TOKEN:` / AP `api_token`)
+- Dashboard: open `http://127.0.0.1:8000/?token=<token>` once to store token in `localStorage`
 
 | Item | Value |
 |------|-------|
@@ -305,6 +336,17 @@ Endpoint: `ws://<pc-ip>:8000/ws`. First frame must be JSON text. Binary frames o
 | Keepalive | Server `ping` every **2 s**; stale after **5 s** no uplink |
 
 `volume_percent` applies on device only; backend does not rescale TTS PCM.
+
+#### Volume & TTS voice (source of truth)
+
+| Setting | Stored in | Notes |
+|---------|-----------|-------|
+| `volume_percent` | `backend/settings.json` (default **33%**) | Saved from Dashboard slider; pushed as `config` on WS connect |
+| `voice_enabled` | same | Mic listen-stream master switch |
+| `tts_voice` | same | **PC-side TTS only** (edge-tts or Windows SAPI, e.g. `sapi:TTS_MS_ZH-CN_HUIHUI_11.0`); ESP plays PCM only |
+| Device gain | ESP **RAM** (`audio.c`, not NVS) | Defaults to 100% on boot, then overwritten by backend `config` |
+
+Adjust volume/voice in Dashboard → writes `settings.json` and pushes to the device. ESP reboot alone does not persist volume; reconnect reapplies the backend value (often 33% if never saved).
 
 ---
 
@@ -467,6 +509,8 @@ Default volume from `backend/settings.json` (**33%**).
 ```
 
 **TTS `audio_chunk` + binary**
+
+Firmware parses the JSON header **synchronously** in the WS callback before accepting the following binary PCM (queued delay caused garbled playback in older builds).
 
 ```json
 {
@@ -646,7 +690,20 @@ audio_upload(stream) → VoskStreamRecognizer → audio_end → LLM → append
 | TTS pump | Burst max 16384 B, interval 0.02 s |
 | Profile rotate | Every 15 s if multiple profiles and not connected |
 
-Env: `LLM_*` (seed for first `llm.json`), `VOICE_TTS`, `ASR_ENGINE`, `VOSK_MODEL_PATH` in `backend/.env`. Full LLM setup: [§5.4](#54-llm-configuration).
+#### Environment (`backend/.env`)
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | LLM seed (first `llm.json`) | see [§5.4](#54-llm-configuration) |
+| `VOICE_TTS` | TTS after LLM reply | `0` |
+| `TTS_VOICE` / `TTS_RATE` | edge-tts options | `zh-CN-XiaoxiaoNeural` / `+20%` |
+| `ASR_ENGINE` | ASR engine | `vosk` |
+| `VOSK_MODEL_PATH` | Vosk model directory | `backend/models/vosk-model-small-cn-0.22` |
+| `AGENT_BIND_HOST` | Backend listen address | `127.0.0.1` |
+| `AGENT_API_TOKEN` | API / WS auth token | empty |
+| `LLM_HISTORY_MAX_LINES` | `llm_chat.jsonl` rotation cap | `2000` |
+
+Copy `backend/.env.example` → `backend/.env`. Full LLM setup: [§5.4](#54-llm-configuration).
 
 ### 5.4 LLM configuration
 
@@ -787,15 +844,32 @@ Cursor: do **not** register `beforeAgentResponse` (invalid in 3.x).
 
 ### 6.2 Flash
 
-```bat
+Requires ESP-IDF **5.4.2**. `scripts/idf_build.bat` wraps `python %IDF_PATH%\tools\idf.py` and does **not** activate ESP-IDF by itself — set `IDF_PATH` and the IDF Python venv first (`export.bat` or the EIM PowerShell profile). See [docs/dev-setup.en.md](docs/dev-setup.en.md).
+
+**Recommended (PowerShell, EIM example):**
+
+```powershell
+. D:\Espressif\tools\Microsoft.v5.4.2.PowerShell_profile.ps1   # adjust path
+cd D:\0-C\esp32s3-agent-display
 scripts\idf_build.bat build
-idf.py -p COMx flash
+scripts\idf_build.bat -p COMx flash
 python scripts/flash_font.py -p COMx
 python scripts/flash_animations.py -p COMx
-idf.py -p COMx monitor
+scripts\idf_build.bat -p COMx monitor
 ```
 
-See [docs/dev-setup.en.md](docs/dev-setup.en.md) (English) or [docs/开发环境搭建.md](docs/开发环境搭建.md) (Chinese).
+> Do **not** run `idf.py` from Git Bash (MSYS guard skips execution). `idf_build.bat` and `idf.py build` are equivalent after env activation.
+
+You can set `ESPPORT=COMx` instead of passing `-p` to the flash scripts.
+
+Copy `backend/.env.example` → `backend/.env`. `start.bat` uses `_run_hidden.py`, which **`load_dotenv`s before reading `AGENT_BIND_HOST`** — required for LAN bind from `.env`.
+
+#### LAN deployment checklist
+
+1. In `backend/.env`: `AGENT_BIND_HOST=0.0.0.0` and `AGENT_API_TOKEN=<strong-random-string>`.
+2. `netstat` should show `0.0.0.0:8000`, not only `127.0.0.1:8000`.
+3. Provision the device with the PC **LAN IP** as `HOST:` (not `127.0.0.1`) and the same token (Dashboard BLE **API Token**, BLE `TOKEN:`, or AP `api_token`).
+4. Open Dashboard once with `?token=<same>` when auth is enabled.
 
 #### Prebuilt firmware (no compile)
 
@@ -825,6 +899,32 @@ esp32s3-agent-display/
     ├── data/          animations.bin / font_cjk_16.bin
     └── releases/v1.0/ prebuilt esp32s3_agent_display.bin
 ```
+
+### 6.4 Troubleshooting
+
+#### Device offline after BLE provisioning
+
+Backend defaults to `127.0.0.1:8000` — the ESP cannot reach that via WiFi. Set `AGENT_BIND_HOST=0.0.0.0` and `AGENT_API_TOKEN` in `backend/.env`, restart with `stop.bat` / `start.bat`, verify `curl http://<PC-LAN-IP>:8000/health`, and provision `HOST:` with the PC LAN IP (not `127.0.0.1`).
+
+#### Dashboard URL not loading
+
+Use `http://127.0.0.1:8000/` on the PC (not `localhost` if IPv6 `::1` fails). With auth enabled, open `http://127.0.0.1:8000/?token=<token>`. Other devices must use `http://<PC-LAN-IP>:8000/`.
+
+#### Volume resets to 33% after ESP reboot
+
+Volume and TTS voice live in **`backend/settings.json`**, not ESP NVS. The backend pushes `config` on every WS connect. Save from the Dashboard slider (release to persist). See [Volume & TTS voice](#volume--tts-voice-source-of-truth).
+
+#### Garbled TTS / “Send and speak”
+
+Flash firmware with synchronous `audio_chunk` header handling in `net_ws.c`. Raise Dashboard volume if too low (amplifier hiss). Check `[tts]` lines in `backend/backend.log`.
+
+#### “AP provisioning” screen or freeze after BLE
+
+Older firmware could auto-start AP after a long BLE session while NimBLE was still running. Current firmware: 60 s grace after `APPLY`, `ble_radio_shutdown()` on apply and before AP. Reflash (see [§6.2](#62-flash)).
+
+#### `IDF_PATH is not set`
+
+Activate ESP-IDF in the same terminal before `scripts\idf_build.bat` (see [§6.2](#62-flash)), or use the VS Code ESP-IDF extension Build button.
 
 ---
 

@@ -28,6 +28,16 @@ log/*.jsonl
 # Local secrets / editable runtime config
 backend/llm.json
 backend/wifi_profiles.json
+backend/settings.json
+
+# Windows accidental redirect target
+/nul
+
+# Local ESP-IDF build helper (use scripts/idf_build.bat.example)
+scripts/idf_build.bat
+
+# Machine-specific IDE paths (use .vscode/settings.json.example)
+.vscode/settings.json
 
 # Generated embedded CJK source (use firmware/data/font_cjk_16.bin instead)
 main/font_cjk_16.c

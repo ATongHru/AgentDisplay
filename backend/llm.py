@@ -136,8 +136,9 @@ async def llm_chat(
         "stream_options": {"include_usage": True},
     }
 
+    timeout = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0)
     t0 = time.monotonic()
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("POST", url, headers=headers, json=payload) as response:
             if response.status_code >= 400:
                 body = (await response.aread()).decode("utf-8", errors="replace")

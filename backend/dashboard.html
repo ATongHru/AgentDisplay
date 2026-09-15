@@ -320,7 +320,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
     <div class="row three" style="margin-top:8px">
       <input id="ble-host" type="text" maxlength="64" data-i18n-placeholder="ble.host_placeholder" placeholder="后端 IP" autocomplete="off">
       <input id="ble-port" type="number" min="1" max="65535" value="8000" data-i18n-placeholder="ble.port_placeholder" placeholder="端口">
-      <span></span>
+      <input id="ble-token" type="password" maxlength="96" placeholder="API Token（可选）" autocomplete="off" title="与 backend/.env 的 AGENT_API_TOKEN 一致">
     </div>
     <div class="row three" style="margin-top:8px">
       <input id="ble-ip" type="text" maxlength="15" data-i18n-placeholder="ble.ip_placeholder" placeholder="设备静态 IP（可选）" autocomplete="off">
@@ -455,6 +455,22 @@ let volumeDragging=false;
 let ttsVoiceSaving=false;
 let volumeSaveTimer=null;
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+(function(){
+  const q=new URLSearchParams(location.search);
+  const t=q.get('token');
+  if(t) localStorage.setItem('agent_api_token',t);
+})();
+function apiAuthHeaders(extra){
+  const h={...(extra||{})};
+  const token=localStorage.getItem('agent_api_token')||'';
+  if(token) h.Authorization='Bearer '+token;
+  return h;
+}
+function apiFetch(url,opts){
+  opts=opts||{};
+  opts.headers=apiAuthHeaders(opts.headers||{});
+  return fetch(url,opts);
+}
 function setPill(id,label,kind){
   const el=$(id);
   el.className='pill '+(kind||'');
@@ -490,7 +506,7 @@ function bindQuickButtons(){
   $('quick-text').innerHTML=qt.map((item,i)=>`<button type="button" data-qt="${i}">${esc(item.label)}</button>`).join('');
 }
 async function postJson(url,payload){
-  const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json; charset=utf-8'},body:JSON.stringify(payload)});
+  const res=await apiFetch(url,{method:'POST',headers:{'Content-Type':'application/json; charset=utf-8'},body:JSON.stringify(payload)});
   const data=await res.json().catch(()=>({}));
   if(!res.ok){
     const d=data.detail;
@@ -556,7 +572,7 @@ async function sendText(speak=false){
 
 async function bleRefreshStatus(){
   try{
-    const st=await fetch('/api/ble/status',{cache:'no-store'}).then(r=>r.json());
+    const st=await apiFetch('/api/ble/status',{cache:'no-store'}).then(r=>r.json());
     if($('ble-host') && !$('ble-host').dataset.touched && st.suggested_host){
       $('ble-host').value=st.suggested_host;
     }
@@ -567,7 +583,7 @@ async function bleRefreshStatus(){
     if(box && Array.isArray(st.logs)){
       box.innerHTML=st.logs.slice(0,12).map(x=>{
         const ts=new Date((x.ts||0)*1000).toLocaleTimeString(DashI18n.locale());
-        return `<div>[${ts}] ${x.level}: ${String(x.msg||'')}</div>`;
+        return `<div>[${esc(ts)}] ${esc(x.level)}: ${esc(x.msg||'')}</div>`;
       }).join('') || `<div class="empty">${esc(t('ble.no_logs'))}</div>`;
     }
     if(st.bleak_ok===false){
@@ -620,6 +636,7 @@ async function bleApply(){
     ip:$('ble-ip').value.trim()||null,
     netmask:$('ble-mask').value.trim()||null,
     gateway:$('ble-gw').value.trim()||null,
+    api_token:$('ble-token').value.trim()||null,
   };
   if(!payload.ssid||!payload.host){
     result.className='send-result bad';
@@ -641,7 +658,7 @@ async function bleApply(){
 
 async function refresh(){
   try{
-    const d=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());
+    const d=await apiFetch('/api/status',{cache:'no-store'}).then(r=>r.json());
     const w=d.wifi||{};
     const e=d.event||{};
     const dev=w.device||{};
@@ -681,7 +698,9 @@ async function refresh(){
 }
 function connectLogsWs(){
   const proto=location.protocol==='https:'?'wss':'ws';
-  const ws=new WebSocket(`${proto}://${location.host}/ws`);
+  const token=localStorage.getItem('agent_api_token')||'';
+  const wsUrl=token?`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`:`${proto}://${location.host}/ws`;
+  const ws=new WebSocket(wsUrl);
   ws.addEventListener('open',()=>ws.send(JSON.stringify({type:'hello',role:'dashboard'})));
   ws.addEventListener('message',ev=>{
     try{
@@ -885,7 +904,7 @@ function renderLlmProfiles(){
   }).join('');
 }
 async function reloadLlm(){
-  const data=await fetch('/api/llm',{cache:'no-store'}).then(r=>r.json());
+  const data=await apiFetch('/api/llm',{cache:'no-store'}).then(r=>r.json());
   const store=applyLlmStore(data);
   const cur=llmProfiles.find(p=>p.id===llmActive)||llmProfiles[0];
   if(cur) fillLlmForm(cur); else clearLlmForm();
@@ -1127,7 +1146,7 @@ refresh = async function(){
   syncHeroStackHeight();
 };
 
-setInterval(refresh,1000);
+setInterval(refresh,3000);
 
 DashI18n.onLangChange(()=>{
   bindQuickButtons();

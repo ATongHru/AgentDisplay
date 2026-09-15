@@ -23,7 +23,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from asr import VoskStreamRecognizer
 from settings_store import get_volume_percent, get_voice_enabled
-from voice_pipeline import start_pipeline, synthesize_to_session, tts_to_pcm
+from voice_pipeline import cancel_all_pipelines, cancel_pipeline, start_pipeline, synthesize_to_session, tts_to_pcm
 from voice_session import session_store
 
 
@@ -239,8 +239,8 @@ class WsHub:
                 return
             session.append_pcm(data)
             try:
-                partial = self._device.stream_asr.accept(data)
-            except Exception as exc:
+                partial = await asyncio.to_thread(self._device.stream_asr.accept, data)
+            except (RuntimeError, OSError, ValueError) as exc:
                 print(f"[asr] stream feed failed: {exc}")
                 partial = ""
             if partial:
@@ -296,11 +296,11 @@ class WsHub:
         )
         try:
             stream = VoskStreamRecognizer(sample_rate, channels, bit_depth)
-            stream.accept(data)
-            text = stream.finish()
+            await asyncio.to_thread(stream.accept, data)
+            text = await asyncio.to_thread(stream.finish)
             if text:
                 session.mark_stream_asr(text)
-        except Exception as exc:
+        except (RuntimeError, OSError, ValueError) as exc:
             print(f"[asr] oneshot stream failed, fallback offline: {exc}")
         self._push_status_threadsafe("THINKING", "正在处理…", "VOICE")
         start_pipeline(
@@ -365,8 +365,8 @@ class WsHub:
             print(f"[voice] stream discarded session={session_id}")
             return
         try:
-            text = asr.finish()
-        except Exception as exc:
+            text = await asyncio.to_thread(asr.finish)
+        except (RuntimeError, OSError, ValueError) as exc:
             print(f"[asr] stream finish failed: {exc}")
             text = ""
         pcm_len = len(session.pcm_data)
@@ -695,6 +695,7 @@ class WsHub:
             try:
                 await self._ping_device_if_needed()
                 await self._drop_stale_device()
+                session_store.cleanup_expired()
                 if (
                     self._voice_busy
                     and self._busy_since
@@ -702,6 +703,11 @@ class WsHub:
                 ):
                     stuck = list(self._speak_sessions) or list(self._session_device)
                     print(f"[voice] busy timeout sessions={stuck}")
+                    self._device.stream_session_id = None
+                    self._device.stream_asr = None
+                    for session_id in stuck:
+                        cancel_pipeline(session_id)
+                    cancel_all_pipelines()
                     self._speak_sessions.clear()
                     self._session_device.clear()
                     self._clear_busy("timeout")
@@ -742,6 +748,14 @@ class WsHub:
 
 
 async def ws_endpoint(hub: WsHub, websocket: WebSocket) -> None:
+    from auth import auth_enabled, verify_token
+
+    if auth_enabled():
+        token = websocket.query_params.get("token") or websocket.headers.get("x-api-token")
+        if not verify_token(token):
+            await websocket.close(code=1008)
+            return
+
     await websocket.accept()
     role = "device"
     try:
@@ -751,7 +765,7 @@ async def ws_endpoint(hub: WsHub, websocket: WebSocket) -> None:
     except (json.JSONDecodeError, WebSocketDisconnect, RuntimeError):
         try:
             await websocket.close()
-        except Exception:
+        except OSError:
             pass
         return
 

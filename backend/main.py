@@ -42,15 +42,22 @@ from llm_config import (
     get_llm_config,
     upsert_llm_profile,
 )
-from voice_pipeline import start_pipeline, warmup as voice_warmup
+from auth import AuthMiddleware, auth_enabled, bind_host, startup_warnings
+from hook_bridge import clear_hook_online, run_hook_loop, stop_hook_loop
+from sanitize import mask_wifi_profile
+from voice_pipeline import bind_loop as bind_voice_loop, start_pipeline, warmup as voice_warmup
 from voice_session import session_store
 from ble_prov import ble_prov
 from ws_manager import WsHub, ws_endpoint
 
 install_capture()
 
-DASHBOARD_HTML = Path(__file__).with_name("dashboard.html")
-CHAT_HISTORY_HTML = Path(__file__).with_name("chat_history.html")
+DASHBOARD_HTML_PATH = Path(__file__).with_name("dashboard.html")
+CHAT_HISTORY_HTML_PATH = Path(__file__).with_name("chat_history.html")
+DASHBOARD_HTML = DASHBOARD_HTML_PATH.read_text(encoding="utf-8") if DASHBOARD_HTML_PATH.is_file() else ""
+CHAT_HISTORY_HTML = (
+    CHAT_HISTORY_HTML_PATH.read_text(encoding="utf-8") if CHAT_HISTORY_HTML_PATH.is_file() else ""
+)
 GIF_DIR = Path(__file__).resolve().parent.parent / "third_party" / "emoji-gif"
 GIF_STATUSES = {
     "IDLE", "THINKING", "CODING", "READING", "TESTING", "WAITING",
@@ -175,6 +182,7 @@ class BleProvRequest(BaseModel):
     host: str = Field(min_length=1, max_length=64)
     port: int = Field(default=8000, ge=1, le=65535)
     address: str | None = Field(default=None, max_length=64)
+    api_token: str | None = Field(default=None, max_length=96)
     ip: str | None = Field(default=None, max_length=15)
     netmask: str | None = Field(default=None, max_length=15)
     gateway: str | None = Field(default=None, max_length=15)
@@ -382,76 +390,33 @@ async def _sync_device_state(hub: WsHub) -> None:
 
 ws_hub.set_on_device_connect(_sync_device_state)
 
-HOOK_QUEUE = Path(os.getenv(
-    "AGENT_DISPLAY_QUEUE",
-    str(Path.home() / ".cursor" / "hooks" / "event_queue.jsonl"),
-))
-HOOK_ONLINE = HOOK_QUEUE.parent / "backend_online.json"
-_hook_stop = threading.Event()
-_hook_last_online = 0.0
-
-
-def _touch_hook_online(force: bool = False) -> None:
-    global _hook_last_online
-    now = time.monotonic()
-    if not force and now - _hook_last_online < 2.0:
-        return
-    try:
-        HOOK_ONLINE.parent.mkdir(parents=True, exist_ok=True)
-        HOOK_ONLINE.write_text(json.dumps({"ok": True, "ts": time.time()}), encoding="utf-8")
-        _hook_last_online = now
-    except OSError as exc:
-        print(f"[hook] online file failed: {exc}")
-
-
-def _drain_hook_queue() -> None:
-    if not HOOK_QUEUE.exists() or HOOK_QUEUE.stat().st_size == 0:
-        return
-    try:
-        raw = HOOK_QUEUE.read_text(encoding="utf-8")
-        HOOK_QUEUE.write_text("", encoding="utf-8")
-    except OSError as exc:
-        print(f"[hook] queue read failed: {exc}")
-        return
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            data = json.loads(line)
-            apply_event(Event(**data))
-            print(f"[hook] applied {line}")
-        except (json.JSONDecodeError, ValueError, TypeError) as exc:
-            print(f"[hook] skipped: {exc} -> {line}")
-
-
-def _hook_loop() -> None:
-    HOOK_QUEUE.parent.mkdir(parents=True, exist_ok=True)
-    _touch_hook_online(True)
-    print(f"[hook] watching {HOOK_QUEUE}")
-    while not _hook_stop.is_set():
-        _touch_hook_online()
-        _drain_hook_queue()
-        _hook_stop.wait(0.1)
-
-
+def _apply_hook_line(data: dict) -> None:
+    apply_event(Event(**data))
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    ws_hub.bind_loop(asyncio.get_running_loop())
+    loop = asyncio.get_running_loop()
+    ws_hub.bind_loop(loop)
+    bind_voice_loop(loop)
+    for warning in startup_warnings():
+        print(f"[auth] {warning}")
+    if auth_enabled():
+        print("[auth] API token protection enabled")
+    print(f"[server] bind host={bind_host()}")
     pump_stop = threading.Event()
     pump_task = asyncio.create_task(ws_hub.run_session_pump(pump_stop))
-    voice_warmup()
-    _hook_stop.clear()
-    hook_thread = threading.Thread(target=_hook_loop, daemon=True, name="hook-queue")
+    await asyncio.to_thread(voice_warmup)
+    hook_thread = threading.Thread(
+        target=run_hook_loop,
+        args=(_apply_hook_line,),
+        daemon=True,
+        name="hook-queue",
+    )
     hook_thread.start()
     yield
-    _hook_stop.set()
-    try:
-        HOOK_ONLINE.unlink(missing_ok=True)
-    except OSError:
-        pass
+    stop_hook_loop()
+    clear_hook_online()
     pump_stop.set()
     pump_task.cancel()
     try:
@@ -461,11 +426,12 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Agent 状态显示后端", lifespan=lifespan)
+app.add_middleware(AuthMiddleware)
 
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
-    return HTMLResponse(DASHBOARD_HTML.read_text(encoding="utf-8"))
+    return HTMLResponse(DASHBOARD_HTML)
 
 
 @app.get("/dashboard_i18n.js")
@@ -478,9 +444,9 @@ def dashboard_i18n_js():
 
 @app.get("/chat-history", response_class=HTMLResponse)
 def chat_history_page():
-    if not CHAT_HISTORY_HTML.is_file():
+    if not CHAT_HISTORY_HTML:
         raise HTTPException(status_code=404, detail="chat history page missing")
-    return HTMLResponse(CHAT_HISTORY_HTML.read_text(encoding="utf-8"))
+    return HTMLResponse(CHAT_HISTORY_HTML)
 
 
 @app.get("/api/chat-history")
@@ -594,13 +560,21 @@ def api_wifi_profiles_list():
     return {"profiles": list_wifi_profiles()}
 
 
+@app.get("/api/wifi-profiles/{profile_id}")
+def api_wifi_profile_get(profile_id: str, reveal: bool = False):
+    item = get_wifi_profile(profile_id, reveal_password=reveal)
+    if item is None:
+        raise HTTPException(status_code=404, detail="profile not found")
+    return {"profile": item}
+
+
 @app.post("/api/wifi-profiles")
 def api_wifi_profiles_upsert(payload: WifiProfileEvent):
     try:
         item = upsert_wifi_profile(payload.model_dump())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"ok": True, "profile": item, "profiles": list_wifi_profiles()}
+    return {"ok": True, "profile": mask_wifi_profile(item), "profiles": list_wifi_profiles()}
 
 
 @app.delete("/api/wifi-profiles/{profile_id}")
@@ -676,6 +650,7 @@ async def api_ble_provision(payload: BleProvRequest):
             ip=payload.ip,
             netmask=payload.netmask,
             gateway=payload.gateway,
+            api_token=payload.api_token,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -763,14 +738,15 @@ async def api_ble_read_profiles(payload: BleReadRequest = BleReadRequest()):
             imported.append(upsert_wifi_profile(item))
         except Exception as exc:  # noqa: BLE001
             print(f"[wifi-profile] import skipped: {exc}")
+    device_profiles = [mask_wifi_profile(p) for p in (result.get("profiles") or [])]
     return {
         "ok": True,
         "address": result.get("address"),
         "count": result.get("count"),
         "active": result.get("active"),
-        "device_profiles": result.get("profiles") or [],
+        "device_profiles": device_profiles,
         "profiles": list_wifi_profiles(),
-        "imported": imported,
+        "imported": [mask_wifi_profile(p) for p in imported],
         "replies": result.get("replies") or [],
         **ble_prov.status(),
     }

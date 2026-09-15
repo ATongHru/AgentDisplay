@@ -32,8 +32,25 @@ static bool ipv4_ok(const char *s)
 static bool cfg_equal(const agent_cfg_t *x, const agent_cfg_t *y)
 {
     return strcmp(x->ssid, y->ssid) == 0 && strcmp(x->pass, y->pass) == 0 &&
-           strcmp(x->ws_url, y->ws_url) == 0 && strcmp(x->ip, y->ip) == 0 &&
-           strcmp(x->gateway, y->gateway) == 0 && strcmp(x->netmask, y->netmask) == 0;
+           strcmp(x->ws_url, y->ws_url) == 0 && strcmp(x->ws_token, y->ws_token) == 0 &&
+           strcmp(x->ip, y->ip) == 0 && strcmp(x->gateway, y->gateway) == 0 &&
+           strcmp(x->netmask, y->netmask) == 0;
+}
+
+static void strip_url_query_token(char *url, char *token_out, size_t token_len)
+{
+    if (!url || !token_out || token_len == 0) {
+        return;
+    }
+    char *q = strchr(url, '?');
+    if (!q) {
+        return;
+    }
+    *q = 0;
+    if (strncmp(q + 1, "token=", 6) == 0) {
+        strncpy(token_out, q + 7, token_len - 1);
+        token_out[token_len - 1] = 0;
+    }
 }
 
 static void sync_active_to_cfg(void)
@@ -52,6 +69,8 @@ static void load_defaults(void)
     strncpy(s_cfg.ssid, CONFIG_AGENT_WIFI_SSID, sizeof(s_cfg.ssid) - 1);
     strncpy(s_cfg.pass, CONFIG_AGENT_WIFI_PASSWORD, sizeof(s_cfg.pass) - 1);
     strncpy(s_cfg.ws_url, CONFIG_AGENT_WS_URL, sizeof(s_cfg.ws_url) - 1);
+    strncpy(s_cfg.ws_token, CONFIG_AGENT_WS_TOKEN, sizeof(s_cfg.ws_token) - 1);
+    strip_url_query_token(s_cfg.ws_url, s_cfg.ws_token, sizeof(s_cfg.ws_token));
 #if CONFIG_AGENT_WIFI_STATIC_IP
     strncpy(s_cfg.ip, CONFIG_AGENT_WIFI_IP, sizeof(s_cfg.ip) - 1);
     strncpy(s_cfg.gateway, CONFIG_AGENT_WIFI_GATEWAY, sizeof(s_cfg.gateway) - 1);
@@ -83,6 +102,11 @@ static esp_err_t load_one_profile(nvs_handle_t h, uint8_t idx, agent_cfg_t *out)
     if (nvs_get_str(h, key, out->ws_url, &len) != ESP_OK) {
         return ESP_ERR_NOT_FOUND;
     }
+    snprintf(key, sizeof(key), "tok%u", idx);
+    len = sizeof(out->ws_token);
+    if (nvs_get_str(h, key, out->ws_token, &len) != ESP_OK) {
+        out->ws_token[0] = 0;
+    }
     snprintf(key, sizeof(key), "ip%u", idx);
     len = sizeof(out->ip);
     if (nvs_get_str(h, key, out->ip, &len) != ESP_OK) {
@@ -113,6 +137,9 @@ static esp_err_t save_one_profile(nvs_handle_t h, uint8_t idx, const agent_cfg_t
     if (err != ESP_OK) return err;
     snprintf(key, sizeof(key), "ws%u", idx);
     err = nvs_set_str(h, key, cfg->ws_url);
+    if (err != ESP_OK) return err;
+    snprintf(key, sizeof(key), "tok%u", idx);
+    err = nvs_set_str(h, key, cfg->ws_token);
     if (err != ESP_OK) return err;
     snprintf(key, sizeof(key), "ip%u", idx);
     err = nvs_set_str(h, key, cfg->ip);
@@ -361,6 +388,7 @@ esp_err_t agent_cfg_set_host(const char *host_port)
         if (strlen(host_port) >= AGENT_CFG_WS_URL_MAX) return ESP_ERR_INVALID_ARG;
         memset(s_cfg.ws_url, 0, sizeof(s_cfg.ws_url));
         strncpy(s_cfg.ws_url, host_port, sizeof(s_cfg.ws_url) - 1);
+        strip_url_query_token(s_cfg.ws_url, s_cfg.ws_token, sizeof(s_cfg.ws_token));
         return ESP_OK;
     }
     if (strlen(host_port) >= AGENT_CFG_HOST_MAX) return ESP_ERR_INVALID_ARG;
@@ -369,6 +397,18 @@ esp_err_t agent_cfg_set_host(const char *host_port)
     if (n <= 0 || n >= (int)sizeof(url)) return ESP_ERR_INVALID_ARG;
     memset(s_cfg.ws_url, 0, sizeof(s_cfg.ws_url));
     strncpy(s_cfg.ws_url, url, sizeof(s_cfg.ws_url) - 1);
+    return ESP_OK;
+}
+
+esp_err_t agent_cfg_set_token(const char *token)
+{
+    memset(s_cfg.ws_token, 0, sizeof(s_cfg.ws_token));
+    if (token && token[0]) {
+        if (strlen(token) >= AGENT_CFG_WS_TOKEN_MAX) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        strncpy(s_cfg.ws_token, token, sizeof(s_cfg.ws_token) - 1);
+    }
     return ESP_OK;
 }
 

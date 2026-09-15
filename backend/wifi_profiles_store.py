@@ -13,6 +13,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from sanitize import mask_wifi_profile as _mask_profile
+
 PROFILES_PATH = Path(__file__).with_name("wifi_profiles.json")
 MAX_PROFILES = 20
 
@@ -85,17 +87,25 @@ def _ensure() -> list[dict[str, Any]]:
     return _profiles
 
 
-def list_profiles() -> list[dict[str, Any]]:
+def list_profiles(*, reveal_password: bool = False) -> list[dict[str, Any]]:
     with _lock:
-        return [dict(p) for p in _ensure()]
+        items = [dict(p) for p in _ensure()]
+    if reveal_password:
+        return items
+    return [_mask_profile(p) for p in items]
 
 
-def get_profile(profile_id: str) -> dict[str, Any] | None:
+def get_profile(profile_id: str, *, reveal_password: bool = False) -> dict[str, Any] | None:
     with _lock:
         for p in _ensure():
             if p["id"] == profile_id:
-                return dict(p)
-    return None
+                item = dict(p)
+                break
+        else:
+            return None
+    if reveal_password:
+        return item
+    return _mask_profile(item)
 
 
 def upsert_profile(payload: dict[str, Any]) -> dict[str, Any]:

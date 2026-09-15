@@ -8,7 +8,7 @@ ESP32-S3 N16R8 桌面状态屏：WebSocket 状态下行、离线 RGB565 RLE 表�
 |----|------|
 | 固件框架 | ESP-IDF **5.4.2** + FreeRTOS + LVGL **9.2.2** |
 | 通信 | WebSocket（`espressif/esp_websocket_client`） |
-| 后端 | FastAPI + uvicorn，默认 `:8000` |
+| 后端 | FastAPI + uvicorn，默认 `127.0.0.1:8000`（局域网需设 `AGENT_BIND_HOST`） |
 
 ### 实景预览
 
@@ -78,6 +78,7 @@ flowchart LR
   - [6.1 依赖清单](#61-依赖清单)
   - [6.2 构建与烧录](#62-构建与烧录)
   - [6.3 仓库结构](#63-仓库结构)
+  - [6.4 常见问题与排障](#64-常见问题与排障)
 - [附录](#附录)
 
 ---
@@ -213,7 +214,7 @@ NimBLE / WiFi DMA 为动态占用。配网前需 `wifi_deinit` 腾连续块，�
 | `CONFIG_ESP_TASK_WDT_PANIC` | y | 任务看门狗 5 s 超时直接复位（死锁自恢复） |
 | `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL` | y | NimBLE 堆走 PSRAM |
 
-menuconfig「Agent Display」：WiFi SSID/密码、静态 IP、`AGENT_WS_URL` 等**出厂默认留空**（凭证不入库，新设备强制配网）；「Voice / audio tuning」子菜单可现场调 VAD/AGC/超时参数。BLE/AP 写入 NVS 后 **NVS 优先**。
+menuconfig「Agent Display」：WiFi SSID/密码、静态 IP、`AGENT_WS_URL`、`AGENT_WS_TOKEN` 等**出厂默认留空**（凭证不入库，新设备强制配网）；「Voice / audio tuning」子菜单可现场调 VAD/AGC/超时参数。BLE/AP 写入 NVS 后 **NVS 优先**。`AGENT_WS_TOKEN` 与后端 `AGENT_API_TOKEN` 一致时，固件连接 WS 自动附加 `?token=`。
 
 ---
 
@@ -504,7 +505,8 @@ python scripts/flash_font.py -p COMx
 - 组件：`espressif/esp_websocket_client`
 - 连接后发 `{"type":"hello","role":"device","rssi":…}`；服务端 `ack` 含 `server_time`
 - WS 断线约 **3 s** 重连（`WS_RECONNECT_MS`）；WiFi 断线**指数退避**重连（5 s 起翻倍、封顶 60 s，见 `board_pins.h` `WIFI_RETRY_MS`）
-- WS 事件回调只把文本帧拷入 PSRAM 队列（8 槽 × ≤2 KB），JSON 解析 / NVS / UI 投递统一在 `net_loop` 执行
+- WS 事件回调只把文本帧拷入 PSRAM 队列（8 槽 × ≤2 KB），JSON 解析 / NVS / UI 投递统一在 `net_loop` 执行；**例外**：`audio_chunk` 的 JSON 头在回调内**同步**处理，须先于紧随其后的 binary PCM（避免播报杂音）
+- 连接 URL 支持 `?token=`（NVS `ws_token` / BLE `TOKEN:` / menuconfig `AGENT_WS_TOKEN`，与后端 `AGENT_API_TOKEN` 一致）
 - WiFi 省电按需切换：语音会话 / 播放 / 配网期间 `PS_NONE`，空闲自动 `PS_MIN_MODEM`（`net_loop` 每轮评估）
 - `source`：`PI` / `CURSOR` / `VOICE` / `BOT` / `UNKNOWN`；设备来源行**不显示 `VOICE`**
 
@@ -617,7 +619,7 @@ ESP32-S3 **仅 BLE**（NimBLE + Nordic UART Service）。Windows 系统蓝牙设
 | 按住 BOOT ≥ **5 s** | 运行时诊断覆盖层（约 12 s） |
 | 按住 BOOT → 短按 RST | 下载模式（strapping） |
 
-配网窗口最长约 **5 分钟**；`APPLY` 成功后约 0.5 s 结束广播并重连 WiFi/WS。
+配网窗口最长约 **5 分钟**；`APPLY` 成功后约 0.5 s 结束广播、**关闭 NimBLE 释放射频**，并重连 WiFi/WS。`prov_cfg_apply_saved()` 会重置自动热点回退计时（见 [§4.7](#47-热点配网ap)），避免 BLE 耗时超过 30 s 后误进「热点配网」。
 
 #### NUS UUID
 
@@ -632,6 +634,7 @@ ESP32-S3 **仅 BLE**（NimBLE + Nordic UART Service）。Windows 系统蓝牙设
 ```text
 WIFI:<ssid>,<password>
 HOST:<ip>:<port>
+TOKEN:<api_token>     # 可选，与后端 AGENT_API_TOKEN 一致
 IP:<x.x.x.x>          # 可选静态 IP
 MASK:<x.x.x.x>
 GW:<x.x.x.x>
@@ -655,15 +658,16 @@ APPLY
 
 ### 4.7 热点配网（AP）
 
-启动后若 **30 秒内** WiFi 与后端 WebSocket 均未就绪，设备自动开启 **开放热点** 并内置配网网页；也可通过串口手动触发。配置保存后与 BLE `APPLY` 相同：写入 NVS、关闭热点、以 STA 模式重连。
+首次上电且从未连上过 WebSocket 时，若 **30 秒内** WiFi 与 WS 均未就绪，设备自动开启 **开放热点** 并内置配网网页；也可通过串口手动触发。BLE/AP `APPLY` 成功后另有 **60 秒**宽限期再允许自动热点（给 WiFi+WS 留连接时间）。配置保存后与 BLE `APPLY` 相同：写入 NVS、关闭热点、以 STA 模式重连。
 
-与 BLE 不同，热点配网**无需** `wifi_deinit`，内存占用更小，适合「连不上 WiFi」时的兜底场景。
+进入热点前会调用 `ble_radio_shutdown()` 关闭 NimBLE，避免 AP 与 BLE 射频冲突导致卡死。与 BLE 不同，热点配网**无需** `wifi_deinit`，内存占用更小，适合「连不上 WiFi」时的兜底场景。
 
 #### 触发方式
 
 | 方式 | 说明 |
 |------|------|
-| **自动** | 上电后 30 s 内未连上 WiFi+WS → 自动开热点 |
+| **自动（冷启动）** | 上电后 30 s 内未连上 WiFi+WS → 自动开热点 |
+| **自动（已配网）** | BLE/AP `APPLY` 后 60 s 内仍未连上 WiFi+WS → 自动开热点 |
 | **串口** | 监视器或串口工具发送 `ap`（见下方 CLI） |
 | **手动停止** | 串口发送 `ap_stop`，或等待 10 分钟超时 |
 
@@ -688,6 +692,7 @@ APPLY
 |------|------|
 | WiFi 名称 / 密码 | 目标路由器 SSID 与密码 |
 | 后端 IP / 端口 | 拼为 `ws://<host>:<port>/ws` |
+| API Token | 可选 JSON 字段 `api_token`；与 `backend/.env` 的 `AGENT_API_TOKEN` 一致 |
 | 设备静态 IP / 掩码 / 网关 | 可选；留空则 DHCP |
 
 点击 **「保存并连接」** 后：
@@ -716,6 +721,7 @@ APPLY
   "ip": "",
   "netmask": "",
   "gateway": "",
+  "api_token": "",
   "profile_count": 1,
   "active": 0
 }
@@ -729,6 +735,7 @@ APPLY
   "password": "12345678",
   "host": "192.168.10.167",
   "port": 8000,
+  "api_token": "",
   "ip": "",
   "netmask": "",
   "gateway": ""
@@ -782,7 +789,7 @@ NVS 最多保存 **5 条** profile（WiFi 与 `ws_url` 绑定在同一条）。�
 
 ### 5.1 架构与模块
 
-目录 `backend/`，入口 `main.py`，默认 `0.0.0.0:8000`。
+目录 `backend/`，入口 `main.py`。默认仅监听 **`127.0.0.1:8000`**（`AGENT_BIND_HOST`）；局域网暴露请设 `0.0.0.0` 并**同时**配置 `AGENT_API_TOKEN`。
 
 | 模块 | 职责 |
 |------|------|
@@ -805,7 +812,18 @@ stop.bat
 
 ### 5.2 WebSocket 协议
 
-端点：`ws://<pc-ip>:8000/ws`。连接后首帧须为 JSON text；二进制帧仅紧跟 `audio_upload`（整段）或 `audio_chunk` 头。
+端点：`ws://<pc-ip>:8000/ws`（启用鉴权时：`ws://<pc-ip>:8000/ws?token=<AGENT_API_TOKEN>`）。连接后首帧须为 JSON text；二进制帧仅紧跟 `audio_upload`（整段）或 `audio_chunk` 头。
+
+#### 鉴权（可选）
+
+| 变量 | 说明 | 默认 |
+|------|------|------|
+| `AGENT_BIND_HOST` | 监听地址 | `127.0.0.1` |
+| `AGENT_API_TOKEN` | Bearer / WS `?token=` | 空（不鉴权） |
+
+- HTTP：请求头 `Authorization: Bearer <token>` 或 `X-Api-Token`
+- WebSocket：查询参数 `?token=<token>`（固件 `AGENT_WS_TOKEN` / BLE `TOKEN:` / AP `api_token` 字段）
+- Dashboard：浏览器访问 `http://127.0.0.1:8000/?token=<token>` 一次即可写入 localStorage
 
 **约定**
 
@@ -818,6 +836,17 @@ stop.bat
 | 设备保活 | 服务端每 **2 s** 发 `ping`；**5 s** 无上行则判离线 |
 
 `volume_percent` 仅设备端增益生效；后端 TTS **不二次缩放 PCM**。
+
+#### 播报音量与 TTS 音色
+
+| 项 | 持久化位置 | 说明 |
+|----|------------|------|
+| `volume_percent` | `backend/settings.json`（默认 **33%**） | Dashboard 滑块保存后写入；设备连上 WS 时由 `push_volume_config()` 下发 `config` 帧 |
+| `voice_enabled` | 同上 | 麦克风听流总开关 |
+| `tts_voice` | 同上 | **仅 PC 端 TTS 合成**用（edge-tts 在线 / Windows SAPI 本地，如 `sapi:TTS_MS_ZH-CN_HUIHUI_11.0`）；ESP 只播放 PCM，**不存音色** |
+| 设备播放增益 | ESP **RAM**（`audio.c`，非 NVS） | 开机默认 100%，连上后端后被 `config` 覆盖；**ESP 重启不会记住上次音量** |
+
+因此：在 Dashboard 调整音量/音色会写入 `settings.json` 并推给设备；仅 ESP 断电重启而 PC 后端未改配置时，设备会再次收到 `settings.json` 中的值（常见为 33%）。若总是 33%，检查滑块是否已松开触发保存，或 `backend/settings.json` 是否存在。
 
 ---
 
@@ -1013,7 +1042,7 @@ text 头：
 }
 ```
 
-紧跟 binary PCM（`len` 字节）。仅结束标记：
+紧跟 binary PCM（`len` 字节）。固件在 WS 回调内**同步**解析本 JSON 头后再收 binary（不可入队延迟）。仅结束标记：
 
 ```json
 {
@@ -1201,6 +1230,8 @@ audio_upload(stream) → VoiceSession + VoskStreamRecognizer
 | 过短 PCM | < 6400 B → `IDLE`「没听清，请再说一次」 |
 | 忙控制 | `_voice_busy`；超时 `VOICE_BUSY_TIMEOUT_SEC=55` |
 | TTS 泵送 | 每突发最多 **16384 B**，间隔 `AUDIO_SEND_INTERVAL_SEC=0.02` |
+| TTS 音色 | `backend/settings.json` 的 `tts_voice`；Windows 可选本地 SAPI（`tts_sapi.py`），否则 edge-tts |
+| Dashboard「发送并播报」 | `POST /event` + `speak=true` → `speak_text()` → `audio_chunk` 流式下发 |
 | 多轮 | `CHAT_CONTEXT_MAX_TURNS=8`，空闲 `CHAT_CONTEXT_IDLE_SEC=300` 清空 |
 | Profile 轮询 | 多 profile 且未连上时，每 **15 s** 切换一条（`PROFILE_ROTATE_MS`） |
 
@@ -1213,6 +1244,9 @@ audio_upload(stream) → VoiceSession + VoskStreamRecognizer
 | `TTS_VOICE` / `TTS_RATE` | edge-tts 参数 | `zh-CN-XiaoxiaoNeural` / `+20%` |
 | `ASR_ENGINE` | 识别引擎 | `vosk` |
 | `VOSK_MODEL_PATH` | Vosk 模型目录 | `backend/models/vosk-model-small-cn-0.22` |
+| `AGENT_BIND_HOST` | 后端监听地址 | `127.0.0.1` |
+| `AGENT_API_TOKEN` | API / WS 鉴权令牌 | 空 |
+| `LLM_HISTORY_MAX_LINES` | `llm_chat.jsonl` 轮转上限 | `2000` |
 
 #### 异常与并发
 
@@ -1412,19 +1446,27 @@ cd backend && pip install -r requirements.txt
 | `edge-tts` / `miniaudio` | TTS |
 | `bleak` | 网页 BLE 配网 |
 
-复制 `backend/.env.example` → `backend/.env`，填写 `LLM_API_KEY` 等；也可启动后在 Dashboard **大模型配置** 中填写（见 [§5.4](#54-llm-配置与对接)）。
+复制 `backend/.env.example` → `backend/.env`，填写 `LLM_API_KEY`、`AGENT_BIND_HOST`、`AGENT_API_TOKEN` 等；也可启动后在 Dashboard 配置。`start.bat` 通过 `_run_hidden.py` 启动时会 `load_dotenv`，**`.env` 中的 `AGENT_BIND_HOST` 才会生效**（见 [§6.4](#64-常见问题与排障)）。
 
 ### 6.2 构建与烧录
 
-需 ESP-IDF 5.4.2。Git Bash 下 `export.sh` 可能失败，可用 `scripts/idf_build.bat`。详细环境见 [开发环境搭建.md](docs/开发环境搭建.md)。
+需 ESP-IDF **5.4.2**。`scripts/idf_build.bat` 内部等价于 `python %IDF_PATH%\tools\idf.py …`，**不会**自动安装或激活 ESP-IDF；每个新终端须先设置 `IDF_PATH` 与 Python 虚拟环境（`export.bat` / EIM 激活脚本）。详细环境见 [开发环境搭建.md](docs/开发环境搭建.md)。
 
-```bat
+**推荐（PowerShell，EIM 安装示例）：**
+
+```powershell
+. D:\Espressif\tools\Microsoft.v5.4.2.PowerShell_profile.ps1   # 路径按本机调整
+cd D:\0-C\esp32s3-agent-display
 scripts\idf_build.bat build
-idf.py -p COMx flash
+scripts\idf_build.bat -p COMx flash
 python scripts/flash_font.py -p COMx
 python scripts/flash_animations.py -p COMx
-idf.py -p COMx monitor
+scripts\idf_build.bat -p COMx monitor
 ```
+
+> 勿在 **Git Bash** 中直接运行 `idf.py`（MSYS 会导致脚本空跑）。`idf_build.bat` 与激活环境后的 `idf.py build` 等价，二选一即可。
+
+串口也可设环境变量 `ESPPORT=COMx`，flash 脚本可省略 `-p`。
 
 字库与表情分区可单独更新，不必每次全量 flash。
 
@@ -1461,6 +1503,42 @@ esp32s3-agent-display/
     ├── data/                animations.bin / font_cjk_16.bin
     └── releases/v1.0/       预编译主程序 esp32s3_agent_display.bin
 ```
+
+### 6.4 常见问题与排障
+
+#### ESP 蓝牙配网后仍离线
+
+1. 确认后端监听局域网：在 `backend/.env` 设置 `AGENT_BIND_HOST=0.0.0.0` 与 `AGENT_API_TOKEN=<令牌>`，执行 `stop.bat` → `start.bat`。
+2. `netstat -ano | findstr ":8000"` 应看到 `0.0.0.0:8000`，而非仅 `127.0.0.1:8000`。
+3. 本机自测：`curl http://<PC局域网IP>:8000/health` 应返回 200。
+4. BLE 配网 `HOST:` 须填 **PC 局域网 IP**（如 `192.168.x.x:8000`），不能填 `127.0.0.1`。
+5. 启用鉴权时，BLE `TOKEN:` / AP `api_token` 须与 `AGENT_API_TOKEN` 一致；固件 WS 连接自动带 `?token=`。
+
+#### Dashboard / 后端地址打不开
+
+| 场景 | 地址 |
+|------|------|
+| 本机浏览器 | `http://127.0.0.1:8000/`（若 `localhost` 失败，可能是 IPv6 `::1` 未监听） |
+| 已启用 `AGENT_API_TOKEN` | 打开 `http://127.0.0.1:8000/?token=<令牌>`，或在 BLE 配网区填写 API Token |
+| 手机 / 其他电脑 | `http://<PC局域网IP>:8000/`（不能用 `localhost`） |
+
+#### 每次 ESP 重启音量变回 33%
+
+音量与 TTS 音色由 **`backend/settings.json`** 管理，非 ESP NVS。设备连上 WS 时后端会 `push_volume_config()` 覆盖 ESP 内存中的增益。在 Dashboard 拖动音量滑块并**松开**后才会保存；默认值 33% 见 `settings_store.py`。详见 [§5.2 播报音量与 TTS 音色](#播报音量与-tts-音色)。
+
+#### 文字播报是杂音
+
+1. 确认固件已包含 `audio_chunk` 同步处理（`net_ws.c`）；旧固件可能因 JSON 头延迟入队导致 PCM 错位。
+2. 适当提高 Dashboard 播报音量（过低时易听到功放底噪）。
+3. 查看 `backend/backend.log` 中 `[tts]` 行，确认 PCM 字节数正常；Windows 可在 Dashboard 选用本地 SAPI 音色。
+
+#### BLE 配网后误显示「热点配网」/卡死
+
+旧固件在 BLE 配网超过 30 s 后可能立即触发自动 AP，并与未关闭的 NimBLE 冲突。新固件在 `APPLY` 后重置热点宽限期（60 s）并关闭 NimBLE；进入 AP 前也会 `ble_radio_shutdown()`。需重新编译烧录（见 [§6.2](#62-构建与烧录)）。
+
+#### `idf_build.bat` 报 `IDF_PATH is not set`
+
+先在同一终端执行 ESP-IDF 激活脚本（见 [§6.2](#62-构建与烧录)），再运行 `scripts\idf_build.bat`。VS Code **ESP-IDF: Build** 按钮会在扩展内自动注入环境。
 
 ---
 

@@ -9,6 +9,8 @@
 #define AGENT_CFG_SSID_MAX 32
 #define AGENT_CFG_PASS_MAX 64
 #define AGENT_CFG_WS_URL_MAX 128
+#define AGENT_CFG_WS_TOKEN_MAX 96
+#define AGENT_CFG_WS_URI_MAX 256
 #define AGENT_CFG_HOST_MAX 64
 #define AGENT_CFG_IP_MAX 16
 #define AGENT_CFG_MAX_PROFILES 5
@@ -17,6 +19,7 @@ typedef struct {
     char ssid[AGENT_CFG_SSID_MAX];
     char pass[AGENT_CFG_PASS_MAX];
     char ws_url[AGENT_CFG_WS_URL_MAX];
+    char ws_token[AGENT_CFG_WS_TOKEN_MAX];
     char ip[AGENT_CFG_IP_MAX];
     char gateway[AGENT_CFG_IP_MAX];
     char netmask[AGENT_CFG_IP_MAX];
@@ -28,6 +31,7 @@ const agent_cfg_t *agent_cfg_get(void);
 
 esp_err_t agent_cfg_set_wifi(const char *ssid, const char *pass);
 esp_err_t agent_cfg_set_host(const char *host_port);
+esp_err_t agent_cfg_set_token(const char *token);
 esp_err_t agent_cfg_set_ip(const char *ip);
 esp_err_t agent_cfg_set_gateway(const char *gateway);
 esp_err_t agent_cfg_set_netmask(const char *netmask);

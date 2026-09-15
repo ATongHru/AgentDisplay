@@ -35,4 +35,6 @@ idf_component_register(
         esp_psram
         lwip
         esp_driver_usb_serial_jtag
+        espressif__esp_websocket_client
+        lvgl__lvgl
 )

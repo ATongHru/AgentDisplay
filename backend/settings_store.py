@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import array
 import json
 import os
 import threading
@@ -213,22 +212,3 @@ def set_tts_voice(value: object) -> str:
     print(f"[tts] voice={voice}")
     return voice
 
-
-def scale_pcm16(pcm: bytes, percent: int | None = None) -> bytes:
-    """Scale little-endian int16 PCM by volume percent (100 = unchanged)."""
-    if not pcm:
-        return pcm
-    pct = get_volume_percent() if percent is None else clamp_volume_percent(percent)
-    if pct == 100:
-        return pcm
-    raw = pcm if len(pcm) % 2 == 0 else pcm[:-1]
-    samples = array.array("h")
-    samples.frombytes(raw)
-    for i, sample in enumerate(samples):
-        value = (int(sample) * pct) // 100
-        if value > 32767:
-            value = 32767
-        elif value < -32768:
-            value = -32768
-        samples[i] = value
-    return samples.tobytes()

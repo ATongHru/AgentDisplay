@@ -5,7 +5,7 @@ cd /d "%~dp0"
 
 echo [start] %date% %time% 准备启动 Agent Display 后端
 echo [start] 仓库目录: %CD%
-echo [start] 监听地址: http://0.0.0.0:8000
+echo [start] 监听地址: http://127.0.0.1:8000 （局域网请设 AGENT_BIND_HOST=0.0.0.0）
 echo [start] Dashboard: http://127.0.0.1:8000/
 
 where python >nul 2>&1

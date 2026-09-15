@@ -21,9 +21,6 @@ def _default_vosk_path() -> str:
         here = root / name
         if here.exists():
             return str(here)
-    for cand in Path("D:/0-C").glob("ESP32*N16R8/backend/models/vosk-model-small-cn-0.22"):
-        if cand.exists():
-            return str(cand)
     return str(root / "vosk-model-small-cn-0.22")
 
 
@@ -137,7 +134,7 @@ class VoskStreamRecognizer:
         self._buf.extend(mono)
         self._bytes += len(mono)
         while len(self._buf) >= VOSK_CHUNK_BYTES:
-            chunk = bytes(self._buf[:VOSK_CHUNK_BYTES])
+            chunk = bytes(memoryview(self._buf)[:VOSK_CHUNK_BYTES])
             del self._buf[:VOSK_CHUNK_BYTES]
             if self._rec.AcceptWaveform(chunk):
                 data = json.loads(self._rec.Result())

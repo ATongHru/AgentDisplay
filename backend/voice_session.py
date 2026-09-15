@@ -29,7 +29,7 @@ SESSION_TIMEOUT_SEC = 60.0
 @dataclass
 class VoiceSession:
     session_id: str
-    pcm_data: bytes
+    pcm_data: bytearray
     sample_rate: int = 16000
     channels: int = 1
     bit_depth: int = 16
@@ -40,7 +40,7 @@ class VoiceSession:
     asr_ready: bool = False
     llm_text: str = ""
     error: str = ""
-    audio_pcm: bytes = b""
+    audio_total_bytes: int = 0
     audio_chunks: Deque[bytes] = field(default_factory=deque)
     audio_end: bool = False
     audio_pull_offset: int = 0
@@ -65,7 +65,7 @@ class VoiceSession:
         if not data:
             return
         with self.lock:
-            self.pcm_data += data
+            self.pcm_data.extend(data)
             self.last_active = time.time()
 
     def set_asr(self, text: str) -> None:
@@ -88,7 +88,7 @@ class VoiceSession:
     def _enqueue_pcm_locked(self, pcm: bytes) -> None:
         if not pcm:
             return
-        self.audio_pcm += pcm
+        self.audio_total_bytes += len(pcm)
         for i in range(0, len(pcm), CHUNK_SIZE):
             self.audio_chunks.append(pcm[i : i + CHUNK_SIZE])
         if self.phase in (SessionPhase.TTS, SessionPhase.RECEIVED, SessionPhase.LLM, SessionPhase.ASR):
@@ -97,7 +97,7 @@ class VoiceSession:
     def set_tts_pcm(self, pcm: bytes) -> None:
         """Queue a complete TTS payload and mark end-of-stream."""
         with self.lock:
-            self.audio_pcm = b""
+            self.audio_total_bytes = 0
             self.audio_chunks.clear()
             self.audio_end = False
             self.phase = SessionPhase.TTS
@@ -134,6 +134,7 @@ class VoiceSession:
         with self.lock:
             self.phase = SessionPhase.DONE
             self.audio_end = True
+            self.audio_chunks.clear()
 
     def pop_audio_chunk(self) -> tuple[bytes | None, bool]:
         """Return next PCM chunk and whether this is the final chunk."""
@@ -159,7 +160,7 @@ class VoiceSession:
                 "asr_text": self.asr_text,
                 "llm_text": self.llm_text,
                 "error": self.error,
-                "audio_bytes": len(self.audio_pcm),
+                "audio_bytes": self.audio_total_bytes,
                 "audio_chunks_pending": len(self.audio_chunks),
                 "audio_end": self.audio_end,
                 "age_sec": round(self.age(), 2),
@@ -181,7 +182,7 @@ class VoiceSessionStore:
         session_id = uuid.uuid4().hex[:12]
         session = VoiceSession(
             session_id=session_id,
-            pcm_data=pcm_data,
+            pcm_data=bytearray(pcm_data or b""),
             sample_rate=sample_rate,
             channels=channels,
             bit_depth=bit_depth,
@@ -208,10 +209,15 @@ class VoiceSessionStore:
             self._cleanup_locked()
             return [s.to_dict() for s in self._sessions.values()]
 
-    def _cleanup_locked(self) -> None:
+    def cleanup_expired(self) -> int:
+        with self._lock:
+            return self._cleanup_locked()
+
+    def _cleanup_locked(self) -> int:
         expired = [sid for sid, s in self._sessions.items() if s.expired()]
         for sid in expired:
             del self._sessions[sid]
+        return len(expired)
 
 
 session_store = VoiceSessionStore()

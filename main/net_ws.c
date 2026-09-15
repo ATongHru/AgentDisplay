@@ -73,8 +73,10 @@ static uint32_t s_profile_try_ms;
 static uint32_t s_boot_ms;
 static bool s_ap_fallback_done;
 static bool s_ws_ever_ok;
+static bool s_prov_applied;
 #define PROFILE_ROTATE_MS 15000u
 #define AP_FALLBACK_MS 30000u
+#define AP_FALLBACK_AFTER_PROV_MS 60000u
 static esp_netif_t *s_sta;
 static uint32_t s_usj_sof;
 static uint32_t s_usj_ok_ms;
@@ -277,6 +279,7 @@ static esp_err_t cfg_from_wifi_json(const cJSON *root, agent_cfg_t *cfg)
     json_copy_str(root, "ip", cfg->ip, sizeof(cfg->ip));
     json_copy_str(root, "netmask", cfg->netmask, sizeof(cfg->netmask));
     json_copy_str(root, "gateway", cfg->gateway, sizeof(cfg->gateway));
+    json_copy_str(root, "api_token", cfg->ws_token, sizeof(cfg->ws_token));
     return ESP_OK;
 }
 
@@ -350,6 +353,44 @@ static void send_debug_info(void)
     mem_report(TAG);
 }
 
+/* audio_chunk 元信息须在紧随其后的 binary 帧之前处理（不可入队延迟）。 */
+static void apply_audio_chunk_meta(const cJSON *root)
+{
+    const cJSON *lenj = cJSON_GetObjectItem(root, "len");
+    const cJSON *endj = cJSON_GetObjectItem(root, "end");
+    const cJSON *sid = cJSON_GetObjectItem(root, "session_id");
+    s_chunk_session[0] = '\0';
+    if (cJSON_IsString(sid) && sid->valuestring) {
+        strncpy(s_chunk_session, sid->valuestring, sizeof(s_chunk_session) - 1);
+        s_chunk_session[sizeof(s_chunk_session) - 1] = '\0';
+    }
+    s_audio_len = cJSON_IsNumber(lenj) ? (size_t)lenj->valuedouble : 0;
+    s_audio_end = cJSON_IsTrue(endj);
+    if (s_audio_len > 0) {
+        s_expect_audio = true;
+    } else {
+        s_expect_audio = false;
+        (void)voice_enqueue_audio_chunk(s_chunk_session[0] ? s_chunk_session : NULL, NULL, 0,
+                                        s_audio_end);
+    }
+}
+
+static bool try_handle_audio_chunk_immediate(const char *text, int len)
+{
+    cJSON *root = cJSON_ParseWithLength(text, len);
+    if (!root) {
+        return false;
+    }
+    const cJSON *type = cJSON_GetObjectItem(root, "type");
+    if (!cJSON_IsString(type) || strcmp(type->valuestring, "audio_chunk") != 0) {
+        cJSON_Delete(root);
+        return false;
+    }
+    apply_audio_chunk_meta(root);
+    cJSON_Delete(root);
+    return true;
+}
+
 static void handle_text(const char *text, int len)
 {
     cJSON *root = cJSON_ParseWithLength(text, len);
@@ -398,22 +439,7 @@ static void handle_text(const char *text, int len)
             ui_post_volume(pct);
         }
     } else if (strcmp(t, "audio_chunk") == 0) {
-        const cJSON *lenj = cJSON_GetObjectItem(root, "len");
-        const cJSON *endj = cJSON_GetObjectItem(root, "end");
-        const cJSON *sid = cJSON_GetObjectItem(root, "session_id");
-        s_chunk_session[0] = '\0';
-        if (cJSON_IsString(sid) && sid->valuestring) {
-            strncpy(s_chunk_session, sid->valuestring, sizeof(s_chunk_session) - 1);
-            s_chunk_session[sizeof(s_chunk_session) - 1] = '\0';
-        }
-        s_audio_len = cJSON_IsNumber(lenj) ? (size_t)lenj->valuedouble : 0;
-        s_audio_end = cJSON_IsTrue(endj);
-        if (s_audio_len > 0) {
-            s_expect_audio = true;
-        } else {
-            (void)voice_enqueue_audio_chunk(s_chunk_session[0] ? s_chunk_session : NULL, NULL, 0,
-                                            s_audio_end);
-        }
+        apply_audio_chunk_meta(root);
     } else if (strcmp(t, "config") == 0) {
         const cJSON *vol = cJSON_GetObjectItem(root, "volume_percent");
         if (cJSON_IsNumber(vol)) {
@@ -488,6 +514,7 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     } else if (id == WEBSOCKET_EVENT_DISCONNECTED) {
         s_ws_on = false;
         s_ws_up_ms = 0;
+        s_expect_audio = false;
         xEventGroupClearBits(s_events, WS_OK);
         voice_on_ws_lost();
         ui_post_link_state(net_usb_ready(), s_wifi, false, voice_is_listening(), audio_playback_is_active(), s_rssi);
@@ -496,6 +523,9 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         if (evt->op_code == 0x01) {
             if (!s_text_q || !evt->data_ptr || evt->data_len <= 0) {
                 /* ignore */
+            } else if (evt->data_len <= WS_TEXT_MAX_BYTES &&
+                       try_handle_audio_chunk_immediate((const char *)evt->data_ptr, evt->data_len)) {
+                /* handled synchronously */
             } else if (evt->data_len > WS_TEXT_MAX_BYTES) {
                 ESP_LOGW(TAG, "text frame too large %d, drop", evt->data_len);
             } else {
@@ -513,7 +543,9 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                 }
             }
         } else if (evt->op_code == 0x02 || evt->op_code == 0x00) {
-            if (s_expect_audio && evt->data_ptr && evt->data_len > 0) {
+            if (!s_expect_audio && evt->data_ptr && evt->data_len > 0) {
+                ESP_LOGW(TAG, "binary before audio_chunk meta, drop %d", evt->data_len);
+            } else if (s_expect_audio && evt->data_ptr && evt->data_len > 0) {
                 const bool last_piece =
                     (evt->payload_len <= 0) ||
                     (evt->payload_offset + evt->data_len >= evt->payload_len);
@@ -567,7 +599,7 @@ static void poll_usb(void)
     }
 }
 
-static char s_ws_uri[AGENT_CFG_WS_URL_MAX];
+static char s_ws_uri[AGENT_CFG_WS_URI_MAX];
 
 static void stop_ws(void)
 {
@@ -578,6 +610,7 @@ static void stop_ws(void)
     esp_websocket_client_destroy(s_ws);
     s_ws = NULL;
     s_ws_on = false;
+    s_expect_audio = false;
     if (s_events) {
         xEventGroupClearBits(s_events, WS_OK | SESSION_OK);
     }
@@ -590,7 +623,7 @@ static void start_ws(void)
     }
     const agent_cfg_t *acfg = agent_cfg_get();
     memset(s_ws_uri, 0, sizeof(s_ws_uri));
-    strncpy(s_ws_uri, acfg->ws_url, sizeof(s_ws_uri) - 1);
+    ws_url_build_connect_uri(acfg->ws_url, acfg->ws_token, s_ws_uri, sizeof(s_ws_uri));
     esp_websocket_client_config_t cfg = {
         .uri = s_ws_uri,
         .reconnect_timeout_ms = WS_RECONNECT_MS,
@@ -772,6 +805,14 @@ void net_resume_after_ble(void)
     ESP_LOGI(TAG, "resume wifi after BLE: %s", esp_err_to_name(err));
 }
 
+void net_on_config_applied(void)
+{
+    uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    s_boot_ms = now;
+    s_prov_applied = true;
+    ESP_LOGI(TAG, "config applied, AP fallback grace %us", (unsigned)(AP_FALLBACK_AFTER_PROV_MS / 1000));
+}
+
 esp_err_t net_apply_config(void)
 {
     const agent_cfg_t *acfg = agent_cfg_get();
@@ -875,9 +916,11 @@ void net_loop(void)
     if (!net_ws_ready() && !s_ws_ever_ok && !s_ap_fallback_done && !ble_prov_active() &&
         !ap_prov_active() && !voice_net_busy()) {
         uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-        if ((now - s_boot_ms) >= AP_FALLBACK_MS) {
+        uint32_t grace_ms = s_prov_applied ? AP_FALLBACK_AFTER_PROV_MS : AP_FALLBACK_MS;
+        if ((now - s_boot_ms) >= grace_ms) {
             s_ap_fallback_done = true;
-            ESP_LOGW(TAG, "no WiFi/WS after %us, starting AP provisioning", (unsigned)(AP_FALLBACK_MS / 1000));
+            ESP_LOGW(TAG, "no WiFi/WS after %us, starting AP provisioning",
+                     (unsigned)(grace_ms / 1000));
             (void)ap_prov_start();
         }
     }

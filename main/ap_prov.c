@@ -287,6 +287,7 @@ esp_err_t ap_prov_start(void)
         ESP_LOGW(TAG, "skip AP prov: BLE active");
         return ESP_ERR_INVALID_STATE;
     }
+    ble_radio_shutdown();
     ui_post_ap_prov(true);
     net_pause_sta_for_ap();
     esp_err_t err = start_ap_radio();

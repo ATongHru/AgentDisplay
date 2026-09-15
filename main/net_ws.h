@@ -8,6 +8,8 @@
 
 esp_err_t net_init(void);
 esp_err_t net_apply_config(void);
+/** 配网 APPLY 后重置 AP 自动回退计时，避免 BLE 耗时超过 30s 后立即进热点。 */
+void net_on_config_applied(void);
 void net_pause_for_ble(void);
 void net_resume_after_ble(void);
 void net_pause_sta_for_ap(void);

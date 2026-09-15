@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = ROOT / "log"
 HISTORY_FILE = LOG_DIR / "llm_chat.jsonl"
+MAX_HISTORY_LINES = int(os.getenv("LLM_HISTORY_MAX_LINES", "2000"))
+QUERY_TAIL_LINES = int(os.getenv("LLM_HISTORY_QUERY_TAIL", "5000"))
 
 _lock = threading.Lock()
 
@@ -22,6 +26,20 @@ def _ensure_dir() -> None:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def _rotate_if_needed() -> None:
+    if not HISTORY_FILE.is_file():
+        return
+    try:
+        lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    if len(lines) <= MAX_HISTORY_LINES:
+        return
+    keep = lines[-MAX_HISTORY_LINES:]
+    HISTORY_FILE.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
+    print(f"[llm-history] rotated to last {len(keep)} lines")
 
 
 def append_record(
@@ -59,22 +77,27 @@ def append_record(
         _ensure_dir()
         with HISTORY_FILE.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+        _rotate_if_needed()
     return record
 
 
-def _iter_records() -> list[dict[str, Any]]:
+def _tail_records(max_lines: int | None = None) -> list[dict[str, Any]]:
     if not HISTORY_FILE.is_file():
         return []
+    limit = max_lines or QUERY_TAIL_LINES
+    try:
+        lines = deque(HISTORY_FILE.open("r", encoding="utf-8"), maxlen=limit)
+    except OSError:
+        return []
     items: list[dict[str, Any]] = []
-    with HISTORY_FILE.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                items.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            items.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
     return items
 
 
@@ -95,9 +118,8 @@ def query_records(
     date_to = (date_to or "").strip()
 
     with _lock:
-        items = _iter_records()
+        items = _tail_records()
 
-    # Newest first
     items.reverse()
 
     def match(rec: dict[str, Any]) -> bool:
@@ -139,5 +161,4 @@ def query_records(
         "pages": pages,
         "total_tokens": token_sum,
         "items": slice_,
-        "path": str(HISTORY_FILE),
     }

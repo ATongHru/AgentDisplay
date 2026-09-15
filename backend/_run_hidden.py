@@ -16,12 +16,24 @@ sys.stdout = log_f
 sys.stderr = log_f
 print(f"\n--- start {datetime.now().isoformat(timespec='seconds')} ---", flush=True)
 
+import os
+
 import uvicorn
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(ROOT / ".env")
+except ImportError:
+    pass
+
+host = os.getenv("AGENT_BIND_HOST", "127.0.0.1").strip() or "127.0.0.1"
+port = int(os.getenv("AGENT_BIND_PORT", "8000"))
 
 uvicorn.run(
     "main:app",
-    host="0.0.0.0",
-    port=8000,
+    host=host,
+    port=port,
     ws_ping_interval=None,
     ws_ping_timeout=None,
 )
