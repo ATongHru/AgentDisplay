@@ -33,6 +33,9 @@ backend/settings.json
 # Windows accidental redirect target
 /nul
 
+# Local review scratchpad; do not publish with releases.
+待优化.md
+
 # Local ESP-IDF build helper (use scripts/idf_build.bat.example)
 scripts/idf_build.bat
 
